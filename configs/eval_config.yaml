@@ -1,0 +1,103 @@
+# Standardized Before-and-After Benchmark Evaluation Configuration
+# Covers the 6 primary Arabic/Saudi benchmarks and 4 English/Math/Code zero-forgetting anchors.
+
+evaluation:
+  base_model_id: "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
+  sft_checkpoint_dir: "outputs/sft_stage1"
+  dpo_checkpoint_dir: "outputs/dpo_stage2"
+  merged_checkpoint_dir: "outputs/merged_gemma4_e4b_arabic"
+  output_report_path: "outputs/eval_reports/benchmark_comparison.md"
+  output_json_path: "outputs/eval_reports/benchmark_results.json"
+  batch_size: 4
+  max_seq_length: 2048
+  dtype: "bfloat16"
+  device: "cuda:0"
+
+retention_gate:
+  enforce_zero_forgetting: true
+  min_retention_ratio: 0.998
+  max_allowed_drop_pct: 0.20
+  default_ties_lambda: 0.85
+  ties_density: 0.85
+  sweep_lambdas_on_regression:
+    - 0.80
+    - 0.85
+    - 0.90
+    - 0.95
+    - 1.00
+
+arabic_benchmarks:
+  ArabicMMLU:
+    lm_eval_task: "arabicmmlu"
+    lighteval_task: "community|arabic_mmlu:_average|0"
+    metric: "acc_norm"
+    num_fewshot: 0
+    description: "Native 40-subject curriculum across KSA, Jordan, Egypt, and UAE (STEM, Islamic Studies, Arab Law, History, Civics)"
+
+  MadinahQA:
+    lm_eval_task: "arabicmmlu_arabic_language_general,arabicmmlu_arabic_language_grammar"
+    lighteval_task: "community|madinah_qa:_average|0"
+    metric: "acc_norm"
+    num_fewshot: 0
+    description: "Classical and MSA Arabic language and grammar (Nahw, Sarf, Irab, Balagha)"
+
+  AlGhafa:
+    lm_eval_task: "alghafa_native"
+    lighteval_task: "community|alghafa:_average|0"
+    metric: "acc_norm"
+    num_fewshot: 0
+    description: "Native MSA and Saudi/Gulf/Egyptian dialect reading comprehension, grounded QA, and sentiment"
+
+  ACVA:
+    lm_eval_task: "acva"
+    lighteval_task: "community|acva:_average|0"
+    metric: "acc_norm"
+    num_fewshot: 0
+    description: "Arabic and Islamic cultural values alignment across 58 native subtasks"
+
+  EXAMS-AR:
+    lm_eval_task: "exams_ar"
+    lighteval_task: "community|arabic_exams|0"
+    metric: "acc_norm"
+    num_fewshot: 0
+    description: "High-school subject examinations in Arabic across science and humanities"
+
+  AraTrust:
+    lm_eval_task: "aratrust"
+    lighteval_task: "community|aratrust:_average|0"
+    metric: "acc_norm"
+    num_fewshot: 0
+    description: "Arabic safety, truthfulness, and trustworthiness evaluation"
+
+retention_anchors:
+  MMLU-Pro:
+    domain: "english_reasoning"
+    lm_eval_task: "mmlu_pro"
+    metric: "acc"
+    num_fewshot: 5
+    max_regression_pct: 0.20
+    min_acceptable_score: 69.2
+
+  GSM8K:
+    domain: "math_reasoning"
+    lm_eval_task: "gsm8k"
+    metric: "exact_match,strict-match"
+    num_fewshot: 5
+    max_regression_pct: 0.20
+    min_acceptable_score: 83.8
+
+  HumanEval:
+    domain: "code_generation"
+    lm_eval_task: "humaneval"
+    metric: "pass@1"
+    num_fewshot: 0
+    max_regression_pct: 0.20
+    min_acceptable_score: 51.8
+
+  ARC-Challenge:
+    domain: "english_science_anchor"
+    lm_eval_task: "arc_challenge"
+    metric: "acc_norm"
+    num_fewshot: 25
+    max_regression_pct: 0.20
+    min_acceptable_score: 76.4
