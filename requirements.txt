@@ -1,0 +1,23 @@
+# Core Deep Learning and Unsloth 8.0 GB QLoRA Stack
+torch>=2.4.0
+transformers>=4.46.0
+datasets>=3.0.0
+accelerate>=1.0.0
+peft>=0.13.0
+trl>=0.12.0
+bitsandbytes>=0.44.0
+unsloth
+
+# Model Serialization, Tokenizer, and Configuration Utilities
+safetensors>=0.4.5
+huggingface-hub>=0.26.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+pyyaml>=6.0.1
+numpy>=1.26.0
+scipy>=1.11.0
+tqdm>=4.66.0
+
+# Evaluation and Testing
+lm-eval>=0.4.5
+pytest>=8.0.0
