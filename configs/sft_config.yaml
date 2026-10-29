@@ -1,0 +1,151 @@
+# Stage 1 Supervised Fine-Tuning (SFT) Configuration for Gemma-4-Arabic
+# Optimized for a single 8.0 GB VRAM GPU with zero catastrophic forgetting.
+
+model:
+  base_model_id: "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
+  reference_model_id: "google/gemma-4-E4B-it"
+  total_parameters: "8.0B"
+  effective_parameters: "4.5B"
+  num_layers: 42
+  vocab_size: 262144
+  arabic_vocab_tokens: 8460
+  max_seq_length: 2048
+  dtype: "bfloat16"
+  load_in_4bit: true
+  quant_type: "nf4"
+  use_double_quant: true
+
+vram_optimization:
+  target_vram_budget_gb: 8.0
+  offload_ple_to_cpu: true
+  ple_module_pattern: "embed_tokens_per_layer"
+  ple_shape: [262144, 10752]
+  ple_per_layer_dim: 256
+  ple_non_blocking_transfer: true
+  offload_multimodal_towers_to_cpu: true
+  multimodal_tower_patterns:
+    - "audio_tower"
+    - "vision_tower"
+    - "embed_audio"
+    - "embed_vision"
+  restore_towers_before_export: true
+  freeze_embeddings_and_lm_head: true
+
+lora:
+  use_rslora: true
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.0
+  bias: "none"
+  use_gradient_checkpointing: "unsloth"
+  random_state: 3407
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  exclude_modules:
+    - "vision_tower"
+    - "multi_modal_projector"
+    - "audio_tower"
+    - "embed_tokens_per_layer"
+
+training:
+  output_dir: "outputs/sft_stage1"
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
+  optim: "paged_adamw_8bit"
+  learning_rate: 1.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  neftune_noise_alpha: 5.0
+  num_train_epochs: 2
+  packing: false
+  completion_only_loss: true
+  bf16: true
+  fp16: false
+  logging_steps: 10
+  save_strategy: "steps"
+  save_steps: 250
+  save_total_limit: 3
+  eval_strategy: "steps"
+  eval_steps: 250
+  seed: 3407
+
+chat_template:
+  add_generation_prompt: false
+  preserve_thinking_tokens: true
+  default_enable_thinking: false
+  empty_thinking_block: "<|think|>\n<|think|>\n"
+
+datasets:
+  total_target_samples: 100000
+  arabic_mix_ratio: 0.75
+  replay_mix_ratio: 0.25
+  output_dataset_dir: "data/sft_mixed"
+
+  arabic_sources:
+    voho_saudi_dialogues:
+      repo_id: "VohoAI/voho-saudi-dialogues"
+      config_name: "default"
+      split: "train"
+      weight: 0.25
+      enable_thinking: false
+      strip_speaker_prefixes: true
+      json_column: "messages_json"
+
+    saudi_arabic_laws:
+      repo_id: "SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus"
+      config_names:
+        - "moj"
+        - "boe"
+      split: "train"
+      weight: 0.15
+      enable_thinking: false
+
+    acegpt_v2_tuning:
+      repo_id: "FreedomIntelligence/AceGPT-v2-tuning"
+      config_name: "default"
+      split: "train"
+      weight: 0.25
+      enable_thinking: false
+
+    arabic_math_sft:
+      repo_id: "Omartificial-Intelligence-Space/Arabic-Math-SFT"
+      config_name: "default"
+      split: "train"
+      weight: 0.10
+      enable_thinking: true
+      drop_columns:
+        - "image"
+
+    aya_arabic_instruct:
+      repo_id: "CohereForAI/aya_collection_language_split"
+      config_name: "arabic"
+      split: "train"
+      weight: 0.25
+      enable_thinking: false
+      enable_tool_calling_schema: true
+
+  replay_sources:
+    ultrachat_200k:
+      repo_id: "HuggingFaceH4/ultrachat_200k"
+      config_name: "default"
+      split: "train_sft"
+      weight: 0.60
+      share_of_total_mix: 0.15
+      enable_thinking: false
+
+    openmath_instruct_2:
+      repo_id: "nvidia/OpenMathInstruct-2"
+      config_name: "default"
+      split: "train_1M"
+      weight: 0.40
+      share_of_total_mix: 0.10
+      enable_thinking: true
