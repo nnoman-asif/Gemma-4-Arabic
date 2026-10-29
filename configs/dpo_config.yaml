@@ -1,0 +1,95 @@
+# Stage 2 Trust-Region Direct Preference Optimization (TR-DPO) Configuration
+# Aligns Gemma-4-Arabic on Saudi dialect and Arabic preference pairs within an 8.0 GB VRAM budget.
+
+model:
+  base_model_id: "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
+  sft_adapter_dir: "outputs/sft_stage1"
+  max_seq_length: 1536
+  dtype: "bfloat16"
+  load_in_4bit: true
+
+vram_optimization:
+  target_vram_budget_gb: 8.0
+  offload_ple_to_cpu: true
+  ple_module_pattern: "embed_tokens_per_layer"
+  ple_non_blocking_transfer: true
+  offload_multimodal_towers_to_cpu: true
+  multimodal_tower_patterns:
+    - "audio_tower"
+    - "vision_tower"
+    - "embed_audio"
+    - "embed_vision"
+  restore_towers_before_export: true
+  free_ref_model_vram: true
+  ref_model: null
+  precompute_ref_log_probs: false
+
+lora:
+  use_rslora: true
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.0
+  bias: "none"
+  use_gradient_checkpointing: "unsloth"
+  random_state: 3407
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+dpo:
+  beta: 0.1
+  tr_alpha: 0.6
+  tr_update_steps: 50
+  loss_type: "sigmoid"
+  max_length: 1536
+  max_prompt_length: 768
+  max_completion_length: 768
+  label_smoothing: 0.0
+
+training:
+  output_dir: "outputs/dpo_stage2"
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  optim: "paged_adamw_8bit"
+  learning_rate: 5.0e-7
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.10
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  num_train_epochs: 1
+  bf16: true
+  fp16: false
+  logging_steps: 10
+  save_strategy: "steps"
+  save_steps: 200
+  save_total_limit: 3
+  eval_strategy: "steps"
+  eval_steps: 200
+  seed: 3407
+
+datasets:
+  total_target_pairs: 20000
+  output_dataset_dir: "data/dpo_mixed"
+
+  preference_sources:
+    arabic_dialect_dpo_saudi:
+      repo_id: "HeshamHaroon/arabic-dialect-dpo"
+      config_name: "saudi"
+      split: "train"
+      weight: 0.40
+      enable_thinking: false
+      requires_explicit_config: true
+
+    arabic_orpo_dpo_mix_40k:
+      repo_id: "arcee-globe/arabic-orpo-dpo-mix-40k-filtered"
+      config_name: "default"
+      split: "train"
+      weight: 0.60
+      enable_thinking: false
+      unify_prompt_from_chosen: true
