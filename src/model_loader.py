@@ -63,15 +63,10 @@ def build_8gb_device_map(cuda_device_index: int = 0) -> Dict[str, Union[str, int
         return {"": "cpu"}
     return {
         "model.language_model.embed_tokens_per_layer": "cpu",
-        "language_model.embed_tokens_per_layer": "cpu",
         "model.audio_tower": "cpu",
-        "audio_tower": "cpu",
         "model.vision_tower": "cpu",
-        "vision_tower": "cpu",
         "model.embed_audio": "cpu",
-        "embed_audio": "cpu",
         "model.embed_vision": "cpu",
-        "embed_vision": "cpu",
         "": cuda_device_index,
     }
 
@@ -171,6 +166,11 @@ def inject_rslora_adapters(
             except TypeError:
                 model.gradient_checkpointing_enable()
 
+        exclude_regex = (
+            r".*(" + "|".join(exclude_list) + r").*"
+            if exclude_list
+            else None
+        )
         lora_cfg = LoraConfig(
             r=r,
             lora_alpha=lora_alpha,
@@ -178,7 +178,7 @@ def inject_rslora_adapters(
             bias=bias,
             use_rslora=use_rslora,
             target_modules=target_list,
-            exclude_modules=exclude_list,
+            exclude_modules=exclude_regex,
             task_type="CAUSAL_LM",
         )
         return get_peft_model(model, lora_cfg)
@@ -232,9 +232,15 @@ def load_gemma4_8gb_model_and_tokenizer(
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         hf_config = AutoConfig.from_pretrained(model_name)
-        has_prequant = getattr(hf_config, "quantization_config", None) is not None
+        quant_cfg = getattr(hf_config, "quantization_config", None)
+        has_prequant = quant_cfg is not None
+        if isinstance(quant_cfg, dict):
+            quant_cfg["llm_int8_enable_fp32_cpu_offload"] = True
+        elif quant_cfg is not None and hasattr(quant_cfg, "llm_int8_enable_fp32_cpu_offload"):
+            quant_cfg.llm_int8_enable_fp32_cpu_offload = True
 
         load_kwargs: Dict[str, Any] = {
+            "config": hf_config,
             "dtype": resolved_dtype,
             "device_map": device_map,
         }
@@ -243,14 +249,19 @@ def load_gemma4_8gb_model_and_tokenizer(
                 compute_dtype=resolved_dtype
             )
 
-        try:
+        arch_list = getattr(hf_config, "architectures", None) or []
+        is_multimodal_arch = (
+            getattr(hf_config, "model_type", "") == "gemma4"
+            or any("ConditionalGeneration" in a for a in arch_list)
+        )
+        if is_multimodal_arch:
             from transformers import AutoModelForImageTextToText
 
             model = AutoModelForImageTextToText.from_pretrained(
                 model_name,
                 **load_kwargs,
             )
-        except Exception:
+        else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 **load_kwargs,

@@ -69,6 +69,46 @@ def _first_param_device_and_dtype(
     return torch.device("cpu"), torch.bfloat16
 
 
+def _detach_accelerate_hooks(root_module: nn.Module) -> None:
+    """Materialize any Accelerate-offloaded meta tensors onto CPU and detach AlignDevicesHook."""
+    try:
+        from accelerate.hooks import remove_hook_from_module
+        from accelerate.utils import set_module_tensor_to_device
+
+        for _, submod in root_module.named_modules():
+            hook = getattr(submod, "_hf_hook", None)
+            weights_map = getattr(hook, "weights_map", None) if hook is not None else None
+            if weights_map is not None:
+                for param_name, param in list(submod.named_parameters(recurse=False)):
+                    if param.device.type == "meta" and param_name in weights_map:
+                        set_module_tensor_to_device(
+                            submod,
+                            param_name,
+                            "cpu",
+                            value=weights_map[param_name],
+                        )
+                for buf_name, buf in list(submod.named_buffers(recurse=False)):
+                    if buf.device.type == "meta" and buf_name in weights_map:
+                        set_module_tensor_to_device(
+                            submod,
+                            buf_name,
+                            "cpu",
+                            value=weights_map[buf_name],
+                        )
+            if hook is not None:
+                remove_hook_from_module(submod, recurse=False)
+    except Exception as exc:
+        logger.debug("Accelerate hook detachment skipped: %s", exc)
+
+
+def _materialize_module_on_cpu(module: nn.Module) -> None:
+    """Ensure a submodule has all meta tensors materialized and resides on CPU."""
+    _detach_accelerate_hooks(module)
+    has_meta = any(p.device.type == "meta" for p in module.parameters(recurse=True))
+    if not has_meta:
+        module.to("cpu")
+
+
 def find_modules_by_pattern(
     model: nn.Module,
     patterns: Sequence[str],
@@ -128,12 +168,14 @@ def register_ple_cpu_offload_hook(
 
     for name, ple_mod in ple_modules.items():
         orig_dev, orig_dtype = _first_param_device_and_dtype(ple_mod)
+        _materialize_module_on_cpu(ple_mod)
+        if orig_dev.type == "meta":
+            orig_dev, orig_dtype = _first_param_device_and_dtype(ple_mod)
         state.original_devices[name] = orig_dev
         state.original_dtypes[name] = orig_dtype
         state.ple_module_names.append(name)
         state.ple_bytes_offloaded += _module_param_bytes(ple_mod)
 
-        ple_mod.to("cpu")
         for param in ple_mod.parameters(recurse=True):
             param.requires_grad_(False)
 
@@ -208,13 +250,15 @@ def offload_multimodal_towers_to_cpu(
     towers = find_modules_by_pattern(model, patterns)
     for name, tower_mod in towers.items():
         orig_dev, orig_dtype = _first_param_device_and_dtype(tower_mod)
+        _materialize_module_on_cpu(tower_mod)
+        if orig_dev.type == "meta":
+            orig_dev, orig_dtype = _first_param_device_and_dtype(tower_mod)
         state.original_devices[name] = orig_dev
         state.original_dtypes[name] = orig_dtype
         state.multimodal_module_names.append(name)
         mod_bytes = _module_param_bytes(tower_mod)
         state.multimodal_bytes_offloaded += mod_bytes
 
-        tower_mod.to("cpu")
         for param in tower_mod.parameters(recurse=True):
             param.requires_grad_(False)
 
@@ -289,6 +333,7 @@ def apply_8gb_vram_optimizations(
     non_blocking: bool = True,
 ) -> OffloadState:
     """Apply both PLE CPU forward hook and multimodal tower CPU offload in one call."""
+    _detach_accelerate_hooks(model)
     state = OffloadState()
     register_ple_cpu_offload_hook(
         model=model,
@@ -302,6 +347,13 @@ def apply_8gb_vram_optimizations(
         patterns=MULTIMODAL_TOWER_PATTERNS,
         state=state,
     )
+    if any(p.device.type == "cuda" for p in model.parameters()):
+        offloaded_names = state.ple_module_names + state.multimodal_module_names
+        if offloaded_names:
+            dmap: Dict[str, Union[int, str]] = {"": 0}
+            for mod_name in offloaded_names:
+                dmap[mod_name] = "cpu"
+            setattr(model, "hf_device_map", dmap)
     setattr(model, "_vram_offload_state", state)
     gc.collect()
     if torch.cuda.is_available():

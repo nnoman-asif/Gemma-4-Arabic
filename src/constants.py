@@ -59,6 +59,8 @@ LORA_EXCLUDE_MODULES: Tuple[str, ...] = (
     "vision_tower",
     "multi_modal_projector",
     "audio_tower",
+    "embed_vision",
+    "embed_audio",
     "embed_tokens_per_layer",
 )
 
