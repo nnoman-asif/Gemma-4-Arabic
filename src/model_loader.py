@@ -221,20 +221,33 @@ def load_gemma4_8gb_model_and_tokenizer(
             "Unsloth FastLanguageModel.from_pretrained unavailable (%s); using Transformers loader.",
             unsloth_exc,
         )
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        quant_cfg = (
-            build_bnb_4bit_config(compute_dtype=resolved_dtype)
-            if (load_in_4bit and torch.cuda.is_available())
-            else None
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=resolved_dtype,
-            quantization_config=quant_cfg,
-            device_map=device_map,
-        )
+        hf_config = AutoConfig.from_pretrained(model_name)
+        has_prequant = getattr(hf_config, "quantization_config", None) is not None
+
+        load_kwargs: Dict[str, Any] = {
+            "dtype": resolved_dtype,
+            "device_map": device_map,
+        }
+        if not has_prequant and load_in_4bit and torch.cuda.is_available():
+            load_kwargs["quantization_config"] = build_bnb_4bit_config(
+                compute_dtype=resolved_dtype
+            )
+
+        try:
+            from transformers import AutoModelForImageTextToText
+
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_name,
+                **load_kwargs,
+            )
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                **load_kwargs,
+            )
         if adapter_checkpoint is not None:
             from peft import PeftModel
 
