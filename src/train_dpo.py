@@ -179,7 +179,6 @@ def build_dpo_training_arguments(
         "optim": optim_name,
         "learning_rate": float(train_cfg.get("learning_rate", DPO_LEARNING_RATE)),
         "lr_scheduler_type": str(train_cfg.get("lr_scheduler_type", "cosine")),
-        "warmup_ratio": float(train_cfg.get("warmup_ratio", 0.10)),
         "weight_decay": float(train_cfg.get("weight_decay", 0.01)),
         "max_grad_norm": float(train_cfg.get("max_grad_norm", 1.0)),
         "num_train_epochs": float(train_cfg.get("num_train_epochs", 1)),
@@ -194,10 +193,16 @@ def build_dpo_training_arguments(
         "report_to": "none",
     }
 
+    warmup_ratio_val = float(train_cfg.get("warmup_ratio", 0.10))
+
     try:
         from trl import DPOConfig
 
         sig = inspect.signature(DPOConfig.__init__)
+        if "warmup_steps" in sig.parameters:
+            common_kwargs["warmup_steps"] = warmup_ratio_val
+        elif "warmup_ratio" in sig.parameters:
+            common_kwargs["warmup_ratio"] = warmup_ratio_val
         if "beta" in sig.parameters:
             common_kwargs["beta"] = float(dpo_cfg.get("beta", DPO_BETA))
         if "loss_type" in sig.parameters:
@@ -214,8 +219,17 @@ def build_dpo_training_arguments(
             common_kwargs["precompute_ref_log_probs"] = bool(
                 vram_cfg.get("precompute_ref_log_probs", False)
             )
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            common_kwargs = {k: v for k, v in common_kwargs.items() if k in sig.parameters}
         return DPOConfig(**common_kwargs)
     except ImportError:
+        ta_sig = inspect.signature(TrainingArguments.__init__)
+        if "warmup_steps" in ta_sig.parameters:
+            common_kwargs["warmup_steps"] = warmup_ratio_val
+        elif "warmup_ratio" in ta_sig.parameters:
+            common_kwargs["warmup_ratio"] = warmup_ratio_val
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in ta_sig.parameters.values()):
+            common_kwargs = {k: v for k, v in common_kwargs.items() if k in ta_sig.parameters}
         return TrainingArguments(**common_kwargs)
 
 

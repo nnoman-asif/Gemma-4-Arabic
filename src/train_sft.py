@@ -76,7 +76,6 @@ def build_sft_training_arguments(
         "optim": optim_name,
         "learning_rate": float(train_cfg.get("learning_rate", 1.0e-4)),
         "lr_scheduler_type": str(train_cfg.get("lr_scheduler_type", "cosine")),
-        "warmup_ratio": float(train_cfg.get("warmup_ratio", 0.05)),
         "weight_decay": float(train_cfg.get("weight_decay", 0.01)),
         "max_grad_norm": float(train_cfg.get("max_grad_norm", 1.0)),
         "num_train_epochs": float(train_cfg.get("num_train_epochs", 2)),
@@ -91,6 +90,7 @@ def build_sft_training_arguments(
         "report_to": "none",
     }
 
+    warmup_ratio_val = float(train_cfg.get("warmup_ratio", 0.05))
     neftune_alpha = train_cfg.get("neftune_noise_alpha", 5.0)
     if neftune_alpha is not None:
         common_kwargs["neftune_noise_alpha"] = float(neftune_alpha)
@@ -99,6 +99,10 @@ def build_sft_training_arguments(
         from trl import SFTConfig
 
         sig = inspect.signature(SFTConfig.__init__)
+        if "warmup_steps" in sig.parameters:
+            common_kwargs["warmup_steps"] = warmup_ratio_val
+        elif "warmup_ratio" in sig.parameters:
+            common_kwargs["warmup_ratio"] = warmup_ratio_val
         if "max_seq_length" in sig.parameters:
             common_kwargs["max_seq_length"] = max_seq_length
         elif "max_length" in sig.parameters:
@@ -107,10 +111,19 @@ def build_sft_training_arguments(
             common_kwargs["dataset_text_field"] = "text"
         if "packing" in sig.parameters:
             common_kwargs["packing"] = bool(train_cfg.get("packing", False))
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            common_kwargs = {k: v for k, v in common_kwargs.items() if k in sig.parameters}
         return SFTConfig(**common_kwargs)
     except ImportError:
         from transformers import TrainingArguments
 
+        ta_sig = inspect.signature(TrainingArguments.__init__)
+        if "warmup_steps" in ta_sig.parameters:
+            common_kwargs["warmup_steps"] = warmup_ratio_val
+        elif "warmup_ratio" in ta_sig.parameters:
+            common_kwargs["warmup_ratio"] = warmup_ratio_val
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in ta_sig.parameters.values()):
+            common_kwargs = {k: v for k, v in common_kwargs.items() if k in ta_sig.parameters}
         return TrainingArguments(**common_kwargs)
 
 

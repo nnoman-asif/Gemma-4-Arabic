@@ -161,8 +161,15 @@ def inject_rslora_adapters(
         )
         from peft import LoraConfig, get_peft_model
 
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         if use_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable()
+            try:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                model.gradient_checkpointing_enable()
 
         lora_cfg = LoraConfig(
             r=r,
@@ -251,6 +258,16 @@ def load_gemma4_8gb_model_and_tokenizer(
         if adapter_checkpoint is not None:
             from peft import PeftModel
 
+            if is_trainable:
+                if hasattr(model, "enable_input_require_grads"):
+                    model.enable_input_require_grads()
+                if use_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+                    try:
+                        model.gradient_checkpointing_enable(
+                            gradient_checkpointing_kwargs={"use_reentrant": False}
+                        )
+                    except TypeError:
+                        model.gradient_checkpointing_enable()
             model = PeftModel.from_pretrained(
                 model,
                 adapter_checkpoint,
