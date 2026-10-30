@@ -64,7 +64,10 @@ training:
   max_grad_norm: 1.0
   num_train_epochs: 1
   bf16: true
+  tf32: true
   fp16: false
+  dataloader_pin_memory: true
+  dataloader_num_workers: 0
   logging_steps: 10
   save_strategy: "steps"
   save_steps: 200

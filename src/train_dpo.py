@@ -163,6 +163,12 @@ def build_dpo_training_arguments(
     )
 
     use_bf16 = bool(train_cfg.get("bf16", True)) and torch.cuda.is_available()
+    use_tf32 = bool(train_cfg.get("tf32", True)) and torch.cuda.is_available()
+    if use_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
     optim_name = str(
         train_cfg.get("optim", "paged_adamw_8bit")
         if torch.cuda.is_available()
@@ -184,10 +190,13 @@ def build_dpo_training_arguments(
         "num_train_epochs": float(train_cfg.get("num_train_epochs", 1)),
         "max_steps": max_steps,
         "bf16": use_bf16,
+        "tf32": use_tf32,
         "fp16": False,
+        "dataloader_pin_memory": bool(train_cfg.get("dataloader_pin_memory", True)),
+        "dataloader_num_workers": int(train_cfg.get("dataloader_num_workers", 0)),
         "logging_steps": 1 if smoke_test else int(train_cfg.get("logging_steps", 10)),
         "save_strategy": "no" if smoke_test else str(train_cfg.get("save_strategy", "steps")),
-        "save_steps": int(train_cfg.get("save_steps", 200)),
+        "save_steps": int(train_cfg.get("save_steps", 100)),
         "save_total_limit": int(train_cfg.get("save_total_limit", 3)),
         "seed": int(train_cfg.get("seed", 3407)),
         "report_to": "none",
