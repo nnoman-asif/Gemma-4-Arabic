@@ -20,7 +20,7 @@ Handles dataset-specific schemas and preprocessing rules:
 import json
 import logging
 import re
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from src.chat_template import format_gemma4_chat, format_thinking_response
 from src.constants import (
@@ -453,6 +453,24 @@ def normalize_arabic_sft_iterable(
     return results
 
 
+LIVE_HUB_FALLBACK_SOURCES: Dict[str, List[Tuple[str, Optional[str]]]] = {
+    "acegpt_v2_tuning": [
+        ("FreedomIntelligence/Evol-Instruct-Arabic-GPT4", "default"),
+        ("FreedomIntelligence/Alpaca-Arabic-GPT4", "default"),
+    ],
+    "aya_arabic_instruct": [
+        (
+            "parquet",
+            "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/standard_arabic/train/0000.parquet",
+        ),
+        (
+            "parquet",
+            "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/najdi_arabic/train/0000.parquet",
+        ),
+    ],
+}
+
+
 def load_and_normalize_arabic_sft_source(
     source_key: str,
     max_samples: Optional[int] = None,
@@ -466,36 +484,52 @@ def load_and_normalize_arabic_sft_source(
         raise KeyError(f"Unknown Arabic SFT source key: {source_key!r}")
 
     spec = SFT_ARABIC_DATASETS[source_key]
-    collected: List[Dict[str, Any]] = []
 
-    per_config_limit = (
-        max(1, max_samples // len(spec.config_names))
-        if max_samples is not None
-        else None
-    )
+    if source_key in LIVE_HUB_FALLBACK_SOURCES:
+        targets: List[Tuple[str, Optional[str]]] = LIVE_HUB_FALLBACK_SOURCES[source_key]
+    else:
+        targets = [(spec.repo_id, cfg_name) for cfg_name in spec.config_names]
 
-    for cfg_name in spec.config_names:
-        load_kwargs: Dict[str, Any] = {
-            "path": spec.repo_id,
-            "split": spec.split,
-            "streaming": streaming,
-        }
-        if cfg_name and cfg_name != "default":
-            load_kwargs["name"] = cfg_name
-
-        ds = load_dataset(**load_kwargs)
-        if spec.drop_columns:
-            ds = drop_pil_image_columns(ds, spec.drop_columns)
-
-        normalized_chunk = normalize_arabic_sft_iterable(
-            source_key=source_key,
-            rows=ds,
-            config_name=cfg_name,
-            tokenizer=tokenizer,
-            max_samples=per_config_limit,
+    def _collect_from_targets(
+        candidate_targets: List[Tuple[str, Optional[str]]]
+    ) -> List[Dict[str, Any]]:
+        chunk_results: List[Dict[str, Any]] = []
+        per_target_limit = (
+            max(1, max_samples // len(candidate_targets))
+            if max_samples is not None
+            else None
         )
-        collected.extend(normalized_chunk)
-        if max_samples is not None and len(collected) >= max_samples:
-            return collected[:max_samples]
+        for repo_id, cfg_name in candidate_targets:
+            if repo_id == "parquet" and cfg_name:
+                ds = load_dataset(
+                    "parquet",
+                    data_files=cfg_name,
+                    split="train",
+                    streaming=streaming,
+                )
+            else:
+                load_kwargs: Dict[str, Any] = {
+                    "path": repo_id,
+                    "split": spec.split,
+                    "streaming": streaming,
+                }
+                if cfg_name and cfg_name != "default":
+                    load_kwargs["name"] = cfg_name
+                ds = load_dataset(**load_kwargs)
 
-    return collected
+            if spec.drop_columns:
+                ds = drop_pil_image_columns(ds, spec.drop_columns)
+
+            normalized_chunk = normalize_arabic_sft_iterable(
+                source_key=source_key,
+                rows=ds,
+                config_name=cfg_name or "default",
+                tokenizer=tokenizer,
+                max_samples=per_target_limit,
+            )
+            chunk_results.extend(normalized_chunk)
+            if max_samples is not None and len(chunk_results) >= max_samples:
+                return chunk_results[:max_samples]
+        return chunk_results
+
+    return _collect_from_targets(targets)

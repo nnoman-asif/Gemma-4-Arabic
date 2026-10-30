@@ -217,6 +217,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    for noisy_logger in ("httpx", "httpcore", "urllib3", "fsspec"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     args = parse_args(argv)
 
     cfg_path = pathlib.Path(args.config)
