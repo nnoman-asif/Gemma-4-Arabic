@@ -338,9 +338,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
+    use_4bit_for_merge = bool(args.offload_to_cpu) or (effective_format == "gguf")
     model, tokenizer, offload_state = load_gemma4_8gb_model_and_tokenizer(
         model_name=args.base_model,
         max_seq_length=DEFAULT_MAX_SEQ_LENGTH,
+        load_in_4bit=use_4bit_for_merge,
         attach_lora=False,
         adapter_checkpoint=args.adapter_dir if pathlib.Path(args.adapter_dir).exists() else None,
         is_trainable=False,

@@ -105,15 +105,33 @@ def profile_single_model_live(
     device: str = "cuda:0",
 ) -> Dict[str, Any]:
     """Run live CUDA event timing for TTFT, decode tokens/sec, and peak VRAM if model is present."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map=device if torch.cuda.is_available() else "cpu",
-        trust_remote_code=True,
+    hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    arch_list = getattr(hf_cfg, "architectures", None) or []
+    is_multimodal = (
+        getattr(hf_cfg, "model_type", "") == "gemma4"
+        or any("ConditionalGeneration" in a for a in arch_list)
     )
+    target_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    target_device = device if torch.cuda.is_available() else "cpu"
+    if is_multimodal:
+        from transformers import AutoModelForImageTextToText
+
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            dtype=target_dtype,
+            device_map=target_device,
+            trust_remote_code=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            dtype=target_dtype,
+            device_map=target_device,
+            trust_remote_code=True,
+        )
     model.eval()
 
     profiles: Dict[str, Any] = {}

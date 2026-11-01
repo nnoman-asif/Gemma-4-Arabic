@@ -11,14 +11,28 @@ Integrates `src/vram_hooks.py` to enforce the 8.0 GB GPU VRAM budget by:
    `up_proj`, `down_proj`) with `use_gradient_checkpointing="unsloth"`.
 """
 
+import builtins
 import gc
 import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+if not hasattr(builtins, "auto_docstring"):
+    try:
+        from transformers.utils import auto_docstring as _hf_auto_docstring  # type: ignore
+
+        builtins.auto_docstring = _hf_auto_docstring  # type: ignore[attr-defined]
+    except Exception:
+        def _fallback_auto_docstring(*args: Any, **kwargs: Any) -> Any:
+            if args and callable(args[0]) and len(args) == 1 and not kwargs:
+                return args[0]
+            return lambda fn: fn
+
+        builtins.auto_docstring = _fallback_auto_docstring  # type: ignore[attr-defined]
+
 try:
     import unsloth  # type: ignore # noqa: F401
-except ImportError:
+except Exception:
     pass
 
 import torch
@@ -160,7 +174,7 @@ def inject_rslora_adapters(
     clean fallback to Hugging Face PEFT `get_peft_model` + `LoraConfig`.
     """
     target_list = list(target_modules)
-    exclude_list = list(exclude_modules)
+    exclude_list = list(dict.fromkeys([*LORA_EXCLUDE_MODULES, *exclude_modules]))
 
     try:
         from unsloth import FastLanguageModel  # type: ignore

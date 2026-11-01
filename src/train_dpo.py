@@ -13,6 +13,7 @@ Configures:
 """
 
 import argparse
+import builtins
 import inspect
 import json
 import logging
@@ -20,9 +21,22 @@ import pathlib
 import sys
 from typing import Any, Dict, List, Optional
 
+if not hasattr(builtins, "auto_docstring"):
+    try:
+        from transformers.utils import auto_docstring as _hf_auto_docstring  # type: ignore
+
+        builtins.auto_docstring = _hf_auto_docstring  # type: ignore[attr-defined]
+    except Exception:
+        def _fallback_auto_docstring(*args: Any, **kwargs: Any) -> Any:
+            if args and callable(args[0]) and len(args) == 1 and not kwargs:
+                return args[0]
+            return lambda fn: fn
+
+        builtins.auto_docstring = _fallback_auto_docstring  # type: ignore[attr-defined]
+
 try:
     import unsloth  # type: ignore # noqa: F401
-except ImportError:
+except Exception:
     pass
 
 import torch
