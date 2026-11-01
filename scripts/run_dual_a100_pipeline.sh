@@ -65,7 +65,7 @@ echo "======================================================================"
     --adapter-dir outputs/dpo_e4b_a100 \
     --output-dir outputs/merged_gemma4_e4b_arabic \
     --export-format merged_16bit
-) > logs/gpu0_e4b.log 2>&1 &
+) 2>&1 | tee logs/gpu0_e4b.log &
 PID_GPU0=$!
 
 (
@@ -90,7 +90,7 @@ PID_GPU0=$!
     --adapter-dir outputs/dpo_26b_a4b_a100 \
     --output-dir outputs/merged_gemma4_26b_a4b_arabic \
     --export-format merged_16bit
-) > logs/gpu1_26b_a4b.log 2>&1 &
+) 2>&1 | tee logs/gpu1_26b_a4b.log &
 PID_GPU1=$!
 
 echo "Waiting for GPU 0 (PID ${PID_GPU0}) and GPU 1 (PID ${PID_GPU1}) to complete..."
