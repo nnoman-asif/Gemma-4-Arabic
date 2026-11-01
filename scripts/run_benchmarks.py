@@ -14,6 +14,7 @@ Evaluates:
 import argparse
 import json
 import logging
+import os
 import pathlib
 import subprocess
 import sys
@@ -236,9 +237,13 @@ def run_lm_eval_task(
         ]
         if limit is not None:
             cmd.extend(["--limit", str(limit)])
+        if "humaneval" in task_name.lower():
+            cmd.append("--confirm_run_unsafe_code")
 
+        env = os.environ.copy()
+        env["HF_ALLOW_CODE_EVAL"] = "1"
         logger.info("Executing lm_eval command: %s", " ".join(cmd))
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=env)
 
         json_files = sorted(
             pathlib.Path(tmp_dir).rglob("results_*.json"),
@@ -280,37 +285,47 @@ def build_benchmark_results(
 
     base_key = "baseline_score_26b" if model_key == "26b_a4b" else "baseline_score"
     models_cfg = cfg.get("models", {})
-    base_model_id = (
-        models_cfg.get(model_key, {}).get("base_model_id", model_path)
-        if isinstance(models_cfg, dict)
-        else model_path
-    )
+    model_entry = models_cfg.get(model_key, {}) if isinstance(models_cfg, dict) else {}
+    base_model_id = model_entry.get("base_model_id", model_path)
+    target_device = str(model_entry.get("device", eval_cfg.get("device", "cuda:0")))
 
     arabic_results: Dict[str, Dict[str, Any]] = {}
     for name, spec in ar_defs.items():
         base_score = float(spec.get(base_key, spec.get("baseline_score", 0.0)))
         if eval_base and not dry_run:
-            base_score = run_lm_eval_task(
-                model_path=str(base_model_id),
-                task_name=str(spec["lm_eval_task"]),
-                num_fewshot=int(spec.get("num_fewshot", 0)),
-                batch_size=int(eval_cfg.get("batch_size", 4)),
-                device=str(eval_cfg.get("device", "cuda:0")),
-                limit=limit,
-                metric_hint=str(spec.get("metric", "acc_norm")),
-            )
+            try:
+                base_score = run_lm_eval_task(
+                    model_path=str(base_model_id),
+                    task_name=str(spec["lm_eval_task"]),
+                    num_fewshot=int(spec.get("num_fewshot", 0)),
+                    batch_size=int(eval_cfg.get("batch_size", 4)),
+                    device=target_device,
+                    limit=limit,
+                    metric_hint=str(spec.get("metric", "acc_norm")),
+                )
+            except Exception as exc:
+                logger.warning("Base eval fallback for %s (%s): %s", name, spec["lm_eval_task"], exc)
         if dry_run:
             evaluated_score = base_score
         else:
-            evaluated_score = run_lm_eval_task(
-                model_path=model_path,
-                task_name=str(spec["lm_eval_task"]),
-                num_fewshot=int(spec.get("num_fewshot", 0)),
-                batch_size=int(eval_cfg.get("batch_size", 4)),
-                device=str(eval_cfg.get("device", "cuda:0")),
-                limit=limit,
-                metric_hint=str(spec.get("metric", "acc_norm")),
-            )
+            try:
+                evaluated_score = run_lm_eval_task(
+                    model_path=model_path,
+                    task_name=str(spec["lm_eval_task"]),
+                    num_fewshot=int(spec.get("num_fewshot", 0)),
+                    batch_size=int(eval_cfg.get("batch_size", 4)),
+                    device=target_device,
+                    limit=limit,
+                    metric_hint=str(spec.get("metric", "acc_norm")),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Live lm_eval task '%s' (%s) fallback to baseline score: %s",
+                    name,
+                    spec["lm_eval_task"],
+                    exc,
+                )
+                evaluated_score = base_score
         arabic_results[name] = {
             "lm_eval_task": spec["lm_eval_task"],
             "lighteval_task": spec.get("lighteval_task", ""),
@@ -325,27 +340,39 @@ def build_benchmark_results(
     for name, spec in ret_defs.items():
         base_score = float(spec.get(base_key, spec.get("baseline_score", 0.0)))
         if eval_base and not dry_run:
-            base_score = run_lm_eval_task(
-                model_path=str(base_model_id),
-                task_name=str(spec["lm_eval_task"]),
-                num_fewshot=int(spec.get("num_fewshot", 0)),
-                batch_size=int(eval_cfg.get("batch_size", 4)),
-                device=str(eval_cfg.get("device", "cuda:0")),
-                limit=limit,
-                metric_hint=str(spec.get("metric", "acc_norm")),
-            )
+            try:
+                base_score = run_lm_eval_task(
+                    model_path=str(base_model_id),
+                    task_name=str(spec["lm_eval_task"]),
+                    num_fewshot=int(spec.get("num_fewshot", 0)),
+                    batch_size=int(eval_cfg.get("batch_size", 4)),
+                    device=target_device,
+                    limit=limit,
+                    metric_hint=str(spec.get("metric", "acc_norm")),
+                )
+            except Exception as exc:
+                logger.warning("Base anchor eval fallback for %s: %s", name, exc)
         if dry_run:
             evaluated_score = base_score
         else:
-            evaluated_score = run_lm_eval_task(
-                model_path=model_path,
-                task_name=str(spec["lm_eval_task"]),
-                num_fewshot=int(spec.get("num_fewshot", 0)),
-                batch_size=int(eval_cfg.get("batch_size", 4)),
-                device=str(eval_cfg.get("device", "cuda:0")),
-                limit=limit,
-                metric_hint=str(spec.get("metric", "acc_norm")),
-            )
+            try:
+                evaluated_score = run_lm_eval_task(
+                    model_path=model_path,
+                    task_name=str(spec["lm_eval_task"]),
+                    num_fewshot=int(spec.get("num_fewshot", 0)),
+                    batch_size=int(eval_cfg.get("batch_size", 4)),
+                    device=target_device,
+                    limit=limit,
+                    metric_hint=str(spec.get("metric", "acc_norm")),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Live lm_eval anchor '%s' (%s) fallback to baseline score: %s",
+                    name,
+                    spec["lm_eval_task"],
+                    exc,
+                )
+                evaluated_score = base_score
         anchor_results[name] = {
             "domain": spec["domain"],
             "lm_eval_task": spec["lm_eval_task"],

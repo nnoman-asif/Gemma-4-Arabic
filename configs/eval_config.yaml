@@ -6,7 +6,7 @@ evaluation:
   base_model_id: "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
   sft_checkpoint_dir: "outputs/sft_stage1"
   dpo_checkpoint_dir: "outputs/dpo_stage2"
-  merged_checkpoint_dir: "outputs/merged_gemma4_e4b_arabic"
+  merged_checkpoint_dir: "outputs/merged_gemma4_e4b_arabic/merged_16bit"
   output_report_path: "outputs/eval_reports/benchmark_comparison.md"
   output_json_path: "outputs/eval_reports/benchmark_results.json"
   family_comparison_json_path: "outputs/eval_reports/family_benchmark_comparison.json"
@@ -21,7 +21,7 @@ models:
     architecture: "Dense (8.0B Total / 4.5B Active)"
     base_model_id: "google/gemma-4-E4B-it"
     unsloth_model_id: "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
-    merged_checkpoint_dir: "outputs/merged_gemma4_e4b_arabic"
+    merged_checkpoint_dir: "outputs/merged_gemma4_e4b_arabic/merged_16bit"
     hf_repo_id: "noman-asif/Gemma-4-E4B-Arabic-It"
     device: "cuda:0"
 
@@ -30,7 +30,7 @@ models:
     architecture: "MoE 128 Experts (26.0B Total / 3.8B Active)"
     base_model_id: "google/gemma-4-26B-A4B-it"
     unsloth_model_id: "unsloth/gemma-4-26B-A4B-it"
-    merged_checkpoint_dir: "outputs/merged_gemma4_26b_a4b_arabic"
+    merged_checkpoint_dir: "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit"
     hf_repo_id: "noman-asif/Gemma-4-26B-A4B-Arabic-It"
     device: "cuda:1"
 

@@ -175,6 +175,12 @@ def profile_single_model_live(
                 "peak_vram_gb": round(peak_vram_gb, 2),
             }
 
+    del model
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return profiles
 
 

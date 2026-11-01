@@ -253,6 +253,12 @@ def profile_vllm_model_live(
             "vram_utilization_pct": round((vram_used_gb / 80.0) * 100.0, 1),
         }
 
+    del llm
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return scaling_results
 
 
