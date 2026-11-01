@@ -1,4 +1,4 @@
-# Core Deep Learning and Unsloth 8.0 GB QLoRA Stack
+# Core Deep Learning and Unsloth 8.0 GB / A100 80 GB QLoRA Stack
 torch>=2.4.0
 transformers>=4.46.0
 datasets>=3.0.0
@@ -7,6 +7,9 @@ peft>=0.13.0
 trl>=0.12.0
 bitsandbytes>=0.44.0
 unsloth
+unsloth_zoo
+xformers
+cut-cross-entropy
 
 # Model Serialization, Tokenizer, and Configuration Utilities
 safetensors>=0.4.5

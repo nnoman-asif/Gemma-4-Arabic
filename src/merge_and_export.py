@@ -18,12 +18,21 @@ import pathlib
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
-import torch
-import torch.nn as nn
-
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.model_loader import ensure_unsloth_builtins, load_gemma4_8gb_model_and_tokenizer
+
+ensure_unsloth_builtins()
+
+try:
+    import unsloth  # type: ignore # noqa: F401
+except Exception:
+    pass
+
+import torch
+import torch.nn as nn
 
 from src.constants import (
     BASE_MODEL_ID,
@@ -31,7 +40,6 @@ from src.constants import (
     DEFAULT_TIES_DENSITY,
     DEFAULT_TIES_LAMBDA,
 )
-from src.model_loader import load_gemma4_8gb_model_and_tokenizer
 from src.vram_hooks import restore_multimodal_towers
 
 logger = logging.getLogger(__name__)
@@ -190,21 +198,30 @@ def export_merged_checkpoint(
     if export_format in {"merged_16bit", "both"}:
         out_16bit = output_dir / "merged_16bit"
         out_16bit.mkdir(parents=True, exist_ok=True)
+        saved_via_unsloth = False
         if hasattr(model, "save_pretrained_merged"):
-            model.save_pretrained_merged(
-                str(out_16bit),
-                tokenizer,
-                save_method="merged_16bit",
-            )
-        elif hasattr(model, "merge_and_unload"):
-            merged = model.merge_and_unload()
-            merged.save_pretrained(str(out_16bit), safe_serialization=True)
-            if tokenizer is not None:
-                tokenizer.save_pretrained(str(out_16bit))
-        else:
-            model.save_pretrained(str(out_16bit), safe_serialization=True)
-            if tokenizer is not None:
-                tokenizer.save_pretrained(str(out_16bit))
+            try:
+                model.save_pretrained_merged(
+                    str(out_16bit),
+                    tokenizer,
+                    save_method="merged_16bit",
+                )
+                saved_via_unsloth = True
+            except Exception as unsloth_merge_exc:
+                logger.warning(
+                    "save_pretrained_merged failed (%s); falling back to PEFT merge_and_unload.",
+                    unsloth_merge_exc,
+                )
+        if not saved_via_unsloth:
+            if hasattr(model, "merge_and_unload"):
+                merged = model.merge_and_unload()
+                merged.save_pretrained(str(out_16bit), safe_serialization=True)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(str(out_16bit))
+            else:
+                model.save_pretrained(str(out_16bit), safe_serialization=True)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(str(out_16bit))
         exported_artifacts.append(str(out_16bit))
 
     if export_format in {"gguf", "both"}:

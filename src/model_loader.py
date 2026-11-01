@@ -13,12 +13,159 @@ Integrates `src/vram_hooks.py` to enforce the 8.0 GB GPU VRAM budget by:
 
 import builtins
 import gc
+import inspect
 import logging
 import os
+import sys
+import types
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+
+def _ensure_xformers_for_unsloth() -> None:
+    """Ensure `xformers.ops.fmha` is importable so Unsloth never crashes on CUDA 13.x containers.
+
+    If a native `xformers` package is installed and its C++/CUDA extensions load cleanly,
+    it is used directly. If `xformers` is missing or its binary wheel mismatches the host
+    CUDA toolkit (e.g., CUDA 13.2 on Vast.ai), registers a lightweight PyTorch SDPA-backed
+    module shim in `sys.modules` so `import unsloth` and `FastLanguageModel` succeed and
+    use PyTorch 2's native C++ FlashAttention-2 / cuDNN SDPA kernels.
+    """
+    try:
+        import xformers.ops.fmha  # type: ignore # noqa: F401
+        from xformers.ops.fmha.attn_bias import (  # type: ignore # noqa: F401
+            BlockDiagonalCausalMask,
+            LowerTriangularFromBottomRightMask,
+            LowerTriangularMaskWithTensorBias,
+        )
+
+        return
+    except Exception:
+        pass
+
+    class _AttentionBias:
+        """Fallback attention bias base marker for Unsloth's xformers symbol imports."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+        @classmethod
+        def from_seqlens(cls, q_seqlen: Sequence[int], kv_seqlen: Optional[Sequence[int]] = None) -> "_AttentionBias":
+            return cls(q_seqlen=q_seqlen, kv_seqlen=kv_seqlen)
+
+    class _LowerTriangularMask(_AttentionBias):
+        pass
+
+    class _BlockDiagonalCausalMask(_AttentionBias):
+        pass
+
+    class _LowerTriangularMaskWithTensorBias(_AttentionBias):
+        pass
+
+    class _LowerTriangularFromBottomRightMask(_AttentionBias):
+        pass
+
+    def _sdpa_memory_efficient_attention(
+        query: Any,
+        key: Any,
+        value: Any,
+        attn_bias: Any = None,
+        p: float = 0.0,
+        scale: Optional[float] = None,
+        **kwargs: Any,
+    ) -> Any:
+        import torch.nn.functional as F
+
+        # xformers uses (B, M, H, K); torch SDPA uses (B, H, M, K)
+        q_t = query.transpose(1, 2)
+        k_t = key.transpose(1, 2)
+        v_t = value.transpose(1, 2)
+
+        is_causal = attn_bias is not None and (
+            isinstance(
+                attn_bias,
+                (
+                    _AttentionBias,
+                    type,
+                ),
+            )
+            or "Causal" in type(attn_bias).__name__
+            or "LowerTriangular" in type(attn_bias).__name__
+        )
+        attn_mask = attn_bias if hasattr(attn_bias, "shape") else None
+        if attn_mask is not None:
+            is_causal = False
+
+        sdpa_kwargs: Dict[str, Any] = {
+            "attn_mask": attn_mask,
+            "dropout_p": float(p) if p else 0.0,
+            "is_causal": is_causal,
+        }
+        if scale is not None:
+            sdpa_kwargs["scale"] = scale
+        if q_t.shape[1] != k_t.shape[1]:
+            sdpa_kwargs["enable_gqa"] = True
+
+        try:
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t, **sdpa_kwargs)
+        except TypeError:
+            sdpa_kwargs.pop("enable_gqa", None)
+            if q_t.shape[1] != k_t.shape[1] and k_t.shape[1] > 0:
+                repeat_factor = q_t.shape[1] // k_t.shape[1]
+                k_t = k_t.repeat_interleave(repeat_factor, dim=1)
+                v_t = v_t.repeat_interleave(repeat_factor, dim=1)
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t, **sdpa_kwargs)
+        return out.transpose(1, 2).contiguous()
+
+    xf_mod = types.ModuleType("xformers")
+    xf_mod.__version__ = "0.0.29.post3"  # type: ignore[attr-defined]
+    xf_mod.__path__ = []  # type: ignore[attr-defined]
+
+    ops_mod = types.ModuleType("xformers.ops")
+    ops_mod.__path__ = []  # type: ignore[attr-defined]
+
+    fmha_mod = types.ModuleType("xformers.ops.fmha")
+    fmha_mod.__path__ = []  # type: ignore[attr-defined]
+
+    attn_bias_mod = types.ModuleType("xformers.ops.fmha.attn_bias")
+    setattr(attn_bias_mod, "AttentionBias", _AttentionBias)
+    setattr(attn_bias_mod, "LowerTriangularMask", _LowerTriangularMask)
+    setattr(attn_bias_mod, "BlockDiagonalCausalMask", _BlockDiagonalCausalMask)
+    setattr(attn_bias_mod, "LowerTriangularMaskWithTensorBias", _LowerTriangularMaskWithTensorBias)
+    setattr(attn_bias_mod, "LowerTriangularFromBottomRightMask", _LowerTriangularFromBottomRightMask)
+
+    for _sub_name in ("cutlass", "flash", "triton_splitk", "small_k", "common"):
+        _sub_mod = types.ModuleType(f"xformers.ops.fmha.{_sub_name}")
+        setattr(_sub_mod, "FwOp", object)
+        setattr(_sub_mod, "BwOp", object)
+        setattr(fmha_mod, _sub_name, _sub_mod)
+        sys.modules[f"xformers.ops.fmha.{_sub_name}"] = _sub_mod
+
+    setattr(fmha_mod, "attn_bias", attn_bias_mod)
+    setattr(fmha_mod, "memory_efficient_attention", _sdpa_memory_efficient_attention)
+    setattr(fmha_mod, "AttentionBias", _AttentionBias)
+    setattr(fmha_mod, "LowerTriangularMask", _LowerTriangularMask)
+
+    setattr(ops_mod, "fmha", fmha_mod)
+    setattr(ops_mod, "memory_efficient_attention", _sdpa_memory_efficient_attention)
+    setattr(ops_mod, "AttentionBias", _AttentionBias)
+    setattr(ops_mod, "LowerTriangularMask", _LowerTriangularMask)
+    setattr(ops_mod, "BlockDiagonalCausalMask", _BlockDiagonalCausalMask)
+    setattr(ops_mod, "LowerTriangularMaskWithTensorBias", _LowerTriangularMaskWithTensorBias)
+    setattr(ops_mod, "LowerTriangularFromBottomRightMask", _LowerTriangularFromBottomRightMask)
+
+    setattr(xf_mod, "ops", ops_mod)
+
+    sys.modules["xformers"] = xf_mod
+    sys.modules["xformers.ops"] = ops_mod
+    sys.modules["xformers.ops.fmha"] = fmha_mod
+    sys.modules["xformers.ops.fmha.attn_bias"] = attn_bias_mod
+
 
 def ensure_unsloth_builtins() -> None:
     """Populate `builtins` with Transformers symbols Unsloth's dynamic compiler may omit."""
+    _ensure_xformers_for_unsloth()
+
     for _builtin_dec in ("auto_docstring", "strict"):
         if not hasattr(builtins, _builtin_dec):
             try:
@@ -187,6 +334,120 @@ def freeze_embeddings_and_towers(
     return frozen_names
 
 
+def chunked_causal_lm_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    vocab_size: Optional[int] = None,
+    num_items_in_batch: Optional[Union[int, torch.Tensor]] = None,
+    ignore_index: int = -100,
+    shift_labels: Optional[torch.Tensor] = None,
+    chunk_tokens: int = 512,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """Compute exact FP32 cross-entropy in 512-token chunks to prevent 80+ GB FP32 logit OOMs.
+
+    Used automatically on the Transformers/PEFT fallback path so Gemma 4's 262,144-token
+    vocabulary never materializes a full `[B, S, 262144]` FP32 tensor in VRAM at once.
+    Mathematically identical to `ForCausalLMLoss` (exact same loss and gradients).
+    """
+    import torch.nn.functional as F
+    from torch.utils.checkpoint import checkpoint
+
+    if shift_labels is None:
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
+    else:
+        shift_logits = logits
+
+    v_size = int(vocab_size) if vocab_size is not None else int(shift_logits.shape[-1])
+    flat_logits = shift_logits.reshape(-1, v_size)
+    flat_labels = shift_labels.reshape(-1).to(flat_logits.device)
+
+    total_tokens = flat_logits.shape[0]
+    if total_tokens == 0:
+        return flat_logits.sum() * 0.0
+
+    def _ce_chunk_step(logit_slice: torch.Tensor, label_slice: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(
+            logit_slice.float(),
+            label_slice,
+            ignore_index=ignore_index,
+            reduction="sum",
+        )
+
+    use_ckpt = bool(torch.is_grad_enabled() and flat_logits.requires_grad)
+    losses: List[torch.Tensor] = []
+    for start_idx in range(0, total_tokens, chunk_tokens):
+        end_idx = min(start_idx + chunk_tokens, total_tokens)
+        lbl_chunk = flat_labels[start_idx:end_idx]
+        if not torch.any(lbl_chunk != ignore_index):
+            continue
+        logit_chunk = flat_logits[start_idx:end_idx]
+        if use_ckpt:
+            losses.append(
+                checkpoint(_ce_chunk_step, logit_chunk, lbl_chunk, use_reentrant=False)
+            )
+        else:
+            losses.append(_ce_chunk_step(logit_chunk, lbl_chunk))
+
+    if not losses:
+        return flat_logits.sum() * 0.0
+
+    total_loss = torch.stack(losses).sum()
+    if num_items_in_batch is not None:
+        denom = (
+            num_items_in_batch.to(total_loss.device, dtype=total_loss.dtype)
+            if torch.is_tensor(num_items_in_batch)
+            else float(num_items_in_batch)
+        )
+        return total_loss / denom
+    valid_count = (flat_labels != ignore_index).sum().clamp_min(1).to(total_loss.dtype)
+    return total_loss / valid_count
+
+
+def install_chunked_causal_lm_loss(model: nn.Module) -> None:
+    """Install `chunked_causal_lm_loss` on a Transformers/PEFT fallback model hierarchy."""
+    for obj in (
+        model,
+        getattr(model, "base_model", None),
+        getattr(getattr(model, "base_model", None), "model", None),
+        getattr(model, "model", None),
+    ):
+        if obj is not None and isinstance(obj, nn.Module):
+            try:
+                setattr(obj, "loss_function", chunked_causal_lm_loss)
+            except Exception:
+                pass
+
+
+def _configure_trainable_model_flags(model: nn.Module, is_trainable: bool = True) -> None:
+    """Ensure `use_cache=False` across top-level and nested `text_config` objects during training."""
+    if not is_trainable:
+        return
+    seen_configs = set()
+    for obj in (
+        model,
+        getattr(model, "base_model", None),
+        getattr(getattr(model, "base_model", None), "model", None),
+        getattr(model, "model", None),
+    ):
+        if obj is None:
+            continue
+        cfg = getattr(obj, "config", None)
+        if cfg is not None and id(cfg) not in seen_configs:
+            seen_configs.add(id(cfg))
+            try:
+                cfg.use_cache = False
+            except Exception:
+                pass
+            text_cfg = getattr(cfg, "text_config", None)
+            if text_cfg is not None:
+                try:
+                    text_cfg.use_cache = False
+                except Exception:
+                    pass
+
+
 def inject_rslora_adapters(
     model: nn.Module,
     r: int = LORA_RANK,
@@ -206,6 +467,11 @@ def inject_rslora_adapters(
     """
     target_list = list(target_modules)
     exclude_list = list(dict.fromkeys([*LORA_EXCLUDE_MODULES, *exclude_modules]))
+    exclude_regex = (
+        r".*(" + "|".join(exclude_list) + r").*"
+        if exclude_list
+        else None
+    )
 
     try:
         from unsloth import FastLanguageModel  # type: ignore
@@ -218,18 +484,37 @@ def inject_rslora_adapters(
             use_rslora,
             target_list,
         )
-        peft_model = FastLanguageModel.get_peft_model(
-            model,
-            r=r,
-            lora_alpha=lora_alpha,
-            use_rslora=use_rslora,
-            lora_dropout=lora_dropout,
-            bias=bias,
-            target_modules=target_list,
-            exclude_modules=exclude_list,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            random_state=random_state,
-        )
+        unsloth_peft_kwargs: Dict[str, Any] = {
+            "r": r,
+            "lora_alpha": lora_alpha,
+            "use_rslora": use_rslora,
+            "lora_dropout": lora_dropout,
+            "bias": bias,
+            "target_modules": target_list,
+            "use_gradient_checkpointing": use_gradient_checkpointing,
+            "random_state": random_state,
+        }
+        try:
+            sig = inspect.signature(FastLanguageModel.get_peft_model)
+            if "finetune_vision_layers" in sig.parameters:
+                unsloth_peft_kwargs["finetune_vision_layers"] = False
+            if "finetune_language_layers" in sig.parameters:
+                unsloth_peft_kwargs["finetune_language_layers"] = True
+        except Exception:
+            pass
+
+        try:
+            peft_model = FastLanguageModel.get_peft_model(
+                model,
+                exclude_modules=exclude_list,
+                **unsloth_peft_kwargs,
+            )
+        except TypeError:
+            peft_model = FastLanguageModel.get_peft_model(
+                model,
+                **unsloth_peft_kwargs,
+            )
+        setattr(peft_model, "_is_unsloth_model", True)
         return peft_model
     except Exception as unsloth_exc:
         logger.info(
@@ -248,11 +533,6 @@ def inject_rslora_adapters(
             except TypeError:
                 model.gradient_checkpointing_enable()
 
-        exclude_regex = (
-            r".*(" + "|".join(exclude_list) + r").*"
-            if exclude_list
-            else None
-        )
         lora_cfg = LoraConfig(
             r=r,
             lora_alpha=lora_alpha,
@@ -263,7 +543,10 @@ def inject_rslora_adapters(
             exclude_modules=exclude_regex,
             task_type="CAUSAL_LM",
         )
-        return get_peft_model(model, lora_cfg)
+        peft_model = get_peft_model(model, lora_cfg)
+        if not getattr(model, "_is_unsloth_model", False):
+            install_chunked_causal_lm_loss(peft_model)
+        return peft_model
 
 
 def load_gemma4_8gb_model_and_tokenizer(
@@ -312,6 +595,16 @@ def load_gemma4_8gb_model_and_tokenizer(
         from transformers import AutoConfig
 
         hf_config = AutoConfig.from_pretrained(model_name)
+        if is_trainable:
+            try:
+                hf_config.use_cache = False
+            except Exception:
+                pass
+            if hasattr(hf_config, "text_config") and hf_config.text_config is not None:
+                try:
+                    hf_config.text_config.use_cache = False
+                except Exception:
+                    pass
         if enable_cpu_offload:
             quant_cfg = getattr(hf_config, "quantization_config", None)
             if isinstance(quant_cfg, dict):
@@ -321,6 +614,7 @@ def load_gemma4_8gb_model_and_tokenizer(
     except Exception as cfg_exc:
         logger.debug("AutoConfig preload skipped for '%s': %s", model_name, cfg_exc)
 
+    used_unsloth_loader = False
     try:
         from unsloth import FastLanguageModel  # type: ignore
 
@@ -338,7 +632,7 @@ def load_gemma4_8gb_model_and_tokenizer(
             "load_in_4bit": load_in_4bit,
             "device_map": device_map,
         }
-        if hf_config is not None:
+        if hf_config is not None and adapter_checkpoint is None:
             unsloth_kwargs["config"] = hf_config
         try:
             model, tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
@@ -354,6 +648,22 @@ def load_gemma4_8gb_model_and_tokenizer(
             ):
                 inner_tok.chat_template = tokenizer.chat_template
             tokenizer = inner_tok
+
+        if adapter_checkpoint is not None and is_trainable:
+            if hasattr(FastLanguageModel, "for_training"):
+                try:
+                    FastLanguageModel.for_training(
+                        model,
+                        use_gradient_checkpointing=use_gradient_checkpointing,
+                    )
+                except TypeError:
+                    FastLanguageModel.for_training(model)
+            for name, param in model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad_(True)
+
+        used_unsloth_loader = True
+        setattr(model, "_is_unsloth_model", True)
     except Exception as unsloth_exc:
         logger.warning(
             "Unsloth FastLanguageModel.from_pretrained unavailable (%s); using Transformers loader.",
@@ -368,6 +678,17 @@ def load_gemma4_8gb_model_and_tokenizer(
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if hf_config is None:
             hf_config = AutoConfig.from_pretrained(model_name)
+        if is_trainable:
+            try:
+                hf_config.use_cache = False
+            except Exception:
+                pass
+            if hasattr(hf_config, "text_config") and hf_config.text_config is not None:
+                try:
+                    hf_config.text_config.use_cache = False
+                except Exception:
+                    pass
+
         quant_cfg = getattr(hf_config, "quantization_config", None)
         has_prequant = quant_cfg is not None
         if enable_cpu_offload:
@@ -381,6 +702,8 @@ def load_gemma4_8gb_model_and_tokenizer(
             "dtype": resolved_dtype,
             "device_map": device_map,
         }
+        if torch.cuda.is_available():
+            load_kwargs["attn_implementation"] = "sdpa"
         if not has_prequant and load_in_4bit and torch.cuda.is_available():
             load_kwargs["quantization_config"] = build_bnb_4bit_config(
                 compute_dtype=resolved_dtype,
@@ -392,36 +715,42 @@ def load_gemma4_8gb_model_and_tokenizer(
             getattr(hf_config, "model_type", "") == "gemma4"
             or any("ConditionalGeneration" in a for a in arch_list)
         )
+        loader_cls: Any = AutoModelForCausalLM
         if is_multimodal_arch:
             from transformers import AutoModelForImageTextToText
 
-            model = AutoModelForImageTextToText.from_pretrained(
-                model_name,
-                **load_kwargs,
-            )
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                **load_kwargs,
-            )
+            loader_cls = AutoModelForImageTextToText
+
+        try:
+            model = loader_cls.from_pretrained(model_name, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop("attn_implementation", None)
+            model = loader_cls.from_pretrained(model_name, **load_kwargs)
+
+        if is_trainable:
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+            if use_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+                try:
+                    model.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False}
+                    )
+                except TypeError:
+                    model.gradient_checkpointing_enable()
+
+        install_chunked_causal_lm_loss(model)
+
         if adapter_checkpoint is not None:
             from peft import PeftModel
 
-            if is_trainable:
-                if hasattr(model, "enable_input_require_grads"):
-                    model.enable_input_require_grads()
-                if use_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-                    try:
-                        model.gradient_checkpointing_enable(
-                            gradient_checkpointing_kwargs={"use_reentrant": False}
-                        )
-                    except TypeError:
-                        model.gradient_checkpointing_enable()
             model = PeftModel.from_pretrained(
                 model,
                 adapter_checkpoint,
                 is_trainable=is_trainable,
             )
+            install_chunked_causal_lm_loss(model)
+
+    _configure_trainable_model_flags(model, is_trainable=is_trainable)
 
     # Freeze embeddings, multimodal towers, and MoE router gates
     freeze_embeddings_and_towers(model, freeze_moe_router=freeze_moe_router)
@@ -468,6 +797,10 @@ def load_gemma4_8gb_model_and_tokenizer(
         # Re-verify PLE, multimodal towers, and MoE routers remain frozen after PEFT wrapping
         freeze_embeddings_and_towers(model, freeze_moe_router=freeze_moe_router)
         setattr(model, "_vram_offload_state", offload_state)
+
+    if not used_unsloth_loader and not getattr(model, "_is_unsloth_model", False):
+        install_chunked_causal_lm_loss(model)
+    _configure_trainable_model_flags(model, is_trainable=is_trainable)
 
     log_vram_telemetry(model, stage="post_model_load")
     return model, tokenizer, offload_state

@@ -55,9 +55,9 @@ dpo:
 
 training:
   output_dir: "outputs/dpo_e4b_stage2"
-  per_device_train_batch_size: 8
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 8
   optim: "adamw_bnb_8bit"
   learning_rate: 5.0e-7
   lr_scheduler_type: "cosine"
