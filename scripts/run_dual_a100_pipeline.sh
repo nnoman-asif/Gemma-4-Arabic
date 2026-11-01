@@ -26,7 +26,7 @@ else
   "${PYTHON_BIN}" scripts/build_sft_dataset.py \
     --config configs/sft_26b_a4b_a100.yaml \
     --output-dir data/sft_mixed \
-    --total-samples 120000
+    --max-samples 120000
 fi
 
 if [[ -f "data/dpo_mixed/dataset_info.json" || -f "data/dpo_mixed/state.json" ]]; then
@@ -38,7 +38,7 @@ else
 fi
 
 echo "======================================================================"
-echo "[Phase 2/5] Launching Simultaneous Dual-GPU Training (GPU 0 + GPU 1)"
+echo "[Phase 2/4] Launching Simultaneous Dual-GPU Training (GPU 0 + GPU 1)"
 echo "  - GPU 0: Gemma-4-E4B-Arabic-It      -> logs/gpu0_e4b.log"
 echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  -> logs/gpu1_26b_a4b.log"
 echo "======================================================================"
@@ -98,7 +98,7 @@ wait "${PID_GPU0}"
 wait "${PID_GPU1}"
 
 echo "======================================================================"
-echo "[Phase 3/5] Evaluating Both Models on 7 Arabic + 4 Retention Benchmarks"
+echo "[Phase 3/4] Evaluating Both Models on 7 Arabic + 4 Retention Benchmarks"
 echo "======================================================================"
 "${PYTHON_BIN}" scripts/run_benchmarks.py \
   --config configs/eval_config.yaml \

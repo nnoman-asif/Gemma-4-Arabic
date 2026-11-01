@@ -11,6 +11,7 @@ unsloth
 # Model Serialization, Tokenizer, and Configuration Utilities
 safetensors>=0.4.5
 huggingface-hub>=0.26.0
+hf-transfer>=0.1.8
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 pyyaml>=6.0.1
@@ -18,6 +19,7 @@ numpy>=1.26.0
 scipy>=1.11.0
 tqdm>=4.66.0
 
-# Evaluation and Testing
+# Evaluation, Plotting, and Testing
 lm-eval>=0.4.5
+matplotlib>=3.8.0
 pytest>=8.0.0

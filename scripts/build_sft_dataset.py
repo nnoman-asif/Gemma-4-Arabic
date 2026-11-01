@@ -231,6 +231,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-samples",
+        "--total-samples",
+        dest="max_samples",
         type=int,
         default=None,
         help="Maximum total samples to build across Arabic and Replay sources.",
