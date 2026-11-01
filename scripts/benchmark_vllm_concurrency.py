@@ -479,14 +479,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             ckpt = models_cfg.get(key, {}).get("merged_checkpoint_dir")
             if ckpt and pathlib.Path(ckpt).exists():
                 logger.info("Running live vLLM concurrency benchmark for %s (%s)...", key, ckpt)
-                profile["models"][key]["concurrency_scaling"] = profile_vllm_model_live(
-                    model_path=str(ckpt),
-                    concurrency_users=users_list,
-                    prompt_tokens=int(vllm_cfg.get("prompt_tokens", 512)),
-                    max_new_tokens=int(vllm_cfg.get("max_new_tokens", 256)),
-                    gpu_memory_utilization=float(vllm_cfg.get("gpu_memory_utilization", 0.90)),
-                    weights_vram_gb=default_w_gb,
-                )
+                try:
+                    profile["models"][key]["concurrency_scaling"] = profile_vllm_model_live(
+                        model_path=str(ckpt),
+                        concurrency_users=users_list,
+                        prompt_tokens=int(vllm_cfg.get("prompt_tokens", 512)),
+                        max_new_tokens=int(vllm_cfg.get("max_new_tokens", 256)),
+                        gpu_memory_utilization=float(vllm_cfg.get("gpu_memory_utilization", 0.90)),
+                        weights_vram_gb=default_w_gb,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Live vLLM engine unavailable for %s (%s); using reference A100 80GB profile.",
+                        key,
+                        exc,
+                    )
 
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(profile, indent=2), encoding="utf-8")

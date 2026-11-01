@@ -522,13 +522,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             ckpt = models_cfg.get(key, {}).get("merged_checkpoint_dir")
             if ckpt and pathlib.Path(ckpt).exists():
                 logger.info("Running live latency profile for %s (%s)...", key, ckpt)
-                latency_profile["models"][key]["profiles"] = profile_single_model_live(
-                    model_path=str(ckpt),
-                    context_lengths=ctx_lengths,
-                    max_new_tokens=int(lat_cfg.get("max_new_tokens", 64)),
-                    warmup_runs=int(lat_cfg.get("warmup_runs", 1)),
-                    timed_runs=int(lat_cfg.get("timed_runs", 3)),
-                )
+                try:
+                    latency_profile["models"][key]["profiles"] = profile_single_model_live(
+                        model_path=str(ckpt),
+                        context_lengths=ctx_lengths,
+                        max_new_tokens=int(lat_cfg.get("max_new_tokens", 64)),
+                        warmup_runs=int(lat_cfg.get("warmup_runs", 1)),
+                        timed_runs=int(lat_cfg.get("timed_runs", 3)),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Live latency profile skipped for %s (%s); using reference A100 80GB profile.",
+                        key,
+                        exc,
+                    )
 
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text(json.dumps(latency_profile, indent=2), encoding="utf-8")
