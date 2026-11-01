@@ -11,6 +11,9 @@ set -euo pipefail
 
 export HF_XET_HIGH_PERFORMANCE=1
 export TOKENIZERS_PARALLELISM=false
+export TRANSFORMERS_VERBOSITY=warning
+export DATASETS_VERBOSITY=warning
+export PYTHONWARNINGS="ignore::SyntaxWarning,ignore::FutureWarning"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"

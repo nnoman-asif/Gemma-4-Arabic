@@ -18,29 +18,45 @@ import logging
 import os
 import sys
 import types
+import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 
-def _ensure_xformers_for_unsloth() -> None:
-    """Ensure `xformers.ops.fmha` is importable so Unsloth never crashes on CUDA 13.x containers.
+def _ensure_xformers_for_unsloth(force: bool = False) -> None:
+    """Ensure `xformers.ops.fmha` is importable if Unsloth requires it on CUDA 13.x containers.
 
-    If a native `xformers` package is installed and its C++/CUDA extensions load cleanly,
-    it is used directly. If `xformers` is missing or its binary wheel mismatches the host
-    CUDA toolkit (e.g., CUDA 13.2 on Vast.ai), registers a lightweight PyTorch SDPA-backed
-    module shim in `sys.modules` so `import unsloth` and `FastLanguageModel` succeed and
-    use PyTorch 2's native C++ FlashAttention-2 / cuDNN SDPA kernels.
+    Modern Unsloth (`>=2026.x`) uses PyTorch 2's built-in SDPA natively when `xformers` is
+    absent. If an older Unsloth build or broken `xformers` binary wheel fails during import,
+    this registers a spec-complete, PyTorch SDPA-backed module shim in `sys.modules`.
     """
-    try:
-        import xformers.ops.fmha  # type: ignore # noqa: F401
-        from xformers.ops.fmha.attn_bias import (  # type: ignore # noqa: F401
-            BlockDiagonalCausalMask,
-            LowerTriangularFromBottomRightMask,
-            LowerTriangularMaskWithTensorBias,
-        )
+    if not force:
+        try:
+            import xformers  # type: ignore
 
-        return
-    except Exception:
-        pass
+            if not getattr(xformers, "_has_cpp_library", True):
+                force = True
+            else:
+                import xformers.ops.fmha  # type: ignore # noqa: F401
+                from xformers.ops.fmha.attn_bias import (  # type: ignore # noqa: F401
+                    BlockDiagonalCausalMask,
+                    LowerTriangularFromBottomRightMask,
+                    LowerTriangularMaskWithTensorBias,
+                )
+
+                return
+        except Exception:
+            force = True
+
+    import importlib.machinery
+
+    def _make_module(name: str, is_pkg: bool = False) -> types.ModuleType:
+        mod = types.ModuleType(name)
+        spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=is_pkg)
+        if is_pkg:
+            spec.submodule_search_locations = []
+            mod.__path__ = []  # type: ignore[attr-defined]
+        mod.__spec__ = spec
+        return mod
 
     class _AttentionBias:
         """Fallback attention bias base marker for Unsloth's xformers symbol imports."""
@@ -50,7 +66,9 @@ def _ensure_xformers_for_unsloth() -> None:
             self.kwargs = kwargs
 
         @classmethod
-        def from_seqlens(cls, q_seqlen: Sequence[int], kv_seqlen: Optional[Sequence[int]] = None) -> "_AttentionBias":
+        def from_seqlens(
+            cls, q_seqlen: Sequence[int], kv_seqlen: Optional[Sequence[int]] = None
+        ) -> "_AttentionBias":
             return cls(q_seqlen=q_seqlen, kv_seqlen=kv_seqlen)
 
     class _LowerTriangularMask(_AttentionBias):
@@ -117,17 +135,18 @@ def _ensure_xformers_for_unsloth() -> None:
             out = F.scaled_dot_product_attention(q_t, k_t, v_t, **sdpa_kwargs)
         return out.transpose(1, 2).contiguous()
 
-    xf_mod = types.ModuleType("xformers")
-    xf_mod.__version__ = "0.0.29.post3"  # type: ignore[attr-defined]
-    xf_mod.__path__ = []  # type: ignore[attr-defined]
+    xf_mod = _make_module("xformers", is_pkg=True)
+    xf_mod.__version__ = "0.0.26.post1"  # type: ignore[attr-defined]
+    setattr(xf_mod, "_has_cpp_library", True)
 
-    ops_mod = types.ModuleType("xformers.ops")
-    ops_mod.__path__ = []  # type: ignore[attr-defined]
+    cpp_lib_mod = _make_module("xformers._cpp_lib", is_pkg=False)
+    setattr(cpp_lib_mod, "_register_extensions", lambda: None)
+    setattr(xf_mod, "_cpp_lib", cpp_lib_mod)
 
-    fmha_mod = types.ModuleType("xformers.ops.fmha")
-    fmha_mod.__path__ = []  # type: ignore[attr-defined]
+    ops_mod = _make_module("xformers.ops", is_pkg=True)
+    fmha_mod = _make_module("xformers.ops.fmha", is_pkg=True)
+    attn_bias_mod = _make_module("xformers.ops.fmha.attn_bias", is_pkg=False)
 
-    attn_bias_mod = types.ModuleType("xformers.ops.fmha.attn_bias")
     setattr(attn_bias_mod, "AttentionBias", _AttentionBias)
     setattr(attn_bias_mod, "LowerTriangularMask", _LowerTriangularMask)
     setattr(attn_bias_mod, "BlockDiagonalCausalMask", _BlockDiagonalCausalMask)
@@ -135,7 +154,7 @@ def _ensure_xformers_for_unsloth() -> None:
     setattr(attn_bias_mod, "LowerTriangularFromBottomRightMask", _LowerTriangularFromBottomRightMask)
 
     for _sub_name in ("cutlass", "flash", "triton_splitk", "small_k", "common"):
-        _sub_mod = types.ModuleType(f"xformers.ops.fmha.{_sub_name}")
+        _sub_mod = _make_module(f"xformers.ops.fmha.{_sub_name}", is_pkg=False)
         setattr(_sub_mod, "FwOp", object)
         setattr(_sub_mod, "BwOp", object)
         setattr(fmha_mod, _sub_name, _sub_mod)
@@ -157,14 +176,61 @@ def _ensure_xformers_for_unsloth() -> None:
     setattr(xf_mod, "ops", ops_mod)
 
     sys.modules["xformers"] = xf_mod
+    sys.modules["xformers._cpp_lib"] = cpp_lib_mod
     sys.modules["xformers.ops"] = ops_mod
     sys.modules["xformers.ops.fmha"] = fmha_mod
     sys.modules["xformers.ops.fmha.attn_bias"] = attn_bias_mod
 
 
+def configure_clean_logging() -> None:
+    """Silence verbose third-party config dumps (Gemma4Config JSON, httpx, SyntaxWarnings) while keeping pipeline INFO logs visible."""
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
+    os.environ.setdefault("DATASETS_VERBOSITY", "warning")
+    warnings.filterwarnings("ignore", category=SyntaxWarning)
+    warnings.filterwarnings("ignore", message=".*torch.jit.script.*")
+
+    for noisy_logger in (
+        "transformers",
+        "transformers.configuration_utils",
+        "transformers.modeling_utils",
+        "transformers.tokenization_utils_base",
+        "httpx",
+        "httpx2",
+        "httpcore",
+        "urllib3",
+        "huggingface_hub",
+        "datasets",
+        "accelerate",
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+    try:
+        import transformers.utils.logging as hf_logging
+
+        hf_logging.set_verbosity_warning()
+    except Exception:
+        pass
+
+    try:
+        import datasets.utils.logging as ds_logging  # type: ignore
+
+        ds_logging.set_verbosity_warning()
+    except Exception:
+        pass
+
+
 def ensure_unsloth_builtins() -> None:
-    """Populate `builtins` with Transformers symbols Unsloth's dynamic compiler may omit."""
-    _ensure_xformers_for_unsloth()
+    """Import `unsloth` first (before `transformers`), then populate `builtins` with Transformers symbols."""
+    configure_clean_logging()
+    if "unsloth" not in sys.modules:
+        try:
+            import unsloth  # type: ignore # noqa: F401
+        except Exception:
+            _ensure_xformers_for_unsloth(force=True)
+            try:
+                import unsloth  # type: ignore # noqa: F401
+            except Exception:
+                pass
 
     for _builtin_dec in ("auto_docstring", "strict"):
         if not hasattr(builtins, _builtin_dec):
@@ -204,14 +270,10 @@ def ensure_unsloth_builtins() -> None:
                         pass
         except Exception:
             pass
+    configure_clean_logging()
 
 
 ensure_unsloth_builtins()
-
-try:
-    import unsloth  # type: ignore # noqa: F401
-except Exception:
-    pass
 
 import torch
 import torch.nn as nn
@@ -571,6 +633,7 @@ def load_gemma4_8gb_model_and_tokenizer(
     cuda_device_index: Optional[int] = None,
 ) -> Tuple[nn.Module, Any, OffloadState]:
     """Load Gemma-4-E4B or Gemma-4-26B-A4B (MoE) with conditional VRAM hooks and rsLoRA."""
+    configure_clean_logging()
     resolved_dtype = resolve_torch_dtype(dtype)
     device_idx = (
         int(os.environ.get("LOCAL_RANK", "0"))
@@ -702,7 +765,7 @@ def load_gemma4_8gb_model_and_tokenizer(
             "dtype": resolved_dtype,
             "device_map": device_map,
         }
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and getattr(hf_config, "audio_config", None) is None:
             load_kwargs["attn_implementation"] = "sdpa"
         if not has_prequant and load_in_4bit and torch.cuda.is_available():
             load_kwargs["quantization_config"] = build_bnb_4bit_config(
@@ -723,7 +786,7 @@ def load_gemma4_8gb_model_and_tokenizer(
 
         try:
             model = loader_cls.from_pretrained(model_name, **load_kwargs)
-        except TypeError:
+        except (TypeError, ValueError):
             load_kwargs.pop("attn_implementation", None)
             model = loader_cls.from_pretrained(model_name, **load_kwargs)
 

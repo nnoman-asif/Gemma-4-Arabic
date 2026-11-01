@@ -22,7 +22,11 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.model_loader import ensure_unsloth_builtins, load_gemma4_8gb_model_and_tokenizer
+from src.model_loader import (
+    configure_clean_logging,
+    ensure_unsloth_builtins,
+    load_gemma4_8gb_model_and_tokenizer,
+)
 
 ensure_unsloth_builtins()
 
@@ -329,6 +333,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    configure_clean_logging()
     args = parse_args(argv)
     effective_format = "both" if args.export_gguf else args.export_format
 
