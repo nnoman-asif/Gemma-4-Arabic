@@ -265,7 +265,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-    for noisy_logger in ("httpx", "httpcore", "urllib3", "fsspec"):
+    for noisy_logger in ("httpx", "httpx2", "httpcore", "urllib3", "fsspec", "huggingface_hub"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     args = parse_args(argv)
 

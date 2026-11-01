@@ -145,12 +145,18 @@ def normalize_replay_sft_iterable(
 
     normalizer = dispatch[source_key]
     results: List[Dict[str, Any]] = []
-    for row in rows:
-        item = normalizer(row)
-        if item is not None:
-            results.append(item)
-            if max_samples is not None and len(results) >= max_samples:
-                break
+    try:
+        for row in rows:
+            try:
+                item = normalizer(row)
+            except Exception:
+                continue
+            if item is not None:
+                results.append(item)
+                if max_samples is not None and len(results) >= max_samples:
+                    break
+    except Exception:
+        pass
     return results
 
 

@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_XET_HIGH_PERFORMANCE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
 

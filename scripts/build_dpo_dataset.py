@@ -217,7 +217,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-    for noisy_logger in ("httpx", "httpcore", "urllib3", "fsspec"):
+    for noisy_logger in ("httpx", "httpx2", "httpcore", "urllib3", "fsspec", "huggingface_hub"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     args = parse_args(argv)
 
@@ -249,14 +249,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         saudi_samples = pools["saudi"][:saudi_target]
         arcee_samples = pools["arcee"][:arcee_target]
     else:
+        logger.info(
+            "Streaming %d samples from DPO source 'arabic_dialect_dpo_saudi'...",
+            saudi_target,
+        )
         saudi_samples = load_and_normalize_dpo_source(
             source_key="arabic_dialect_dpo_saudi",
             max_samples=saudi_target,
             streaming=True,
         )
+        effective_arcee_target = (
+            max(arcee_target, total_target - len(saudi_samples))
+            if not args.dry_run
+            else arcee_target
+        )
+        logger.info(
+            "Streaming %d samples from DPO source 'arabic_orpo_dpo_mix_40k'...",
+            effective_arcee_target,
+        )
         arcee_samples = load_and_normalize_dpo_source(
             source_key="arabic_orpo_dpo_mix_40k",
-            max_samples=arcee_target,
+            max_samples=effective_arcee_target,
             streaming=True,
         )
 

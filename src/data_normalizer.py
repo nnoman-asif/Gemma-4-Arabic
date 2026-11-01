@@ -457,13 +457,63 @@ def normalize_arabic_sft_iterable(
 
     normalizer = dispatch[source_key]
     results: List[Dict[str, Any]] = []
-    for row in rows:
-        item = normalizer(row)
-        if item is not None:
-            results.append(item)
-            if max_samples is not None and len(results) >= max_samples:
-                break
+    try:
+        for row in rows:
+            try:
+                item = normalizer(row)
+            except Exception:
+                continue
+            if item is not None:
+                results.append(item)
+                if max_samples is not None and len(results) >= max_samples:
+                    break
+    except Exception as exc:
+        logger.warning(
+            "Stream iteration for '%s' (%s) stopped early after %d samples (%s); continuing with fallback/top-up.",
+            source_key,
+            config_name,
+            len(results),
+            exc,
+        )
     return results
+
+
+def _iter_saudi_laws_raw_jsonl(
+    repo_id: str,
+    cfg_name: str = "moj",
+    skip_valid: int = 0,
+) -> Iterable[Dict[str, Any]]:
+    """Read SaudiArabicLaws JSONL files directly via json.loads to bypass PyArrow schema cast errors."""
+    from huggingface_hub import hf_hub_download
+
+    cfg = (cfg_name or "moj").strip().lower()
+    filename = (
+        "data/BOE/boe_saudi_legal_corpus.jsonl"
+        if cfg == "boe"
+        else "data/MOJ/moj_saudi_legal_corpus.jsonl"
+    )
+    local_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        repo_type="dataset",
+    )
+    seen = 0
+    with open(local_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if seen < skip_valid:
+                seen += 1
+                continue
+            seen += 1
+            yield obj
 
 
 LIVE_HUB_FALLBACK_SOURCES: Dict[str, List[Tuple[str, Optional[str]]]] = {
@@ -540,33 +590,77 @@ def load_and_normalize_arabic_sft_source(
             else:
                 per_target_limit = None
 
-            if repo_id == "parquet" and cfg_name:
-                ds = load_dataset(
-                    "parquet",
-                    data_files=cfg_name,
-                    split="train",
-                    streaming=streaming,
+            normalized_chunk: List[Dict[str, Any]] = []
+            try:
+                if repo_id == "parquet" and cfg_name:
+                    ds = load_dataset(
+                        "parquet",
+                        data_files=cfg_name,
+                        split="train",
+                        streaming=streaming,
+                    )
+                else:
+                    load_kwargs: Dict[str, Any] = {
+                        "path": repo_id,
+                        "split": spec.split,
+                        "streaming": streaming,
+                    }
+                    if cfg_name and cfg_name != "default":
+                        load_kwargs["name"] = cfg_name
+                    if repo_id == "Omartificial-Intelligence-Space/Arabic-Math-SFT":
+                        try:
+                            ds = load_dataset(**load_kwargs, columns=["problem", "solution"])
+                        except TypeError:
+                            ds = load_dataset(**load_kwargs)
+                    else:
+                        ds = load_dataset(**load_kwargs)
+
+                if spec.drop_columns:
+                    ds = drop_pil_image_columns(ds, spec.drop_columns)
+
+                normalized_chunk = normalize_arabic_sft_iterable(
+                    source_key=source_key,
+                    rows=ds,
+                    config_name=cfg_name or "default",
+                    tokenizer=tokenizer,
+                    max_samples=per_target_limit,
                 )
-            else:
-                load_kwargs: Dict[str, Any] = {
-                    "path": repo_id,
-                    "split": spec.split,
-                    "streaming": streaming,
-                }
-                if cfg_name and cfg_name != "default":
-                    load_kwargs["name"] = cfg_name
-                ds = load_dataset(**load_kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "Dataset load warning for '%s' (%s/%s): %s",
+                    source_key,
+                    repo_id,
+                    cfg_name,
+                    exc,
+                )
 
-            if spec.drop_columns:
-                ds = drop_pil_image_columns(ds, spec.drop_columns)
+            if (
+                repo_id == "SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus"
+                and per_target_limit is not None
+                and len(normalized_chunk) < per_target_limit
+            ):
+                try:
+                    raw_rows = _iter_saudi_laws_raw_jsonl(
+                        repo_id=repo_id,
+                        cfg_name=cfg_name or "moj",
+                        skip_valid=len(normalized_chunk),
+                    )
+                    top_up = normalize_arabic_sft_iterable(
+                        source_key=source_key,
+                        rows=raw_rows,
+                        config_name=cfg_name or "moj",
+                        tokenizer=tokenizer,
+                        max_samples=per_target_limit - len(normalized_chunk),
+                    )
+                    normalized_chunk.extend(top_up)
+                except Exception as exc:
+                    logger.warning(
+                        "Raw JSONL fallback warning for '%s' (%s): %s",
+                        repo_id,
+                        cfg_name,
+                        exc,
+                    )
 
-            normalized_chunk = normalize_arabic_sft_iterable(
-                source_key=source_key,
-                rows=ds,
-                config_name=cfg_name or "default",
-                tokenizer=tokenizer,
-                max_samples=per_target_limit,
-            )
             chunk_results.extend(normalized_chunk)
             if max_samples is not None and len(chunk_results) >= max_samples:
                 return chunk_results[:max_samples]
