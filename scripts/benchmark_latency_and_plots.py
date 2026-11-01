@@ -553,6 +553,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         max_new_tokens=int(lat_cfg.get("max_new_tokens", 64)),
                         warmup_runs=int(lat_cfg.get("warmup_runs", 1)),
                         timed_runs=int(lat_cfg.get("timed_runs", 3)),
+                        device=str(models_cfg.get(key, {}).get("device", "cuda:0")),
                     )
                 except Exception as exc:
                     logger.warning(

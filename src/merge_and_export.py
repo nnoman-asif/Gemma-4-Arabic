@@ -226,6 +226,19 @@ def export_merged_checkpoint(
                 model.save_pretrained(str(out_16bit), safe_serialization=True)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(str(out_16bit))
+        tc_path = out_16bit / "tokenizer_config.json"
+        if tc_path.exists():
+            try:
+                tc_data = json.loads(tc_path.read_text(encoding="utf-8"))
+                raw_tc = tc_path.read_text(encoding="utf-8")
+                if "<turn|>" in raw_tc and tc_data.get("eos_token") != "<turn|>":
+                    tc_data["eos_token"] = "<turn|>"
+                    tc_path.write_text(
+                        json.dumps(tc_data, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+            except Exception as tc_exc:
+                logger.warning("Could not verify/patch tokenizer_config.json eos_token: %s", tc_exc)
         exported_artifacts.append(str(out_16bit))
 
     if export_format in {"gguf", "both"}:

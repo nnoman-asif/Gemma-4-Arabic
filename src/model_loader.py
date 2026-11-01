@@ -188,12 +188,15 @@ def configure_clean_logging() -> None:
     os.environ.setdefault("DATASETS_VERBOSITY", "warning")
     warnings.filterwarnings("ignore", category=SyntaxWarning)
     warnings.filterwarnings("ignore", message=".*torch.jit.script.*")
+    warnings.filterwarnings("ignore", message=".*Reading global config value for per-layer attribute.*")
+    warnings.filterwarnings("ignore", message=".*rope_scaling.*")
 
     for noisy_logger in (
         "transformers",
         "transformers.configuration_utils",
         "transformers.modeling_utils",
         "transformers.tokenization_utils_base",
+        "transformers.integrations.heterogeneity.configuration_utils",
         "httpx",
         "httpx2",
         "httpcore",
@@ -202,7 +205,7 @@ def configure_clean_logging() -> None:
         "datasets",
         "accelerate",
     ):
-        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+        logging.getLogger(noisy_logger).setLevel(logging.ERROR if "heterogeneity" in noisy_logger else logging.WARNING)
 
     try:
         import transformers.utils.logging as hf_logging
@@ -221,7 +224,13 @@ def configure_clean_logging() -> None:
 
 def ensure_unsloth_builtins() -> None:
     """Import `unsloth` first (before `transformers`), then populate `builtins` with Transformers symbols."""
-    configure_clean_logging()
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
+    os.environ.setdefault("DATASETS_VERBOSITY", "warning")
+    warnings.filterwarnings("ignore", category=SyntaxWarning)
+    warnings.filterwarnings("ignore", message=".*torch.jit.script.*")
+    warnings.filterwarnings("ignore", message=".*Reading global config value for per-layer attribute.*")
+    warnings.filterwarnings("ignore", message=".*rope_scaling.*")
+
     if "unsloth" not in sys.modules:
         try:
             import unsloth  # type: ignore # noqa: F401
@@ -231,6 +240,15 @@ def ensure_unsloth_builtins() -> None:
                 import unsloth  # type: ignore # noqa: F401
             except Exception:
                 pass
+
+    try:
+        from transformers.integrations.heterogeneity.configuration_utils import (  # type: ignore
+            HeterogeneousConfigMixin,
+        )
+
+        HeterogeneousConfigMixin.allow_global_per_layer_attribute_access = True  # type: ignore[assignment]
+    except Exception:
+        pass
 
     for _builtin_dec in ("auto_docstring", "strict"):
         if not hasattr(builtins, _builtin_dec):

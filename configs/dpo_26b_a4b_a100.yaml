@@ -37,9 +37,9 @@ lora:
     - "k_proj"
     - "v_proj"
     - "o_proj"
-    - "gate_proj"
-    - "up_proj"
-    - "down_proj"
+    - "mlp.gate_proj"
+    - "mlp.up_proj"
+    - "mlp.down_proj"
   exclude_modules:
     - "vision_tower"
     - "multi_modal_projector"
