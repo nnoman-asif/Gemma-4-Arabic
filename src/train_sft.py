@@ -19,6 +19,11 @@ import pathlib
 import sys
 from typing import Any, Dict, List, Optional
 
+try:
+    import unsloth  # type: ignore # noqa: F401
+except ImportError:
+    pass
+
 import torch
 import yaml
 
@@ -218,6 +223,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
     )
     args = parse_args(argv)
 

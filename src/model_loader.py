@@ -11,8 +11,14 @@ Integrates `src/vram_hooks.py` to enforce the 8.0 GB GPU VRAM budget by:
    `up_proj`, `down_proj`) with `use_gradient_checkpointing="unsloth"`.
 """
 
+import gc
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+try:
+    import unsloth  # type: ignore # noqa: F401
+except ImportError:
+    pass
 
 import torch
 import torch.nn as nn
@@ -207,6 +213,19 @@ def load_gemma4_8gb_model_and_tokenizer(
     model: nn.Module
     tokenizer: Any
 
+    hf_config: Any = None
+    try:
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(model_name)
+        quant_cfg = getattr(hf_config, "quantization_config", None)
+        if isinstance(quant_cfg, dict):
+            quant_cfg["llm_int8_enable_fp32_cpu_offload"] = True
+        elif quant_cfg is not None and hasattr(quant_cfg, "llm_int8_enable_fp32_cpu_offload"):
+            quant_cfg.llm_int8_enable_fp32_cpu_offload = True
+    except Exception as cfg_exc:
+        logger.debug("AutoConfig preload skipped for '%s': %s", model_name, cfg_exc)
+
     try:
         from unsloth import FastLanguageModel  # type: ignore
 
@@ -216,22 +235,43 @@ def load_gemma4_8gb_model_and_tokenizer(
             max_seq_length,
             load_in_4bit,
         )
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=load_path,
-            max_seq_length=max_seq_length,
-            dtype=resolved_dtype,
-            load_in_4bit=load_in_4bit,
-            device_map=device_map,
-        )
+        unsloth_kwargs: Dict[str, Any] = {
+            "model_name": load_path,
+            "max_seq_length": max_seq_length,
+            "dtype": resolved_dtype,
+            "load_in_4bit": load_in_4bit,
+            "device_map": device_map,
+        }
+        if hf_config is not None:
+            unsloth_kwargs["config"] = hf_config
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
+        except TypeError:
+            unsloth_kwargs.pop("config", None)
+            model, tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
+
+        if hasattr(tokenizer, "tokenizer") and not hasattr(tokenizer, "encode"):
+            inner_tok = tokenizer.tokenizer
+            if (
+                getattr(inner_tok, "chat_template", None) is None
+                and getattr(tokenizer, "chat_template", None) is not None
+            ):
+                inner_tok.chat_template = tokenizer.chat_template
+            tokenizer = inner_tok
     except Exception as unsloth_exc:
         logger.warning(
             "Unsloth FastLanguageModel.from_pretrained unavailable (%s); using Transformers loader.",
             unsloth_exc,
         )
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        hf_config = AutoConfig.from_pretrained(model_name)
+        if hf_config is None:
+            hf_config = AutoConfig.from_pretrained(model_name)
         quant_cfg = getattr(hf_config, "quantization_config", None)
         has_prequant = quant_cfg is not None
         if isinstance(quant_cfg, dict):

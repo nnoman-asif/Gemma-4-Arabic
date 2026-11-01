@@ -224,8 +224,13 @@ def register_ple_cpu_offload_hook(
                 return type(output)(transferred)
             return output
 
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+            _pre_hook = torch.compiler.disable(_pre_hook)
+            _post_hook = torch.compiler.disable(_post_hook)
+
         pre_handle = ple_mod.register_forward_pre_hook(_pre_hook)
         post_handle = ple_mod.register_forward_hook(_post_hook)
+        ple_mod._unsloth_offload_hooks_installed = True
         state.hook_handles.extend([pre_handle, post_handle])
 
         logger.info(
