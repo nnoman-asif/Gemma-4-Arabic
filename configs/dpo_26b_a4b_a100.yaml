@@ -7,7 +7,7 @@ model:
   hf_hub_repo_id: "noman-asif/Gemma-4-26B-A4B-Arabic-It"
   architecture_type: "moe"
   sft_adapter_dir: "outputs/sft_26b_a4b_stage1"
-  max_seq_length: 1024
+  max_seq_length: 2048
   dtype: "bfloat16"
   load_in_4bit: true
 
@@ -49,17 +49,17 @@ lora:
 dpo:
   beta: 0.1
   tr_alpha: 0.6
-  tr_update_steps: 20
+  tr_update_steps: 50
   loss_type: "sigmoid"
-  max_length: 1024
-  max_prompt_length: 512
-  max_completion_length: 512
+  max_length: 2048
+  max_prompt_length: 1024
+  max_completion_length: 1024
   label_smoothing: 0.0
 
 training:
   output_dir: "outputs/dpo_26b_a4b_stage2"
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 2
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
   gradient_accumulation_steps: 4
   optim: "adamw_bnb_8bit"
   learning_rate: 4.0e-7
@@ -68,18 +68,17 @@ training:
   weight_decay: 0.01
   max_grad_norm: 1.0
   num_train_epochs: 1
-  max_steps: 80
   bf16: true
   tf32: true
   fp16: false
   dataloader_pin_memory: true
   dataloader_num_workers: 4
-  logging_steps: 5
+  logging_steps: 20
   save_strategy: "steps"
-  save_steps: 40
+  save_steps: 250
   save_total_limit: 1
-  eval_strategy: "no"
-  eval_steps: 40
+  eval_strategy: "steps"
+  eval_steps: 200
   seed: 3407
 
 datasets:

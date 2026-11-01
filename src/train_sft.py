@@ -20,23 +20,13 @@ import pathlib
 import sys
 from typing import Any, Dict, List, Optional
 
-for _builtin_dec in ("auto_docstring", "strict"):
-    if not hasattr(builtins, _builtin_dec):
-        try:
-            import transformers.utils as _hf_utils  # type: ignore
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-            setattr(
-                builtins,
-                _builtin_dec,
-                getattr(_hf_utils, _builtin_dec),
-            )
-        except Exception:
-            def _fallback_decorator(*args: Any, **kwargs: Any) -> Any:
-                if args and callable(args[0]) and len(args) == 1 and not kwargs:
-                    return args[0]
-                return lambda fn: fn
+from src.model_loader import ensure_unsloth_builtins, load_gemma4_8gb_model_and_tokenizer
 
-            setattr(builtins, _builtin_dec, _fallback_decorator)
+ensure_unsloth_builtins()
 
 try:
     import unsloth  # type: ignore # noqa: F401
@@ -46,13 +36,8 @@ except Exception:
 import torch
 import yaml
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from scripts.build_sft_dataset import build_synthetic_dry_run_pools
 from src.constants import BASE_MODEL_ID, DEFAULT_MAX_SEQ_LENGTH, LORA_ALPHA, LORA_RANK
-from src.model_loader import load_gemma4_8gb_model_and_tokenizer
 from src.replay_mixer import mix_arabic_and_replay_samples
 from src.vram_hooks import log_vram_telemetry, restore_multimodal_towers
 
@@ -314,22 +299,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
-    if sft_args.max_steps and sft_args.max_steps > 0 and not args.smoke_test:
-        needed_samples = (
-            int(sft_args.max_steps)
-            * int(sft_args.per_device_train_batch_size)
-            * int(sft_args.gradient_accumulation_steps)
-            + 256
-        )
-        if len(train_dataset) > needed_samples:
-            logger.info(
-                "Selecting %d/%d pre-shuffled SFT samples required for max_steps=%d.",
-                needed_samples,
-                len(train_dataset),
-                sft_args.max_steps,
-            )
-            train_dataset = train_dataset.select(range(needed_samples))
-
     from trl import SFTTrainer
 
     model, tokenizer, offload_state = load_gemma4_8gb_model_and_tokenizer(
@@ -374,7 +343,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     trainer = SFTTrainer(**trainer_kwargs)
-    if bool(train_cfg.get("completion_only_loss", True)):
+    if bool(train_cfg.get("completion_only_loss", True)) and not bool(train_cfg.get("packing", False)):
         try:
             from unsloth.chat_templates import train_on_responses_only  # type: ignore
 

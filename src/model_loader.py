@@ -17,23 +17,49 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-for _builtin_dec in ("auto_docstring", "strict"):
-    if not hasattr(builtins, _builtin_dec):
+def ensure_unsloth_builtins() -> None:
+    """Populate `builtins` with Transformers symbols Unsloth's dynamic compiler may omit."""
+    for _builtin_dec in ("auto_docstring", "strict"):
+        if not hasattr(builtins, _builtin_dec):
+            try:
+                import transformers.utils as _hf_utils  # type: ignore
+
+                setattr(builtins, _builtin_dec, getattr(_hf_utils, _builtin_dec))
+            except Exception:
+                def _fallback_decorator(*args: Any, **kwargs: Any) -> Any:
+                    if args and callable(args[0]) and len(args) == 1 and not kwargs:
+                        return args[0]
+                    return lambda fn: fn
+
+                setattr(builtins, _builtin_dec, _fallback_decorator)
+
+    import importlib
+
+    for _mod_name in (
+        "transformers",
+        "transformers.utils",
+        "transformers.configuration_utils",
+        "transformers.modeling_utils",
+        "transformers.cache_utils",
+        "transformers.modeling_outputs",
+        "transformers.generation",
+        "transformers.processing_utils",
+        "transformers.models.gemma4.configuration_gemma4",
+        "transformers.models.gemma4.modeling_gemma4",
+    ):
         try:
-            import transformers.utils as _hf_utils  # type: ignore
-
-            setattr(
-                builtins,
-                _builtin_dec,
-                getattr(_hf_utils, _builtin_dec),
-            )
+            _mod = importlib.import_module(_mod_name)
+            for _attr_name in dir(_mod):
+                if not _attr_name.startswith("_") and not hasattr(builtins, _attr_name):
+                    try:
+                        setattr(builtins, _attr_name, getattr(_mod, _attr_name))
+                    except Exception:
+                        pass
         except Exception:
-            def _fallback_decorator(*args: Any, **kwargs: Any) -> Any:
-                if args and callable(args[0]) and len(args) == 1 and not kwargs:
-                    return args[0]
-                return lambda fn: fn
+            pass
 
-            setattr(builtins, _builtin_dec, _fallback_decorator)
+
+ensure_unsloth_builtins()
 
 try:
     import unsloth  # type: ignore # noqa: F401
