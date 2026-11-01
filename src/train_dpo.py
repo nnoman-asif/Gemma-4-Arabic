@@ -155,6 +155,7 @@ def build_dpo_training_arguments(
     output_dir: str,
     smoke_test: bool = False,
     max_steps_override: Optional[int] = None,
+    has_eval_dataset: bool = False,
 ) -> Any:
     """Build TRL `DPOConfig` (or `TrainingArguments` fallback) from `dpo_config.yaml`."""
     train_cfg = cfg.get("training", {})
@@ -180,6 +181,12 @@ def build_dpo_training_arguments(
         else "adamw_torch"
     )
 
+    eval_strategy = (
+        str(train_cfg.get("eval_strategy", "no"))
+        if (has_eval_dataset and not smoke_test)
+        else "no"
+    )
+
     common_kwargs: Dict[str, Any] = {
         "output_dir": output_dir,
         "per_device_train_batch_size": int(train_cfg.get("per_device_train_batch_size", 1)),
@@ -200,12 +207,15 @@ def build_dpo_training_arguments(
         "dataloader_pin_memory": bool(train_cfg.get("dataloader_pin_memory", True)),
         "dataloader_num_workers": int(train_cfg.get("dataloader_num_workers", 0)),
         "logging_steps": 1 if smoke_test else int(train_cfg.get("logging_steps", 10)),
+        "eval_strategy": eval_strategy,
         "save_strategy": "no" if smoke_test else str(train_cfg.get("save_strategy", "steps")),
         "save_steps": int(train_cfg.get("save_steps", 100)),
         "save_total_limit": int(train_cfg.get("save_total_limit", 3)),
         "seed": int(train_cfg.get("seed", 3407)),
         "report_to": "none",
     }
+    if eval_strategy != "no":
+        common_kwargs["eval_steps"] = int(train_cfg.get("eval_steps", 100))
 
     warmup_ratio_val = float(train_cfg.get("warmup_ratio", 0.10))
 
@@ -343,6 +353,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     dpo_cfg = cfg.get("dpo", {})
     train_cfg = cfg.get("training", {})
     ds_cfg = cfg.get("datasets", {})
+    vram_cfg = cfg.get("vram_optimization", {})
 
     output_dir = str(args.output_dir or train_cfg.get("output_dir", "outputs/dpo_stage2"))
     dataset_dir = pathlib.Path(
@@ -357,15 +368,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         1 if args.smoke_test else dpo_cfg.get("tr_update_steps", 50)
     )
 
+    full_dataset = load_or_build_dpo_dataset(
+        dataset_dir=dataset_dir,
+        smoke_test=args.smoke_test or args.dry_run_only,
+    )
+    eval_dataset = None
+    train_dataset = full_dataset
+    if (
+        str(train_cfg.get("eval_strategy", "no")) != "no"
+        and not args.smoke_test
+        and not args.dry_run_only
+        and len(full_dataset) >= 50
+    ):
+        split = full_dataset.train_test_split(
+            test_size=0.02, seed=int(train_cfg.get("seed", 3407))
+        )
+        train_dataset = split["train"]
+        eval_dataset = split["test"]
+
     dpo_args = build_dpo_training_arguments(
         cfg=cfg,
         output_dir=output_dir,
         smoke_test=args.smoke_test,
         max_steps_override=args.max_steps,
-    )
-    train_dataset = load_or_build_dpo_dataset(
-        dataset_dir=dataset_dir,
-        smoke_test=args.smoke_test or args.dry_run_only,
+        has_eval_dataset=(eval_dataset is not None),
     )
 
     if args.dry_run_only:
@@ -384,6 +410,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "ema_test_value": round(float(ema_check["lora_A"].item()), 4),
             "learning_rate": float(train_cfg.get("learning_rate", DPO_LEARNING_RATE)),
             "max_length": int(dpo_cfg.get("max_length", DPO_MAX_SEQ_LENGTH)),
+            "offload_ple_to_cpu": bool(vram_cfg.get("offload_ple_to_cpu", True)),
+            "offload_multimodal_towers_to_cpu": bool(
+                vram_cfg.get("offload_multimodal_towers_to_cpu", True)
+            ),
+            "freeze_moe_router": bool(vram_cfg.get("freeze_moe_router", True)),
             "max_steps": dpo_args.max_steps,
             "dataset_pairs": len(train_dataset),
             "output_dir": output_dir,
@@ -415,6 +446,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         random_state=int(lora_cfg.get("random_state", 3407)),
         adapter_checkpoint=adapter_ckpt,
         is_trainable=True,
+        target_modules=lora_cfg.get("target_modules"),
+        exclude_modules=lora_cfg.get("exclude_modules"),
+        offload_ple_to_cpu=bool(vram_cfg.get("offload_ple_to_cpu", True)),
+        offload_multimodal_towers_to_cpu=bool(
+            vram_cfg.get("offload_multimodal_towers_to_cpu", True)
+        ),
+        freeze_moe_router=bool(vram_cfg.get("freeze_moe_router", True)),
     )
 
     tr_callback = TrustRegionDPOCallback(
@@ -429,6 +467,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         "train_dataset": train_dataset,
         "callbacks": [tr_callback],
     }
+    if eval_dataset is not None:
+        trainer_kwargs["eval_dataset"] = eval_dataset
+
     trainer_sig = inspect.signature(DPOTrainer.__init__)
     if "processing_class" in trainer_sig.parameters:
         trainer_kwargs["processing_class"] = tokenizer
@@ -437,14 +478,36 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     trainer = DPOTrainer(**trainer_kwargs)
     log_vram_telemetry(model, stage="pre_dpo_train")
-    train_result = trainer.train()
+    last_ckpt = None
+    out_dir_path = pathlib.Path(output_dir)
+    if not args.smoke_test and out_dir_path.exists():
+        if (out_dir_path / "adapter_config.json").exists():
+            logger.info("Stage 2 DPO final adapter already exists at %s; skipping training.", output_dir)
+            return 0
+        from transformers.trainer_utils import get_last_checkpoint
+
+        last_ckpt = get_last_checkpoint(output_dir)
+        if last_ckpt is not None:
+            logger.info("Resuming Stage 2 DPO from latest checkpoint: %s", last_ckpt)
+
+    train_result = trainer.train(resume_from_checkpoint=last_ckpt)
     log_vram_telemetry(model, stage="post_dpo_train")
 
     if not args.smoke_test:
-        restore_multimodal_towers(model, state=offload_state, target_device="cpu")
-        pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+        if offload_state.ple_module_names or offload_state.multimodal_module_names:
+            restore_multimodal_towers(model, state=offload_state, target_device="cpu")
+        out_path = pathlib.Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
         trainer.save_model(output_dir)
         tokenizer.save_pretrained(output_dir)
+        metrics_payload = {
+            "metrics": dict(train_result.metrics),
+            "log_history": list(getattr(trainer.state, "log_history", [])),
+        }
+        (out_path / "dpo_metrics.json").write_text(
+            json.dumps(metrics_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     logger.info("Stage 2 Trust-Region DPO completed: %s", train_result.metrics)
     return 0

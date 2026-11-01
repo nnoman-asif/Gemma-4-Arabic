@@ -5,13 +5,22 @@ from typing import Dict, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Base Model and 8.0 GB Hardware Constants
+# Base Model and Dual-Model Family Constants (E4B Dense + 26B-A4B MoE)
 # ---------------------------------------------------------------------------
 BASE_MODEL_ID: str = "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
+PRIMARY_MODEL_ID: str = BASE_MODEL_ID
 GOOGLE_REFERENCE_MODEL_ID: str = "google/gemma-4-E4B-it"
+
+PRIMARY_MODEL_ID_26B: str = "unsloth/gemma-4-26B-A4B-it"
+FALLBACK_MODEL_ID_26B: str = "google/gemma-4-26B-A4B-it"
 
 TOTAL_PARAMETERS: int = 7_996_156_490
 EFFECTIVE_PARAMETERS: int = 4_500_000_000
+MOE_TOTAL_PARAMETERS: int = 26_000_000_000
+MOE_ACTIVE_PARAMETERS: int = 3_800_000_000
+MOE_NUM_EXPERTS: int = 128
+MOE_TOP_K_EXPERTS: int = 8
+
 NUM_LAYERS: int = 42
 HIDDEN_SIZE: int = 2560
 INTERMEDIATE_SIZE: int = 10240
@@ -19,11 +28,15 @@ VOCAB_SIZE: int = 262_144
 ARABIC_VOCAB_TOKENS: int = 8_460
 
 DEFAULT_MAX_SEQ_LENGTH: int = 2048
+A100_MAX_SEQ_LENGTH: int = 4096
 DPO_MAX_SEQ_LENGTH: int = 1536
 DPO_MAX_PROMPT_LENGTH: int = 768
 TARGET_VRAM_BUDGET_GB: float = 8.0
+A100_VRAM_BUDGET_GB: float = 80.0
 
-# Per-Layer Embeddings (PLE) and Multimodal Offload Patterns
+MGSM_AR_TASK: str = "mgsm_native_cot_ar"
+
+# Per-Layer Embeddings (PLE), Multimodal, and MoE Router Patterns
 PLE_MODULE_PATTERN: str = "embed_tokens_per_layer"
 PLE_EMBEDDING_SHAPE: Tuple[int, int] = (262_144, 10_752)
 PLE_PER_LAYER_DIM: int = 256
@@ -34,6 +47,10 @@ MULTIMODAL_TOWER_PATTERNS: Tuple[str, ...] = (
     "vision_tower",
     "embed_audio",
     "embed_vision",
+)
+MOE_ROUTER_KEYWORDS: Tuple[str, ...] = (
+    "router",
+    ".gate.",
 )
 AUDIO_TOWER_VRAM_GB: float = 0.618
 VISION_TOWER_VRAM_GB: float = 0.339

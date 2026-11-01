@@ -88,7 +88,7 @@ chat_template:
   empty_thinking_block: "<|think|>\n<|think|>\n"
 
 datasets:
-  total_target_samples: 100000
+  total_target_samples: 120000
   arabic_mix_ratio: 0.75
   replay_mix_ratio: 0.25
   output_dataset_dir: "data/sft_mixed"

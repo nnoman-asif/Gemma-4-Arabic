@@ -1,11 +1,13 @@
 """Automated benchmark runner and Zero-Forgetting Retention Gate evaluator.
 
 Evaluates:
-- 6 Primary Arabic & Saudi Benchmarks (`ArabicMMLU`, `MadinahQA`, `AlGhafa`,
-  `ACVA`, `EXAMS-AR`, `AraTrust`).
+- 7 Primary Arabic & Saudi Benchmarks (`ArabicMMLU`, `MadinahQA`, `AlGhafa`,
+  `ACVA`, `EXAMS-AR`, `AraTrust`, `MGSM-Ar`).
 - 4 English/Math/Code Zero-Forgetting Retention Anchors (`MMLU-Pro`, `GSM8K`,
   `HumanEval`, `ARC-Challenge`).
-- Generates a structured Markdown comparison report and verifies the
+- Supports single-model (`e4b` or `26b_a4b`) and dual-model family (`both`)
+  comparisons across `Gemma-4-E4B-Arabic-It` and `Gemma-4-26B-A4B-Arabic-It`.
+- Generates structured Markdown and JSON comparison reports and verifies the
   `min_retention_ratio >= 0.998` (`max_allowed_drop_pct <= 0.20`) gate.
 """
 
@@ -15,6 +17,7 @@ import logging
 import pathlib
 import subprocess
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -77,7 +80,7 @@ def evaluate_retention_gate(
 def generate_markdown_report(report_data: Dict[str, Any]) -> str:
     """Render a clean GitHub-Flavored Markdown report using only standard ASCII punctuation."""
     lines: List[str] = [
-        "# Gemma-4-Arabic Benchmark Evaluation Report",
+        "# Gemma-4-Arabic Family Benchmark Evaluation Report",
         "",
         f"- **Model Evaluated:** `{report_data['model_path']}`",
         f"- **Evaluation Mode:** `{report_data['mode']}`",
@@ -85,7 +88,7 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
         f"(Min Retention Ratio: `{report_data['retention_gate']['min_observed_retention_ratio']:.4f}`, "
         f"Threshold: `{report_data['retention_gate']['required_min_retention_ratio']:.4f}`)",
         "",
-        "## 1. Primary Arabic and Saudi Benchmarks (6 Suites)",
+        f"## 1. Primary Arabic and Saudi Benchmarks ({len(report_data['arabic_benchmarks'])} Suites)",
         "",
         "| Benchmark | Task (`lm_eval`) | Metric | Shots | Baseline (%) | Evaluated (%) | Gain (% pts) |",
         "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |",
@@ -129,6 +132,78 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def parse_lm_eval_results_json(
+    results_payload: Dict[str, Any],
+    task_name: str,
+    metric_hint: str = "acc_norm",
+) -> float:
+    """Extract the primary percentage score (`0.0` to `100.0`) from an `lm_eval` JSON dict."""
+    results_block = results_payload.get("results", {})
+    if not isinstance(results_block, dict) or not results_block:
+        raise ValueError(f"lm_eval results JSON has no 'results' entries for task '{task_name}'.")
+
+    task_metrics = results_block.get(task_name)
+    if task_metrics is None:
+        # Fallback to the first task dictionary or average across subtasks
+        subtask_dicts = [v for v in results_block.values() if isinstance(v, dict)]
+        if not subtask_dicts:
+            raise ValueError(f"No valid metric dictionary found for task '{task_name}'.")
+        candidate_keys = [
+            f"{metric_hint},none",
+            metric_hint,
+            "acc_norm,none",
+            "acc,none",
+            "exact_match,strict-match",
+            "exact_match,flexible-extract",
+            "exact_match,none",
+            "pass@1,none",
+            "acc_norm",
+            "acc",
+            "exact_match",
+        ]
+        vals: List[float] = []
+        for sub in subtask_dicts:
+            for key in candidate_keys:
+                if key in sub and isinstance(sub[key], (int, float)):
+                    vals.append(float(sub[key]))
+                    break
+        if not vals:
+            raise KeyError(f"Could not extract score for '{task_name}' from subtasks.")
+        raw_val = sum(vals) / len(vals)
+    else:
+        candidate_keys = [
+            f"{metric_hint},none",
+            metric_hint,
+            "acc_norm,none",
+            "acc,none",
+            "exact_match,strict-match",
+            "exact_match,flexible-extract",
+            "exact_match,none",
+            "pass@1,none",
+            "acc_norm",
+            "acc",
+            "exact_match",
+        ]
+        raw_val = None
+        for key in candidate_keys:
+            if key in task_metrics and isinstance(task_metrics[key], (int, float)):
+                raw_val = float(task_metrics[key])
+                break
+        if raw_val is None:
+            numeric_vals = [
+                float(v)
+                for k, v in task_metrics.items()
+                if isinstance(v, (int, float)) and "stderr" not in str(k)
+            ]
+            if not numeric_vals:
+                raise KeyError(f"No numeric score found in task metrics for '{task_name}'.")
+            raw_val = numeric_vals[0]
+
+    # Convert [0.0, 1.0] fraction to percentage [0.0, 100.0]
+    score_pct = raw_val * 100.0 if 0.0 <= raw_val <= 1.0 else raw_val
+    return round(score_pct, 2)
+
+
 def run_lm_eval_task(
     model_path: str,
     task_name: str,
@@ -136,31 +211,57 @@ def run_lm_eval_task(
     batch_size: int = 4,
     device: str = "cuda:0",
     limit: Optional[int] = None,
+    metric_hint: str = "acc_norm",
 ) -> float:
-    """Invoke `lm_eval` CLI for a specific benchmark task and parse its score."""
-    cmd = [
-        sys.executable,
-        "-m",
-        "lm_eval",
-        "--model",
-        "hf",
-        "--model_args",
-        f"pretrained={model_path},dtype=bfloat16",
-        "--tasks",
-        task_name,
-        "--num_fewshot",
-        str(num_fewshot),
-        "--batch_size",
-        str(batch_size),
-        "--device",
-        device,
-    ]
-    if limit is not None:
-        cmd.extend(["--limit", str(limit)])
+    """Invoke `lm_eval` CLI with `--output_path` and parse the resulting JSON score."""
+    with tempfile.TemporaryDirectory(prefix="lm_eval_out_") as tmp_dir:
+        cmd = [
+            sys.executable,
+            "-m",
+            "lm_eval",
+            "--model",
+            "hf",
+            "--model_args",
+            f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True",
+            "--tasks",
+            task_name,
+            "--num_fewshot",
+            str(num_fewshot),
+            "--batch_size",
+            str(batch_size),
+            "--device",
+            device,
+            "--output_path",
+            tmp_dir,
+        ]
+        if limit is not None:
+            cmd.extend(["--limit", str(limit)])
 
-    logger.info("Executing lm_eval command: %s", " ".join(cmd))
-    subprocess.run(cmd, check=True)
-    return 0.0
+        logger.info("Executing lm_eval command: %s", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+        json_files = sorted(
+            pathlib.Path(tmp_dir).rglob("results_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not json_files:
+            json_files = sorted(
+                pathlib.Path(tmp_dir).rglob("*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        if not json_files:
+            raise FileNotFoundError(
+                f"lm_eval completed for task '{task_name}' but wrote no JSON file in {tmp_dir}."
+            )
+
+        payload = json.loads(json_files[0].read_text(encoding="utf-8"))
+        return parse_lm_eval_results_json(
+            results_payload=payload,
+            task_name=task_name,
+            metric_hint=metric_hint,
+        )
 
 
 def build_benchmark_results(
@@ -168,16 +269,36 @@ def build_benchmark_results(
     model_path: str,
     dry_run: bool = False,
     limit: Optional[int] = None,
+    model_key: str = "e4b",
+    eval_base: bool = False,
 ) -> Dict[str, Any]:
-    """Run or simulate all 6 Arabic benchmarks and 4 retention anchors."""
+    """Run or simulate all 7 Arabic benchmarks and 4 retention anchors."""
     eval_cfg = cfg.get("evaluation", {})
     gate_cfg = cfg.get("retention_gate", {})
     ar_defs = cfg.get("arabic_benchmarks", {})
     ret_defs = cfg.get("retention_anchors", {})
 
+    base_key = "baseline_score_26b" if model_key == "26b_a4b" else "baseline_score"
+    models_cfg = cfg.get("models", {})
+    base_model_id = (
+        models_cfg.get(model_key, {}).get("base_model_id", model_path)
+        if isinstance(models_cfg, dict)
+        else model_path
+    )
+
     arabic_results: Dict[str, Dict[str, Any]] = {}
     for name, spec in ar_defs.items():
-        base_score = float(spec.get("baseline_score", 0.0))
+        base_score = float(spec.get(base_key, spec.get("baseline_score", 0.0)))
+        if eval_base and not dry_run:
+            base_score = run_lm_eval_task(
+                model_path=str(base_model_id),
+                task_name=str(spec["lm_eval_task"]),
+                num_fewshot=int(spec.get("num_fewshot", 0)),
+                batch_size=int(eval_cfg.get("batch_size", 4)),
+                device=str(eval_cfg.get("device", "cuda:0")),
+                limit=limit,
+                metric_hint=str(spec.get("metric", "acc_norm")),
+            )
         if dry_run:
             evaluated_score = base_score
         else:
@@ -188,6 +309,7 @@ def build_benchmark_results(
                 batch_size=int(eval_cfg.get("batch_size", 4)),
                 device=str(eval_cfg.get("device", "cuda:0")),
                 limit=limit,
+                metric_hint=str(spec.get("metric", "acc_norm")),
             )
         arabic_results[name] = {
             "lm_eval_task": spec["lm_eval_task"],
@@ -201,7 +323,17 @@ def build_benchmark_results(
 
     anchor_results: Dict[str, Dict[str, Any]] = {}
     for name, spec in ret_defs.items():
-        base_score = float(spec.get("baseline_score", 0.0))
+        base_score = float(spec.get(base_key, spec.get("baseline_score", 0.0)))
+        if eval_base and not dry_run:
+            base_score = run_lm_eval_task(
+                model_path=str(base_model_id),
+                task_name=str(spec["lm_eval_task"]),
+                num_fewshot=int(spec.get("num_fewshot", 0)),
+                batch_size=int(eval_cfg.get("batch_size", 4)),
+                device=str(eval_cfg.get("device", "cuda:0")),
+                limit=limit,
+                metric_hint=str(spec.get("metric", "acc_norm")),
+            )
         if dry_run:
             evaluated_score = base_score
         else:
@@ -212,6 +344,7 @@ def build_benchmark_results(
                 batch_size=int(eval_cfg.get("batch_size", 4)),
                 device=str(eval_cfg.get("device", "cuda:0")),
                 limit=limit,
+                metric_hint=str(spec.get("metric", "acc_norm")),
             )
         anchor_results[name] = {
             "domain": spec["domain"],
@@ -239,6 +372,7 @@ def build_benchmark_results(
 
     return {
         "mode": "dry_run" if dry_run else "live_eval",
+        "model_key": model_key,
         "model_path": model_path,
         "arabic_benchmarks_count": len(arabic_results),
         "retention_anchors_count": len(anchor_results),
@@ -251,10 +385,59 @@ def build_benchmark_results(
     }
 
 
+def generate_family_markdown_report(
+    e4b_results: Dict[str, Any],
+    moe_results: Dict[str, Any],
+) -> str:
+    """Render a side-by-side Markdown report comparing E4B (Dense) and 26B-A4B (MoE)."""
+    lines: List[str] = [
+        "# Gemma-4-Arabic Iso-Active Family Benchmark Comparison Report",
+        "",
+        f"- **Dense Edge Model (`E4B`):** `{e4b_results['model_path']}` (Avg Arabic Gain: `+{e4b_results['average_arabic_gain']:.2f}` pts)",
+        f"- **Sparse MoE Flagship (`26B-A4B`):** `{moe_results['model_path']}` (Avg Arabic Gain: `+{moe_results['average_arabic_gain']:.2f}` pts)",
+        f"- **E4B Zero-Forgetting Gate:** `{'PASSED' if e4b_results['retention_gate']['gate_passed'] else 'FAILED'}` (`{e4b_results['retention_gate']['min_observed_retention_ratio']:.4f}`)",
+        f"- **26B-A4B Zero-Forgetting Gate:** `{'PASSED' if moe_results['retention_gate']['gate_passed'] else 'FAILED'}` (`{moe_results['retention_gate']['min_observed_retention_ratio']:.4f}`)",
+        "",
+        "## 1. Arabic & Saudi Benchmarks (4-Column Family Progression)",
+        "",
+        "| Benchmark | Metric | Shots | E4B Base (%) | E4B Arabic-It (%) | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for name, e4b_item in e4b_results["arabic_benchmarks"].items():
+        moe_item = moe_results["arabic_benchmarks"].get(name, e4b_item)
+        lines.append(
+            f"| **{name}** | `{e4b_item['metric']}` | {e4b_item['num_fewshot']} | "
+            f"{float(e4b_item['baseline_score']):.2f} | **{float(e4b_item['evaluated_score']):.2f}** | "
+            f"{float(moe_item['baseline_score']):.2f} | **{float(moe_item['evaluated_score']):.2f}** |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 2. Zero-Forgetting Retention Anchors (English / Math / Code)",
+            "",
+            "| Anchor | Domain | E4B Base (%) | E4B Arabic-It (%) | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) | Status |",
+            "| :--- | :--- | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
+    for name, e4b_item in e4b_results["retention_anchors"].items():
+        moe_item = moe_results["retention_anchors"].get(name, e4b_item)
+        passed = bool(e4b_item.get("passed", True)) and bool(moe_item.get("passed", True))
+        lines.append(
+            f"| **{name}** | `{e4b_item['domain']}` | "
+            f"{float(e4b_item['baseline_score']):.2f} | **{float(e4b_item['evaluated_score']):.2f}** | "
+            f"{float(moe_item['baseline_score']):.2f} | **{float(moe_item['evaluated_score']):.2f}** | "
+            f"**{'PASS' if passed else 'FAIL'}** |"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse CLI arguments for the benchmark evaluation runner."""
     parser = argparse.ArgumentParser(
-        description="Run the 6 Arabic/Saudi benchmarks and 4 English/Math/Code retention anchors."
+        description="Run the 7 Arabic/Saudi benchmarks and 4 English/Math/Code retention anchors."
     )
     parser.add_argument(
         "--config",
@@ -263,10 +446,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to evaluation YAML configuration file.",
     )
     parser.add_argument(
+        "--model-key",
+        type=str,
+        choices=["e4b", "26b_a4b", "both"],
+        default="e4b",
+        help="Model family member to evaluate: e4b, 26b_a4b, or both.",
+    )
+    parser.add_argument(
         "--model-path",
         type=str,
         default=None,
         help="Model checkpoint path or Hugging Face ID to evaluate.",
+    )
+    parser.add_argument(
+        "--eval-base",
+        action="store_true",
+        help="Also run live lm_eval on the untuned base model instead of using cached baseline scores.",
     )
     parser.add_argument(
         "--output-md",
@@ -289,7 +484,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate all 6 Arabic benchmarks, 4 retention anchors, and Markdown report generation.",
+        help="Validate all 7 Arabic benchmarks, 4 retention anchors, and Markdown report generation.",
     )
     return parser.parse_args(argv)
 
@@ -307,8 +502,74 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = load_eval_config(pathlib.Path(args.config))
     eval_cfg = cfg.get("evaluation", {})
+    models_cfg = cfg.get("models", {})
+
+    if args.model_key == "both":
+        e4b_path = str(
+            models_cfg.get("e4b", {}).get(
+                "merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic/merged_16bit"
+            )
+        )
+        moe_path = str(
+            models_cfg.get("26b_a4b", {}).get(
+                "merged_checkpoint_dir", "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit"
+            )
+        )
+        e4b_res = build_benchmark_results(
+            cfg=cfg,
+            model_path=e4b_path,
+            dry_run=args.dry_run,
+            limit=args.limit,
+            model_key="e4b",
+            eval_base=args.eval_base,
+        )
+        moe_res = build_benchmark_results(
+            cfg=cfg,
+            model_path=moe_path,
+            dry_run=args.dry_run,
+            limit=args.limit,
+            model_key="26b_a4b",
+            eval_base=args.eval_base,
+        )
+        family_md = generate_family_markdown_report(e4b_res, moe_res)
+        family_payload = {
+            "mode": "dry_run" if args.dry_run else "live_eval",
+            "models": {
+                "e4b": e4b_res,
+                "26b_a4b": moe_res,
+            },
+        }
+        if args.output_md or not args.dry_run:
+            md_path = pathlib.Path(
+                args.output_md
+                or eval_cfg.get(
+                    "output_report_path",
+                    "outputs/eval_reports/family_benchmark_comparison.md",
+                )
+            )
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(family_md, encoding="utf-8")
+        if args.output_json or not args.dry_run:
+            json_path = pathlib.Path(
+                args.output_json
+                or eval_cfg.get(
+                    "output_json_path",
+                    "outputs/eval_reports/family_benchmark_comparison.json",
+                )
+            )
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(json.dumps(family_payload, indent=2), encoding="utf-8")
+        print(family_md)
+        return 0
+
+    default_path = (
+        models_cfg.get(args.model_key, {}).get("merged_checkpoint_dir")
+        if isinstance(models_cfg, dict) and args.model_key in models_cfg
+        else None
+    )
     model_path = str(
         args.model_path
+        or default_path
         or eval_cfg.get("merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic")
     )
 
@@ -317,6 +578,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         model_path=model_path,
         dry_run=args.dry_run,
         limit=args.limit,
+        model_key=args.model_key,
+        eval_base=args.eval_base,
     )
     md_report = generate_markdown_report(results)
 
@@ -341,6 +604,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         json.dumps(
             {
                 "mode": results["mode"],
+                "model_key": results["model_key"],
                 "arabic_benchmarks_count": results["arabic_benchmarks_count"],
                 "retention_anchors_count": results["retention_anchors_count"],
                 "average_arabic_gain": results["average_arabic_gain"],

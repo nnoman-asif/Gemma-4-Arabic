@@ -276,7 +276,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     total_target = int(
         args.max_samples
         if args.max_samples is not None
-        else (12 if args.dry_run else ds_cfg.get("total_target_samples", 100000))
+        else (12 if args.dry_run else ds_cfg.get("total_target_samples", 120000))
     )
     output_dir = pathlib.Path(
         args.output_dir or ds_cfg.get("output_dataset_dir", "data/sft_mixed")
@@ -294,12 +294,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         replay_samples = pools["replay"]
     else:
         arabic_samples = []
+        arabic_target_total = int(allocation["arabic_total"])
         for src_key, count in allocation["arabic_per_source"].items():
             logger.info("Streaming %d samples from Arabic SFT source '%s'...", count, src_key)
             arabic_samples.extend(
                 load_and_normalize_arabic_sft_source(
                     source_key=src_key,
                     max_samples=count,
+                    streaming=True,
+                )
+            )
+        # Automatic shortfall redistribution if any single Arabic source yielded fewer rows
+        if len(arabic_samples) < arabic_target_total:
+            deficit = arabic_target_total - len(arabic_samples)
+            logger.info(
+                "Topping up %d Arabic SFT deficit rows via multi-shard aya_arabic_instruct...",
+                deficit,
+            )
+            arabic_samples.extend(
+                load_and_normalize_arabic_sft_source(
+                    source_key="aya_arabic_instruct",
+                    max_samples=deficit,
                     streaming=True,
                 )
             )

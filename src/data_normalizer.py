@@ -102,7 +102,20 @@ def normalize_voho_saudi_row(
         elif isinstance(fallback, list):
             parsed = fallback
         else:
-            return None
+            # Support flat instruction/inputs + output/targets fallback rows for Saudi dialect top-up
+            user_in = str(
+                row.get("inputs") or row.get("instruction") or row.get("prompt") or ""
+            ).strip()
+            asst_out = str(
+                row.get("targets") or row.get("output") or row.get("response") or ""
+            ).strip()
+            if user_in and asst_out:
+                parsed = [
+                    {"role": "user", "content": user_in},
+                    {"role": "assistant", "content": asst_out},
+                ]
+            else:
+                return None
 
     if not isinstance(parsed, list) or not parsed:
         return None
@@ -454,6 +467,14 @@ def normalize_arabic_sft_iterable(
 
 
 LIVE_HUB_FALLBACK_SOURCES: Dict[str, List[Tuple[str, Optional[str]]]] = {
+    "voho_saudi_dialogues": [
+        ("VohoAI/voho-saudi-dialogues", "default"),
+        (
+            "parquet",
+            "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/najdi_arabic/train/0000.parquet",
+        ),
+        ("FreedomIntelligence/Alpaca-Arabic-GPT4", "default"),
+    ],
     "acegpt_v2_tuning": [
         ("FreedomIntelligence/Evol-Instruct-Arabic-GPT4", "default"),
         ("FreedomIntelligence/Alpaca-Arabic-GPT4", "default"),
@@ -467,6 +488,10 @@ LIVE_HUB_FALLBACK_SOURCES: Dict[str, List[Tuple[str, Optional[str]]]] = {
             "parquet",
             "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/najdi_arabic/train/0000.parquet",
         ),
+        (
+            "parquet",
+            "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/egyptian_arabic/train/0000.parquet",
+        ),
     ],
 }
 
@@ -477,7 +502,12 @@ def load_and_normalize_arabic_sft_source(
     tokenizer: Optional[Any] = None,
     streaming: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Load one of the 5 Arabic SFT datasets from Hugging Face and normalize its schema."""
+    """Load one of the 5 Arabic SFT datasets from Hugging Face and normalize its schema.
+
+    Dynamically top-ups across multi-shard fallback targets so smaller primary corpora
+    (such as VohoAI/voho-saudi-dialogues) never cause a quota shortfall when building
+    100,000 to 120,000 SFT training rows.
+    """
     from datasets import load_dataset
 
     if source_key not in SFT_ARABIC_DATASETS:
@@ -494,12 +524,22 @@ def load_and_normalize_arabic_sft_source(
         candidate_targets: List[Tuple[str, Optional[str]]]
     ) -> List[Dict[str, Any]]:
         chunk_results: List[Dict[str, Any]] = []
-        per_target_limit = (
-            max(1, max_samples // len(candidate_targets))
-            if max_samples is not None
-            else None
-        )
-        for repo_id, cfg_name in candidate_targets:
+        for idx, (repo_id, cfg_name) in enumerate(candidate_targets):
+            remaining_targets = max(1, len(candidate_targets) - idx)
+            if max_samples is not None:
+                needed = max_samples - len(chunk_results)
+                if needed <= 0:
+                    break
+                # Allow primary shard to fill its share or let subsequent shards top up any deficit
+                per_target_limit: Optional[int] = (
+                    needed if idx == len(candidate_targets) - 1 else max(1, needed // remaining_targets)
+                )
+                # For voho_saudi_dialogues primary repo, take all native rows first before backfilling
+                if repo_id == "VohoAI/voho-saudi-dialogues":
+                    per_target_limit = needed
+            else:
+                per_target_limit = None
+
             if repo_id == "parquet" and cfg_name:
                 ds = load_dataset(
                     "parquet",

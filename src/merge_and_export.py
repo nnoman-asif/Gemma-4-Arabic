@@ -151,15 +151,27 @@ def scale_and_trim_peft_lora_weights(
     model: nn.Module,
     lambda_scale: float = DEFAULT_TIES_LAMBDA,
     density: float = DEFAULT_TIES_DENSITY,
+    sft_adapter_state: Optional[Dict[str, torch.Tensor]] = None,
 ) -> int:
-    """Apply TIES trimming (`density`) and interpolation (`lambda_scale`) to active LoRA weights."""
+    """Apply TIES trimming (`density`) and interpolation (`lambda_scale`) to active LoRA weights.
+
+    Avoids double-trimming `lora_A` and `lora_B` independently: when `sft_adapter_state` is
+    provided, merges the SFT and DPO `lora_B` tensors via `ties_merge_deltas` before applying
+    `lambda_scale`. Otherwise trims and scales `lora_B` directly while keeping `lora_A` intact
+    as the input projection basis.
+    """
     modified_count = 0
     for name, param in model.named_parameters():
-        if "lora_B" in name or "lora_A" in name:
-            trimmed = ties_trim_tensor(param.data, density=density)
-            if "lora_B" in name:
-                trimmed = trimmed * float(lambda_scale)
-            param.data.copy_(trimmed)
+        if "lora_B" in name:
+            if sft_adapter_state is not None and name in sft_adapter_state:
+                merged_b = ties_merge_deltas(
+                    deltas=[sft_adapter_state[name].to(param.device), param.data],
+                    weights=[0.35, 0.65],
+                    density=density,
+                )
+            else:
+                merged_b = ties_trim_tensor(param.data, density=density)
+            param.data.copy_(merged_b * float(lambda_scale))
             modified_count += 1
     return modified_count
 
@@ -237,6 +249,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to the trained Stage 2 DPO (or Stage 1 SFT) LoRA adapter directory.",
     )
     parser.add_argument(
+        "--sft-adapter-dir",
+        type=str,
+        default=None,
+        help="Optional path to Stage 1 SFT adapter directory for two-stage TIES sign election.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="outputs/merged_gemma4_e4b_arabic",
@@ -259,13 +277,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         choices=["merged_16bit", "gguf", "both"],
         default="merged_16bit",
-        help="Export target format: merged_16bit, gguf, or both.",
+        help="Export target format: merged_16bit (default), gguf, or both.",
+    )
+    parser.add_argument(
+        "--export-gguf",
+        action="store_true",
+        help="Opt-in flag to also export GGUF quantized weights in addition to merged_16bit.",
     )
     parser.add_argument(
         "--gguf-quant",
         type=str,
         default="q4_k_m",
         help="GGUF quantization method when exporting GGUF (e.g. q4_k_m, q8_0, f16).",
+    )
+    parser.add_argument(
+        "--offload-to-cpu",
+        action="store_true",
+        help="Enable 8.0 GB laptop CPU offload hooks during model loading.",
     )
     parser.add_argument(
         "--dry-run",
@@ -285,6 +313,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     args = parse_args(argv)
+    effective_format = "both" if args.export_gguf else args.export_format
 
     if args.dry_run:
         base_w = {"q_proj.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]])}
@@ -301,7 +330,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "status": "dry_run_verified",
             "lambda_scale": args.lambda_scale,
             "density": args.density,
-            "export_format": args.export_format,
+            "export_format": effective_format,
             "gguf_quant": args.gguf_quant,
             "merged_q_proj_00": round(float(merged_state["q_proj.weight"][0, 0].item()), 4),
             "output_dir": args.output_dir,
@@ -315,24 +344,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         attach_lora=False,
         adapter_checkpoint=args.adapter_dir if pathlib.Path(args.adapter_dir).exists() else None,
         is_trainable=False,
+        offload_ple_to_cpu=bool(args.offload_to_cpu),
+        offload_multimodal_towers_to_cpu=bool(args.offload_to_cpu),
     )
+
+    sft_state: Optional[Dict[str, torch.Tensor]] = None
+    if args.sft_adapter_dir and pathlib.Path(args.sft_adapter_dir).exists():
+        safetensors_file = pathlib.Path(args.sft_adapter_dir) / "adapter_model.safetensors"
+        if safetensors_file.exists():
+            try:
+                from safetensors.torch import load_file
+
+                sft_state = load_file(str(safetensors_file), device="cpu")
+            except Exception as exc:
+                logger.warning("Could not load SFT adapter safetensors from %s: %s", safetensors_file, exc)
 
     modified = scale_and_trim_peft_lora_weights(
         model=model,
         lambda_scale=args.lambda_scale,
         density=args.density,
+        sft_adapter_state=sft_state,
     )
-    restored_modules = restore_multimodal_towers(
-        model=model,
-        state=offload_state,
-        target_device="cpu",
-        restore_ple=True,
-    )
+    restored_modules: List[str] = []
+    if offload_state.ple_module_names or offload_state.multimodal_module_names:
+        restored_modules = restore_multimodal_towers(
+            model=model,
+            state=offload_state,
+            target_device="cpu",
+            restore_ple=True,
+        )
     exported = export_merged_checkpoint(
         model=model,
         tokenizer=tokenizer,
         output_dir=pathlib.Path(args.output_dir),
-        export_format=args.export_format,
+        export_format=effective_format,
         gguf_quant=args.gguf_quant,
     )
     logger.info(
