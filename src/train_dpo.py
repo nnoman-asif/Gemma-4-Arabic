@@ -21,18 +21,23 @@ import pathlib
 import sys
 from typing import Any, Dict, List, Optional
 
-if not hasattr(builtins, "auto_docstring"):
-    try:
-        from transformers.utils import auto_docstring as _hf_auto_docstring  # type: ignore
+for _builtin_dec in ("auto_docstring", "strict"):
+    if not hasattr(builtins, _builtin_dec):
+        try:
+            import transformers.utils as _hf_utils  # type: ignore
 
-        builtins.auto_docstring = _hf_auto_docstring  # type: ignore[attr-defined]
-    except Exception:
-        def _fallback_auto_docstring(*args: Any, **kwargs: Any) -> Any:
-            if args and callable(args[0]) and len(args) == 1 and not kwargs:
-                return args[0]
-            return lambda fn: fn
+            setattr(
+                builtins,
+                _builtin_dec,
+                getattr(_hf_utils, _builtin_dec),
+            )
+        except Exception:
+            def _fallback_decorator(*args: Any, **kwargs: Any) -> Any:
+                if args and callable(args[0]) and len(args) == 1 and not kwargs:
+                    return args[0]
+                return lambda fn: fn
 
-        builtins.auto_docstring = _fallback_auto_docstring  # type: ignore[attr-defined]
+            setattr(builtins, _builtin_dec, _fallback_decorator)
 
 try:
     import unsloth  # type: ignore # noqa: F401
@@ -435,6 +440,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         }
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
+
+    if dpo_args.max_steps and dpo_args.max_steps > 0 and not args.smoke_test:
+        needed_pairs = (
+            int(dpo_args.max_steps)
+            * int(dpo_args.per_device_train_batch_size)
+            * int(dpo_args.gradient_accumulation_steps)
+            + 128
+        )
+        if len(train_dataset) > needed_pairs:
+            logger.info(
+                "Selecting %d/%d pre-shuffled DPO pairs required for max_steps=%d.",
+                needed_pairs,
+                len(train_dataset),
+                dpo_args.max_steps,
+            )
+            train_dataset = train_dataset.select(range(needed_pairs))
 
     try:
         from unsloth import PatchDPOTrainer  # type: ignore

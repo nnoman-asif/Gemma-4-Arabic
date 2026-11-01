@@ -13,7 +13,7 @@ model:
   top_k_experts: 8
   vocab_size: 262144
   arabic_vocab_tokens: 8460
-  max_seq_length: 4096
+  max_seq_length: 1536
   dtype: "bfloat16"
   load_in_4bit: true
   quant_type: "nf4"
@@ -56,7 +56,7 @@ training:
   output_dir: "outputs/sft_26b_a4b_stage1"
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: 4
   optim: "adamw_bnb_8bit"
   learning_rate: 8.0e-5
   lr_scheduler_type: "cosine"
@@ -64,7 +64,8 @@ training:
   weight_decay: 0.01
   max_grad_norm: 1.0
   neftune_noise_alpha: 5.0
-  num_train_epochs: 2
+  num_train_epochs: 1
+  max_steps: 200
   packing: false
   completion_only_loss: true
   bf16: true
@@ -72,12 +73,12 @@ training:
   fp16: false
   dataloader_pin_memory: true
   dataloader_num_workers: 4
-  logging_steps: 10
+  logging_steps: 5
   save_strategy: "steps"
-  save_steps: 250
+  save_steps: 100
   save_total_limit: 1
-  eval_strategy: "steps"
-  eval_steps: 250
+  eval_strategy: "no"
+  eval_steps: 100
   seed: 3407
 
 chat_template:

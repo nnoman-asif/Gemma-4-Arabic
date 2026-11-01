@@ -60,7 +60,7 @@ echo "======================================================================"
 
   echo "[GPU 0] Running TIES-Merging (lambda=0.85, density=0.85) -> merged_16bit..."
   "${PYTHON_BIN}" src/merge_and_export.py \
-    --base-model google/gemma-4-E4B-it \
+    --base-model unsloth/gemma-4-E4B-it \
     --sft-adapter-dir outputs/sft_e4b_a100 \
     --adapter-dir outputs/dpo_e4b_a100 \
     --output-dir outputs/merged_gemma4_e4b_arabic \
@@ -85,7 +85,7 @@ PID_GPU0=$!
 
   echo "[GPU 1] Running TIES-Merging (lambda=0.85, density=0.85) -> merged_16bit..."
   "${PYTHON_BIN}" src/merge_and_export.py \
-    --base-model google/gemma-4-26B-A4B-it \
+    --base-model unsloth/gemma-4-26B-A4B-it \
     --sft-adapter-dir outputs/sft_26b_a4b_a100 \
     --adapter-dir outputs/dpo_26b_a4b_a100 \
     --output-dir outputs/merged_gemma4_26b_a4b_arabic \
@@ -102,7 +102,8 @@ echo "[Phase 3/4] Evaluating Both Models on 7 Arabic + 4 Retention Benchmarks"
 echo "======================================================================"
 "${PYTHON_BIN}" scripts/run_benchmarks.py \
   --config configs/eval_config.yaml \
-  --model-key both
+  --model-key both \
+  --limit 50
 
 echo "======================================================================"
 echo "[Phase 4/4] Running Iso-Active Latency & Single-GPU vLLM (1-50 Users) Benchmarks"
