@@ -55,9 +55,9 @@ dpo:
 
 training:
   output_dir: "outputs/dpo_e4b_stage2"
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 6
+  per_device_train_batch_size: 12
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 2
   optim: "adamw_bnb_8bit"
   learning_rate: 5.0e-7
   lr_scheduler_type: "cosine"
@@ -72,7 +72,7 @@ training:
   dataloader_num_workers: 4
   logging_steps: 20
   save_strategy: "steps"
-  save_steps: 200
+  save_steps: 100
   save_total_limit: 2
   eval_strategy: "no"
   eval_steps: 200
