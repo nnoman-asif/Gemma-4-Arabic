@@ -784,6 +784,11 @@ def load_gemma4_8gb_model_and_tokenizer(
                             mod.gradient_checkpointing = False
                         except Exception:
                             pass
+                    if hasattr(mod, "_offloaded_gradient_checkpointing"):
+                        try:
+                            mod._offloaded_gradient_checkpointing = False
+                        except Exception:
+                            pass
             for name, param in model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad_(True)
