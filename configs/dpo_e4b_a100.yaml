@@ -72,7 +72,7 @@ training:
   dataloader_num_workers: 4
   logging_steps: 20
   save_strategy: "steps"
-  save_steps: 250
+  save_steps: 200
   save_total_limit: 2
   eval_strategy: "no"
   eval_steps: 200
