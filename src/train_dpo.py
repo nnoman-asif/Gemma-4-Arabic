@@ -166,6 +166,8 @@ def build_dpo_training_arguments(
     train_cfg = cfg.get("training", {})
     dpo_cfg = cfg.get("dpo", {})
     vram_cfg = cfg.get("vram_optimization", {})
+    lora_cfg = cfg.get("lora", {})
+    use_gc = bool(lora_cfg.get("use_gradient_checkpointing", True))
 
     max_steps = (
         max_steps_override
@@ -209,6 +211,7 @@ def build_dpo_training_arguments(
         "bf16": use_bf16,
         "tf32": use_tf32,
         "fp16": False,
+        "gradient_checkpointing": use_gc,
         "dataloader_pin_memory": bool(train_cfg.get("dataloader_pin_memory", True)),
         "dataloader_num_workers": int(train_cfg.get("dataloader_num_workers", 0)),
         "logging_steps": 1 if smoke_test else int(train_cfg.get("logging_steps", 10)),

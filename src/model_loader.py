@@ -615,6 +615,18 @@ def inject_rslora_adapters(
                 model,
                 **unsloth_peft_kwargs,
             )
+        if not use_gradient_checkpointing:
+            if hasattr(peft_model, "gradient_checkpointing_disable"):
+                try:
+                    peft_model.gradient_checkpointing_disable()
+                except Exception:
+                    pass
+            for mod in peft_model.modules():
+                if hasattr(mod, "gradient_checkpointing"):
+                    try:
+                        mod.gradient_checkpointing = False
+                    except Exception:
+                        pass
         setattr(peft_model, "_is_unsloth_model", True)
         return peft_model
     except Exception as unsloth_exc:
@@ -760,6 +772,18 @@ def load_gemma4_8gb_model_and_tokenizer(
                     )
                 except TypeError:
                     FastLanguageModel.for_training(model)
+            if not use_gradient_checkpointing:
+                if hasattr(model, "gradient_checkpointing_disable"):
+                    try:
+                        model.gradient_checkpointing_disable()
+                    except Exception:
+                        pass
+                for mod in model.modules():
+                    if hasattr(mod, "gradient_checkpointing"):
+                        try:
+                            mod.gradient_checkpointing = False
+                        except Exception:
+                            pass
             for name, param in model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad_(True)
