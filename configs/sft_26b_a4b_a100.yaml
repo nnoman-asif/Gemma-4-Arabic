@@ -13,7 +13,7 @@ model:
   top_k_experts: 8
   vocab_size: 262144
   arabic_vocab_tokens: 8460
-  max_seq_length: 4096
+  max_seq_length: 2048
   dtype: "bfloat16"
   load_in_4bit: true
   quant_type: "nf4"
@@ -54,9 +54,9 @@ lora:
 
 training:
   output_dir: "outputs/sft_26b_a4b_stage1"
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 2
-  gradient_accumulation_steps: 8
+  per_device_train_batch_size: 5
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 6
   optim: "adamw_bnb_8bit"
   learning_rate: 8.0e-5
   lr_scheduler_type: "cosine"
