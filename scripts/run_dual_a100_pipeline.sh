@@ -15,6 +15,7 @@ export TRANSFORMERS_VERBOSITY=warning
 export DATASETS_VERBOSITY=warning
 export PYTHONWARNINGS="ignore::SyntaxWarning,ignore::FutureWarning"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export UNSLOTH_BLOCK_COMPILE="0"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -46,8 +47,11 @@ echo "  - GPU 0: Gemma-4-E4B-Arabic-It      -> logs/gpu0_e4b.log"
 echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  -> logs/gpu1_26b_a4b.log"
 echo "======================================================================"
 
+rm -rf unsloth_compiled_cache unsloth_compiled_cache_gpu0 unsloth_compiled_cache_gpu1
+
 (
   export CUDA_VISIBLE_DEVICES=0
+  export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu0"
   echo "[GPU 0] Starting Stage 1 rsLoRA SFT for Gemma-4-E4B-Arabic-It..."
   "${PYTHON_BIN}" src/train_sft.py \
     --config configs/sft_e4b_a100.yaml \
@@ -73,6 +77,7 @@ PID_GPU0=$!
 
 (
   export CUDA_VISIBLE_DEVICES=1
+  export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu1"
   echo "[GPU 1] Starting Stage 1 rsLoRA SFT for Gemma-4-26B-A4B-Arabic-It (Frozen MoE Router)..."
   "${PYTHON_BIN}" src/train_sft.py \
     --config configs/sft_26b_a4b_a100.yaml \

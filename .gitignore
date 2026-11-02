@@ -42,6 +42,7 @@ outputs/
 checkpoints/
 merged_models/
 unsloth_compiled_cache/
+unsloth_compiled_cache*/
 wandb/
 runs/
 logs/

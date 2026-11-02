@@ -226,6 +226,11 @@ def ensure_unsloth_builtins() -> None:
     """Import `unsloth` first (before `transformers`), then populate `builtins` with Transformers symbols."""
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
     os.environ.setdefault("DATASETS_VERBOSITY", "warning")
+    # Disable whole-decoder-layer block compilation (`_block_compile.py`) on Gemma 4's
+    # heterogeneous sliding/global/KV-shared layers so non-reentrant activation
+    # checkpointing never mixes 2D block-compiled and 4D eager Q/K/V norm activations,
+    # while keeping all individual Unsloth Triton/Inductor kernels enabled.
+    os.environ.setdefault("UNSLOTH_BLOCK_COMPILE", "0")
     warnings.filterwarnings("ignore", category=SyntaxWarning)
     warnings.filterwarnings("ignore", message=".*torch.jit.script.*")
     warnings.filterwarnings("ignore", message=".*Reading global config value for per-layer attribute.*")
@@ -240,15 +245,6 @@ def ensure_unsloth_builtins() -> None:
                 import unsloth  # type: ignore # noqa: F401
             except Exception:
                 pass
-
-    try:
-        from transformers.integrations.heterogeneity.configuration_utils import (  # type: ignore
-            HeterogeneousConfigMixin,
-        )
-
-        HeterogeneousConfigMixin.allow_global_per_layer_attribute_access = True  # type: ignore[assignment]
-    except Exception:
-        pass
 
     for _builtin_dec in ("auto_docstring", "strict"):
         if not hasattr(builtins, _builtin_dec):
@@ -295,6 +291,31 @@ ensure_unsloth_builtins()
 
 import torch
 import torch.nn as nn
+
+
+def _configure_dynamo_for_heterogeneous_checkpointing() -> None:
+    """Disable Dynamo LRU cache reordering (pytorch#166926) and raise recompile limits for Gemma 4."""
+    try:
+        if hasattr(torch._C, "_dynamo") and hasattr(torch._C._dynamo, "eval_frame"):
+            torch._C._dynamo.eval_frame._set_lru_cache(False)
+    except Exception:
+        pass
+    try:
+        import torch._dynamo.config as _dynamo_cfg
+
+        for _attr, _min_val in (
+            ("cache_size_limit", 256),
+            ("recompile_limit", 256),
+            ("accumulated_cache_size_limit", 1024),
+            ("accumulated_recompile_limit", 1024),
+        ):
+            if hasattr(_dynamo_cfg, _attr):
+                setattr(_dynamo_cfg, _attr, max(int(getattr(_dynamo_cfg, _attr)), _min_val))
+    except Exception:
+        pass
+
+
+_configure_dynamo_for_heterogeneous_checkpointing()
 
 from src.constants import (
     BASE_MODEL_ID,
