@@ -36,7 +36,7 @@ lora:
   lora_alpha: 64
   lora_dropout: 0.0
   bias: "none"
-  use_gradient_checkpointing: "unsloth"
+  use_gradient_checkpointing: true
   random_state: 3407
   target_modules:
     - "q_proj"
@@ -54,9 +54,9 @@ lora:
 
 training:
   output_dir: "outputs/sft_26b_a4b_stage1"
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 2
-  gradient_accumulation_steps: 8
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
   optim: "adamw_bnb_8bit"
   learning_rate: 8.0e-5
   lr_scheduler_type: "cosine"
@@ -74,10 +74,10 @@ training:
   dataloader_num_workers: 4
   logging_steps: 10
   save_strategy: "steps"
-  save_steps: 400
+  save_steps: 800
   save_total_limit: 1
   eval_strategy: "steps"
-  eval_steps: 400
+  eval_steps: 800
   seed: 3407
 
 chat_template:
