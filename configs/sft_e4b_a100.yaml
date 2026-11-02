@@ -66,7 +66,7 @@ training:
   weight_decay: 0.01
   max_grad_norm: 1.0
   neftune_noise_alpha: 5.0
-  num_train_epochs: 2
+  num_train_epochs: 1.5
   packing: true
   completion_only_loss: true
   bf16: true
@@ -78,7 +78,7 @@ training:
   save_strategy: "steps"
   save_steps: 800
   save_total_limit: 2
-  eval_strategy: "steps"
+  eval_strategy: "no"
   eval_steps: 800
   seed: 3407
 

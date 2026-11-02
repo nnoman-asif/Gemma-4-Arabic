@@ -77,7 +77,7 @@ training:
   save_strategy: "steps"
   save_steps: 250
   save_total_limit: 1
-  eval_strategy: "steps"
+  eval_strategy: "no"
   eval_steps: 200
   seed: 3407
 
