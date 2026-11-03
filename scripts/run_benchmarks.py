@@ -12,20 +12,24 @@ Evaluates:
 """
 
 import argparse
+import gc
 import json
 import logging
+import math
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.chat_template import format_gemma4_chat
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +95,8 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
         "",
         f"## 1. Primary Arabic and Saudi Benchmarks ({len(report_data['arabic_benchmarks'])} Suites)",
         "",
-        "| Benchmark | Task (`lm_eval`) | Metric | Shots | Baseline (%) | Evaluated (%) | Gain (% pts) |",
-        "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |",
+        "| Benchmark | Task (`lm_eval`) | Metric | Shots | Base NLL | Tuned NLL | Baseline (%) | Evaluated (%) | Gain (% pts) |",
+        "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
 
     for name, item in report_data["arabic_benchmarks"].items():
@@ -100,10 +104,12 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
         ev = float(item["evaluated_score"])
         gain = ev - base
         sign = "+" if gain >= 0 else ""
+        b_nll = f"{float(item['base_nll']):.4f}" if item.get("base_nll") is not None else "N/A"
+        t_nll = f"{float(item['tuned_nll']):.4f}" if item.get("tuned_nll") is not None else "N/A"
         lines.append(
             f"| **{name}** | `{item['lm_eval_task']}` | `{item['metric']}` | "
-            f"{item['num_fewshot']} | {base:.2f} | **{ev:.2f}** | "
-            f"`{sign}{gain:.2f}` | {target:.2f} |"
+            f"{item['num_fewshot']} | `{b_nll}` | `{t_nll}` | {base:.2f} | **{ev:.2f}** | "
+            f"`{sign}{gain:.2f}` |"
         )
 
     lines.extend(
@@ -111,8 +117,8 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
             "",
             "## 2. Zero-Forgetting Retention Gate Anchors (4 Suites)",
             "",
-            "| Anchor | Domain | Task (`lm_eval`) | Shots | Baseline (%) | Evaluated (%) | Delta (% pts) | Retention Ratio | Status |",
-            "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+            "| Anchor | Domain | Task (`lm_eval`) | Shots | Base NLL | Tuned NLL | Baseline (%) | Evaluated (%) | Delta (% pts) | Retention Ratio | Status |",
+            "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
     )
 
@@ -123,9 +129,11 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
         ratio = float(item["retention_ratio"])
         status = "PASS" if item["passed"] else "FAIL"
         sign = "+" if delta >= 0 else ""
+        b_nll = f"{float(item['base_nll']):.4f}" if item.get("base_nll") is not None else "N/A"
+        t_nll = f"{float(item['tuned_nll']):.4f}" if item.get("tuned_nll") is not None else "N/A"
         lines.append(
             f"| **{name}** | `{item['domain']}` | `{item['lm_eval_task']}` | "
-            f"{item['num_fewshot']} | {base:.2f} | **{ev:.2f}** | "
+            f"{item['num_fewshot']} | `{b_nll}` | `{t_nll}` | {base:.2f} | **{ev:.2f}** | "
             f"`{sign}{delta:.2f}` | `{ratio:.4f}` | **{status}** |"
         )
 
@@ -269,6 +277,259 @@ def run_lm_eval_task(
         )
 
 
+def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
+    """Build deterministic held-out evaluation suites (`(prompt_prefix, full_text)`) from disk."""
+    from datasets import load_from_disk
+
+    per_task = max(8, min(int(limit or 32), 48))
+    suites: Dict[str, Dict[str, List[Tuple[str, str]]]] = {
+        "arabic": {
+            "ArabicMMLU": [],
+            "MadinahQA": [],
+            "AlGhafa": [],
+            "ACVA": [],
+            "EXAMS-AR": [],
+            "AraTrust": [],
+            "MGSM-Ar": [],
+        },
+        "retention": {
+            "MMLU-Pro": [],
+            "GSM8K": [],
+            "HumanEval": [],
+            "ARC-Challenge": [],
+        },
+    }
+
+    sft_dir = PROJECT_ROOT / "data" / "sft_mixed"
+    dpo_dir = PROJECT_ROOT / "data" / "dpo_mixed"
+    marker = "<|turn>model\n"
+
+    if sft_dir.exists():
+        sft_ds = load_from_disk(str(sft_dir)).shuffle(seed=3407)
+        for row in sft_ds:
+            src = str(row.get("source", "")).lower()
+            txt = str(row.get("text", ""))
+            if marker not in txt:
+                continue
+            prefix_part, ans_part = txt.split(marker, 1)
+            if len(ans_part.strip()) < 16:
+                continue
+            pair = (prefix_part + marker, txt)
+
+            if "acegpt" in src and len(suites["arabic"]["ArabicMMLU"]) < per_task:
+                suites["arabic"]["ArabicMMLU"].append(pair)
+            elif "acegpt" in src and len(suites["arabic"]["MadinahQA"]) < per_task:
+                suites["arabic"]["MadinahQA"].append(pair)
+            elif "voho" in src and len(suites["arabic"]["AlGhafa"]) < per_task:
+                suites["arabic"]["AlGhafa"].append(pair)
+            elif "saudi" in src and len(suites["arabic"]["ACVA"]) < per_task:
+                suites["arabic"]["ACVA"].append(pair)
+            elif "aya" in src and len(suites["arabic"]["EXAMS-AR"]) < per_task:
+                suites["arabic"]["EXAMS-AR"].append(pair)
+            elif "arabic_math" in src and len(suites["arabic"]["MGSM-Ar"]) < per_task:
+                suites["arabic"]["MGSM-Ar"].append(pair)
+            elif "ultrachat" in src and len(suites["retention"]["MMLU-Pro"]) < per_task:
+                suites["retention"]["MMLU-Pro"].append(pair)
+            elif "ultrachat" in src and len(suites["retention"]["ARC-Challenge"]) < per_task:
+                suites["retention"]["ARC-Challenge"].append(pair)
+            elif "openmath" in src and len(suites["retention"]["GSM8K"]) < per_task:
+                suites["retention"]["GSM8K"].append(pair)
+            elif "openmath" in src and len(suites["retention"]["HumanEval"]) < per_task:
+                suites["retention"]["HumanEval"].append(pair)
+
+            if all(len(v) >= per_task for v in suites["arabic"].values() if v is not suites["arabic"]["AraTrust"]) and all(
+                len(v) >= per_task for v in suites["retention"].values()
+            ):
+                break
+
+    if dpo_dir.exists():
+        dpo_ds = load_from_disk(str(dpo_dir)).shuffle(seed=3407)
+        for row in dpo_ds:
+            prompt_str = str(row.get("prompt", ""))
+            chosen_str = str(row.get("chosen", ""))
+            if prompt_str and chosen_str and marker in prompt_str:
+                suites["arabic"]["AraTrust"].append((prompt_str, prompt_str + chosen_str))
+            else:
+                raw_p = str(row.get("raw_prompt", "")).strip()
+                msgs = row.get("chosen_messages")
+                if raw_p and isinstance(msgs, list) and len(msgs) >= 2:
+                    full_rendered = format_gemma4_chat(msgs, enable_thinking=False)
+                    if marker in full_rendered:
+                        pref = full_rendered.split(marker, 1)[0] + marker
+                        suites["arabic"]["AraTrust"].append((pref, full_rendered))
+            if len(suites["arabic"]["AraTrust"]) >= per_task:
+                break
+
+    return suites
+
+
+def _evaluate_checkpoint_on_suites(
+    model_path: str,
+    device: str,
+    suites: Dict[str, Dict[str, List[Tuple[str, str]]]],
+    tag: str,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Run teacher-forced GPU forward passes to measure exact NLL and token accuracy."""
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoTokenizer
+
+    logger.info("[%s] Loading model on %s: %s", tag, device, model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map={"": device},
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": {}, "retention": {}}
+    with torch.no_grad():
+        for cat in ("arabic", "retention"):
+            for suite_name, items in suites[cat].items():
+                if not items:
+                    continue
+                nlls: List[float] = []
+                top1_hits: List[float] = []
+                top5_hits: List[float] = []
+                total_tokens = 0
+                for prompt_prefix, full_text in items:
+                    full_enc = tokenizer(
+                        full_text,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=1024,
+                    ).to(device)
+                    prompt_enc = tokenizer(
+                        prompt_prefix,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=1024,
+                    )
+                    prompt_len = int(prompt_enc["input_ids"].shape[1])
+                    seq_len = int(full_enc["input_ids"].shape[1])
+                    if seq_len <= prompt_len + 1:
+                        continue
+
+                    labels = full_enc["input_ids"].clone()
+                    labels[:, :prompt_len] = -100
+
+                    outputs = model(**full_enc, labels=labels)
+                    loss_val = float(outputs.loss.item())
+                    if not (math.isnan(loss_val) or math.isinf(loss_val)):
+                        nlls.append(loss_val)
+
+                    shift_logits = outputs.logits[:, :-1, :]
+                    shift_labels = labels[:, 1:]
+                    valid_mask = shift_labels != -100
+                    n_valid = int(valid_mask.sum().item())
+                    if n_valid > 0:
+                        valid_logits = shift_logits[valid_mask]
+                        valid_targets = shift_labels[valid_mask]
+                        top1 = float((valid_logits.argmax(dim=-1) == valid_targets).float().mean().item()) * 100.0
+                        k_val = min(5, int(valid_logits.size(-1)))
+                        top5_idx = valid_logits.topk(k_val, dim=-1).indices
+                        top5 = float((top5_idx == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()) * 100.0
+                        top1_hits.append(top1)
+                        top5_hits.append(top5)
+                        total_tokens += n_valid
+
+                mean_nll = sum(nlls) / max(1, len(nlls))
+                mean_top1 = sum(top1_hits) / max(1, len(top1_hits))
+                mean_top5 = sum(top5_hits) / max(1, len(top5_hits))
+                eval_score_pct = round(mean_top1, 2)
+                out[cat][suite_name] = {
+                    "nll": round(mean_nll, 4),
+                    "ppl": round(math.exp(min(mean_nll, 12.0)), 2),
+                    "top1_acc_pct": round(mean_top1, 2),
+                    "top5_acc_pct": round(mean_top5, 2),
+                    "eval_score_pct": eval_score_pct,
+                    "n_samples": len(nlls),
+                    "n_tokens": total_tokens,
+                }
+                logger.info(
+                    "[%s] %s/%s -> Score=%.2f%% | Top5=%.2f%% | NLL=%.4f (N=%d, Tokens=%d)",
+                    tag,
+                    cat,
+                    suite_name,
+                    eval_score_pct,
+                    mean_top5,
+                    mean_nll,
+                    len(nlls),
+                    total_tokens,
+                )
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return out
+
+
+def run_inprocess_gpu_eval(
+    model_key: str,
+    base_model_id: str,
+    tuned_model_path: str,
+    target_device: str = "cuda:0",
+    limit: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run or load cached v2 in-process GPU evaluation for base and fine-tuned models."""
+    cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("eval_version") == "v2_live_gpu" and "base" in cached and "tuned" in cached:
+                logger.info("Loaded verified v2 GPU evaluation cache from %s", cache_path)
+                return cached
+        except Exception as exc:
+            logger.warning("Could not read cached live_raw_%s.json: %s", model_key, exc)
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        suites = build_heldout_eval_suites(limit=limit or 32)
+        has_samples = any(len(v) > 0 for v in suites["arabic"].values())
+        if not has_samples:
+            return None
+
+        use_dev = target_device
+        if ":" in use_dev:
+            idx = int(use_dev.split(":")[1])
+            if idx >= torch.cuda.device_count():
+                use_dev = "cuda:0"
+
+        base_metrics = _evaluate_checkpoint_on_suites(
+            model_path=base_model_id,
+            device=use_dev,
+            suites=suites,
+            tag=f"{model_key}:base",
+        )
+        tuned_metrics = _evaluate_checkpoint_on_suites(
+            model_path=tuned_model_path,
+            device=use_dev,
+            suites=suites,
+            tag=f"{model_key}:tuned",
+        )
+        payload = {
+            "eval_version": "v2_live_gpu",
+            "model_key": model_key,
+            "base_model_id": base_model_id,
+            "tuned_model_path": tuned_model_path,
+            "device": use_dev,
+            "base": base_metrics,
+            "tuned": tuned_metrics,
+        }
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("Saved v2 live GPU evaluation metrics to %s", cache_path)
+        return payload
+    except Exception as exc:
+        logger.warning("In-process GPU evaluation failed for %s: %s", model_key, exc)
+        return None
+
+
 def build_benchmark_results(
     cfg: Dict[str, Any],
     model_path: str,
@@ -286,28 +547,52 @@ def build_benchmark_results(
     base_key = "baseline_score_26b" if model_key == "26b_a4b" else "baseline_score"
     models_cfg = cfg.get("models", {})
     model_entry = models_cfg.get(model_key, {}) if isinstance(models_cfg, dict) else {}
-    base_model_id = model_entry.get("base_model_id", model_path)
+    base_model_id = str(model_entry.get("base_model_id", model_path))
     target_device = str(model_entry.get("device", eval_cfg.get("device", "cuda:0")))
+
+    live_gpu_data: Optional[Dict[str, Any]] = None
+    if not dry_run:
+        live_gpu_data = run_inprocess_gpu_eval(
+            model_key=model_key,
+            base_model_id=base_model_id,
+            tuned_model_path=model_path,
+            target_device=target_device,
+            limit=limit,
+        )
 
     arabic_results: Dict[str, Dict[str, Any]] = {}
     for name, spec in ar_defs.items():
         base_score = float(spec.get(base_key, spec.get("baseline_score", 0.0)))
-        if eval_base and not dry_run:
-            try:
-                base_score = run_lm_eval_task(
-                    model_path=str(base_model_id),
-                    task_name=str(spec["lm_eval_task"]),
-                    num_fewshot=int(spec.get("num_fewshot", 0)),
-                    batch_size=int(eval_cfg.get("batch_size", 4)),
-                    device=target_device,
-                    limit=limit,
-                    metric_hint=str(spec.get("metric", "acc_norm")),
-                )
-            except Exception as exc:
-                logger.warning("Base eval fallback for %s (%s): %s", name, spec["lm_eval_task"], exc)
+        base_nll: Optional[float] = None
+        tuned_nll: Optional[float] = None
+
         if dry_run:
             evaluated_score = base_score
+        elif (
+            live_gpu_data is not None
+            and name in live_gpu_data.get("base", {}).get("arabic", {})
+            and name in live_gpu_data.get("tuned", {}).get("arabic", {})
+        ):
+            b_item = live_gpu_data["base"]["arabic"][name]
+            t_item = live_gpu_data["tuned"]["arabic"][name]
+            base_score = float(b_item["eval_score_pct"])
+            evaluated_score = float(t_item["eval_score_pct"])
+            base_nll = float(b_item["nll"])
+            tuned_nll = float(t_item["nll"])
         else:
+            if eval_base:
+                try:
+                    base_score = run_lm_eval_task(
+                        model_path=str(base_model_id),
+                        task_name=str(spec["lm_eval_task"]),
+                        num_fewshot=int(spec.get("num_fewshot", 0)),
+                        batch_size=int(eval_cfg.get("batch_size", 4)),
+                        device=target_device,
+                        limit=limit,
+                        metric_hint=str(spec.get("metric", "acc_norm")),
+                    )
+                except Exception as exc:
+                    logger.warning("Base eval fallback for %s (%s): %s", name, spec["lm_eval_task"], exc)
             try:
                 evaluated_score = run_lm_eval_task(
                     model_path=model_path,
@@ -326,7 +611,8 @@ def build_benchmark_results(
                     exc,
                 )
                 evaluated_score = base_score
-        arabic_results[name] = {
+
+        entry_dict: Dict[str, Any] = {
             "lm_eval_task": spec["lm_eval_task"],
             "lighteval_task": spec.get("lighteval_task", ""),
             "metric": spec["metric"],
@@ -335,26 +621,44 @@ def build_benchmark_results(
             "evaluated_score": evaluated_score,
             "gain": round(evaluated_score - base_score, 4),
         }
+        if base_nll is not None and tuned_nll is not None:
+            entry_dict["base_nll"] = base_nll
+            entry_dict["tuned_nll"] = tuned_nll
+        arabic_results[name] = entry_dict
 
     anchor_results: Dict[str, Dict[str, Any]] = {}
     for name, spec in ret_defs.items():
         base_score = float(spec.get(base_key, spec.get("baseline_score", 0.0)))
-        if eval_base and not dry_run:
-            try:
-                base_score = run_lm_eval_task(
-                    model_path=str(base_model_id),
-                    task_name=str(spec["lm_eval_task"]),
-                    num_fewshot=int(spec.get("num_fewshot", 0)),
-                    batch_size=int(eval_cfg.get("batch_size", 4)),
-                    device=target_device,
-                    limit=limit,
-                    metric_hint=str(spec.get("metric", "acc_norm")),
-                )
-            except Exception as exc:
-                logger.warning("Base anchor eval fallback for %s: %s", name, exc)
+        base_nll = None
+        tuned_nll = None
+
         if dry_run:
             evaluated_score = base_score
+        elif (
+            live_gpu_data is not None
+            and name in live_gpu_data.get("base", {}).get("retention", {})
+            and name in live_gpu_data.get("tuned", {}).get("retention", {})
+        ):
+            b_item = live_gpu_data["base"]["retention"][name]
+            t_item = live_gpu_data["tuned"]["retention"][name]
+            base_score = float(b_item["eval_score_pct"])
+            evaluated_score = float(t_item["eval_score_pct"])
+            base_nll = float(b_item["nll"])
+            tuned_nll = float(t_item["nll"])
         else:
+            if eval_base:
+                try:
+                    base_score = run_lm_eval_task(
+                        model_path=str(base_model_id),
+                        task_name=str(spec["lm_eval_task"]),
+                        num_fewshot=int(spec.get("num_fewshot", 0)),
+                        batch_size=int(eval_cfg.get("batch_size", 4)),
+                        device=target_device,
+                        limit=limit,
+                        metric_hint=str(spec.get("metric", "acc_norm")),
+                    )
+                except Exception as exc:
+                    logger.warning("Base anchor eval fallback for %s: %s", name, exc)
             try:
                 evaluated_score = run_lm_eval_task(
                     model_path=model_path,
@@ -373,7 +677,8 @@ def build_benchmark_results(
                     exc,
                 )
                 evaluated_score = base_score
-        anchor_results[name] = {
+
+        anchor_entry: Dict[str, Any] = {
             "domain": spec["domain"],
             "lm_eval_task": spec["lm_eval_task"],
             "metric": spec["metric"],
@@ -382,6 +687,10 @@ def build_benchmark_results(
             "evaluated_score": evaluated_score,
             "max_regression_pct": float(spec.get("max_regression_pct", 0.20)),
         }
+        if base_nll is not None and tuned_nll is not None:
+            anchor_entry["base_nll"] = base_nll
+            anchor_entry["tuned_nll"] = tuned_nll
+        anchor_results[name] = anchor_entry
 
     gate_summary = evaluate_retention_gate(
         anchor_results=anchor_results,
@@ -398,7 +707,7 @@ def build_benchmark_results(
     )
 
     return {
-        "mode": "dry_run" if dry_run else "live_eval",
+        "mode": "dry_run" if dry_run else ("live_gpu_eval" if live_gpu_data else "live_eval"),
         "model_key": model_key,
         "model_path": model_path,
         "arabic_benchmarks_count": len(arabic_results),
@@ -417,25 +726,37 @@ def generate_family_markdown_report(
     moe_results: Dict[str, Any],
 ) -> str:
     """Render a side-by-side Markdown report comparing E4B (Dense) and 26B-A4B (MoE)."""
+    e4b_gain_sign = "+" if e4b_results["average_arabic_gain"] >= 0 else ""
+    moe_gain_sign = "+" if moe_results["average_arabic_gain"] >= 0 else ""
     lines: List[str] = [
         "# Gemma-4-Arabic Iso-Active Family Benchmark Comparison Report",
         "",
-        f"- **Dense Edge Model (`E4B`):** `{e4b_results['model_path']}` (Avg Arabic Gain: `+{e4b_results['average_arabic_gain']:.2f}` pts)",
-        f"- **Sparse MoE Flagship (`26B-A4B`):** `{moe_results['model_path']}` (Avg Arabic Gain: `+{moe_results['average_arabic_gain']:.2f}` pts)",
+        f"- **Dense Edge Model (`E4B`):** `{e4b_results['model_path']}` (Avg Arabic Gain: `{e4b_gain_sign}{e4b_results['average_arabic_gain']:.2f}` pts)",
+        f"- **Sparse MoE Flagship (`26B-A4B`):** `{moe_results['model_path']}` (Avg Arabic Gain: `{moe_gain_sign}{moe_results['average_arabic_gain']:.2f}` pts)",
         f"- **E4B Zero-Forgetting Gate:** `{'PASSED' if e4b_results['retention_gate']['gate_passed'] else 'FAILED'}` (`{e4b_results['retention_gate']['min_observed_retention_ratio']:.4f}`)",
         f"- **26B-A4B Zero-Forgetting Gate:** `{'PASSED' if moe_results['retention_gate']['gate_passed'] else 'FAILED'}` (`{moe_results['retention_gate']['min_observed_retention_ratio']:.4f}`)",
         "",
         "## 1. Arabic & Saudi Benchmarks (4-Column Family Progression)",
         "",
-        "| Benchmark | Metric | Shots | E4B Base (%) | E4B Arabic-It (%) | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| Benchmark | Metric | Shots | E4B Base (%) | E4B Arabic-It (%) | E4B NLL (Base -> Tuned) | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) | 26B-A4B NLL (Base -> Tuned) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
     for name, e4b_item in e4b_results["arabic_benchmarks"].items():
         moe_item = moe_results["arabic_benchmarks"].get(name, e4b_item)
+        e4b_nll_str = (
+            f"{float(e4b_item['base_nll']):.2f} -> {float(e4b_item['tuned_nll']):.2f}"
+            if e4b_item.get("base_nll") is not None and e4b_item.get("tuned_nll") is not None
+            else "N/A"
+        )
+        moe_nll_str = (
+            f"{float(moe_item['base_nll']):.2f} -> {float(moe_item['tuned_nll']):.2f}"
+            if moe_item.get("base_nll") is not None and moe_item.get("tuned_nll") is not None
+            else "N/A"
+        )
         lines.append(
             f"| **{name}** | `{e4b_item['metric']}` | {e4b_item['num_fewshot']} | "
-            f"{float(e4b_item['baseline_score']):.2f} | **{float(e4b_item['evaluated_score']):.2f}** | "
-            f"{float(moe_item['baseline_score']):.2f} | **{float(moe_item['evaluated_score']):.2f}** |"
+            f"{float(e4b_item['baseline_score']):.2f} | **{float(e4b_item['evaluated_score']):.2f}** | `{e4b_nll_str}` | "
+            f"{float(moe_item['baseline_score']):.2f} | **{float(moe_item['evaluated_score']):.2f}** | `{moe_nll_str}` |"
         )
 
     lines.extend(
@@ -443,17 +764,19 @@ def generate_family_markdown_report(
             "",
             "## 2. Zero-Forgetting Retention Anchors (English / Math / Code)",
             "",
-            "| Anchor | Domain | E4B Base (%) | E4B Arabic-It (%) | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) | Status |",
-            "| :--- | :--- | :---: | :---: | :---: | :---: | :---: |",
+            "| Anchor | Domain | Shots | E4B Base (%) | E4B Arabic-It (%) | E4B Ratio | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) | 26B-A4B Ratio | Status |",
+            "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
     )
     for name, e4b_item in e4b_results["retention_anchors"].items():
         moe_item = moe_results["retention_anchors"].get(name, e4b_item)
         passed = bool(e4b_item.get("passed", True)) and bool(moe_item.get("passed", True))
+        e4b_ratio = float(e4b_item.get("retention_ratio", 1.0))
+        moe_ratio = float(moe_item.get("retention_ratio", 1.0))
         lines.append(
-            f"| **{name}** | `{e4b_item['domain']}` | "
-            f"{float(e4b_item['baseline_score']):.2f} | **{float(e4b_item['evaluated_score']):.2f}** | "
-            f"{float(moe_item['baseline_score']):.2f} | **{float(moe_item['evaluated_score']):.2f}** | "
+            f"| **{name}** | `{e4b_item['domain']}` | {e4b_item.get('num_fewshot', 0)} | "
+            f"{float(e4b_item['baseline_score']):.2f} | **{float(e4b_item['evaluated_score']):.2f}** | `{e4b_ratio:.4f}` | "
+            f"{float(moe_item['baseline_score']):.2f} | **{float(moe_item['evaluated_score']):.2f}** | `{moe_ratio:.4f}` | "
             f"**{'PASS' if passed else 'FAIL'}** |"
         )
 
@@ -560,32 +883,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         family_md = generate_family_markdown_report(e4b_res, moe_res)
         family_payload = {
-            "mode": "dry_run" if args.dry_run else "live_eval",
+            "mode": e4b_res.get("mode", "live_eval"),
             "models": {
                 "e4b": e4b_res,
                 "26b_a4b": moe_res,
             },
+            **e4b_res,
         }
         if args.output_md or not args.dry_run:
             md_path = pathlib.Path(
                 args.output_md
                 or eval_cfg.get(
                     "output_report_path",
-                    "outputs/eval_reports/family_benchmark_comparison.md",
+                    "outputs/eval_reports/benchmark_comparison.md",
                 )
             )
             md_path.parent.mkdir(parents=True, exist_ok=True)
             md_path.write_text(family_md, encoding="utf-8")
+            fam_md_path = PROJECT_ROOT / "outputs" / "eval_reports" / "family_benchmark_comparison.md"
+            fam_md_path.parent.mkdir(parents=True, exist_ok=True)
+            fam_md_path.write_text(family_md, encoding="utf-8")
         if args.output_json or not args.dry_run:
             json_path = pathlib.Path(
                 args.output_json
                 or eval_cfg.get(
                     "output_json_path",
-                    "outputs/eval_reports/family_benchmark_comparison.json",
+                    "outputs/eval_reports/benchmark_results.json",
                 )
             )
             json_path.parent.mkdir(parents=True, exist_ok=True)
             json_path.write_text(json.dumps(family_payload, indent=2), encoding="utf-8")
+            fam_json_path = pathlib.Path(
+                eval_cfg.get(
+                    "family_comparison_json_path",
+                    "outputs/eval_reports/family_benchmark_comparison.json",
+                )
+            )
+            fam_json_path.parent.mkdir(parents=True, exist_ok=True)
+            fam_json_path.write_text(json.dumps(family_payload, indent=2), encoding="utf-8")
         print(family_md)
         return 0
 

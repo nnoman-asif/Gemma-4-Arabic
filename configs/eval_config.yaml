@@ -18,8 +18,8 @@ evaluation:
 models:
   e4b:
     label: "Gemma-4-E4B-Arabic-It"
-    architecture: "Dense (8.0B Total / 4.5B Active)"
-    base_model_id: "google/gemma-4-E4B-it"
+    architecture: "Dense (4.5B Total / 4.0B Active)"
+    base_model_id: "unsloth/gemma-4-E4B-it"
     unsloth_model_id: "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
     merged_checkpoint_dir: "outputs/merged_gemma4_e4b_arabic/merged_16bit"
     hf_repo_id: "noman-asif/Gemma-4-E4B-Arabic-It"
@@ -27,8 +27,8 @@ models:
 
   26b_a4b:
     label: "Gemma-4-26B-A4B-Arabic-It"
-    architecture: "MoE 128 Experts (26.0B Total / 3.8B Active)"
-    base_model_id: "google/gemma-4-26B-A4B-it"
+    architecture: "Sparse MoE 128 Experts (25.2B Total / 3.8B Active)"
+    base_model_id: "unsloth/gemma-4-26B-A4B-it"
     unsloth_model_id: "unsloth/gemma-4-26B-A4B-it"
     merged_checkpoint_dir: "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit"
     hf_repo_id: "noman-asif/Gemma-4-26B-A4B-Arabic-It"
@@ -92,9 +92,9 @@ arabic_benchmarks:
 
   MGSM-Ar:
     lm_eval_task: "mgsm_native_cot_ar"
-    lighteval_task: "community|mgsm_ar|5"
+    lighteval_task: "community|mgsm_ar|0"
     metric: "exact_match"
-    num_fewshot: 5
+    num_fewshot: 0
     description: "Generative Arabic multi-step mathematical Chain-of-Thought (<|think|>) reasoning benchmark"
 
 retention_anchors:
@@ -102,7 +102,7 @@ retention_anchors:
     domain: "english_reasoning"
     lm_eval_task: "mmlu_pro"
     metric: "acc"
-    num_fewshot: 5
+    num_fewshot: 0
     max_regression_pct: 0.20
     min_acceptable_score: 69.2
 
@@ -110,7 +110,7 @@ retention_anchors:
     domain: "math_reasoning"
     lm_eval_task: "gsm8k"
     metric: "exact_match,strict-match"
-    num_fewshot: 5
+    num_fewshot: 0
     max_regression_pct: 0.20
     min_acceptable_score: 83.8
 
@@ -126,7 +126,7 @@ retention_anchors:
     domain: "english_science_anchor"
     lm_eval_task: "arc_challenge"
     metric: "acc_norm"
-    num_fewshot: 25
+    num_fewshot: 0
     max_regression_pct: 0.20
     min_acceptable_score: 76.4
 

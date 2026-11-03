@@ -433,6 +433,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
+    out_dir_path = pathlib.Path(output_dir)
+    if not args.smoke_test and (out_dir_path / "adapter_config.json").exists():
+        logger.info("Stage 2 DPO final adapter already exists at %s; skipping training.", output_dir)
+        return 0
+
     try:
         from unsloth import PatchDPOTrainer  # type: ignore
 

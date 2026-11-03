@@ -309,6 +309,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
+    out_dir_path = pathlib.Path(output_dir)
+    if not args.smoke_test and (out_dir_path / "adapter_config.json").exists():
+        logger.info("Stage 1 SFT final adapter already exists at %s; skipping training.", output_dir)
+        return 0
+
     from trl import SFTTrainer
 
     model, tokenizer, offload_state = load_gemma4_8gb_model_and_tokenizer(
