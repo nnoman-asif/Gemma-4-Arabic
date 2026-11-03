@@ -187,7 +187,7 @@ def profile_pytorch_batched_live(
     """Run live GPU batched concurrency profiling via Transformers when vLLM is not installed."""
     import gc
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from src.data_Card_and_formatting import format_gemma4_chat
+    from src.chat_template import format_gemma4_chat
 
     target_device = device if torch.cuda.is_available() else "cpu"
     if torch.cuda.is_available():

@@ -302,19 +302,26 @@ def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple
 
     sft_dir = PROJECT_ROOT / "data" / "sft_mixed"
     dpo_dir = PROJECT_ROOT / "data" / "dpo_mixed"
-    marker = "<|turn>model\n"
+    markers = ("<start_of_turn>model\n", "<|turn>model\n", "<|turn|>model\n")
+    fallback_ar: List[Tuple[str, str]] = []
+    fallback_ret: List[Tuple[str, str]] = []
+
+    def _split_on_marker(text_val: str) -> Optional[Tuple[str, str]]:
+        for m in markers:
+            if m in text_val:
+                pref, ans = text_val.split(m, 1)
+                if len(ans.strip()) >= 16:
+                    return (pref + m, text_val)
+        return None
 
     if sft_dir.exists():
         sft_ds = load_from_disk(str(sft_dir)).shuffle(seed=3407)
         for row in sft_ds:
             src = str(row.get("source", "")).lower()
             txt = str(row.get("text", ""))
-            if marker not in txt:
+            pair = _split_on_marker(txt)
+            if pair is None:
                 continue
-            prefix_part, ans_part = txt.split(marker, 1)
-            if len(ans_part.strip()) < 16:
-                continue
-            pair = (prefix_part + marker, txt)
 
             if "acegpt" in src and len(suites["arabic"]["ArabicMMLU"]) < per_task:
                 suites["arabic"]["ArabicMMLU"].append(pair)
@@ -336,8 +343,15 @@ def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple
                 suites["retention"]["GSM8K"].append(pair)
             elif "openmath" in src and len(suites["retention"]["HumanEval"]) < per_task:
                 suites["retention"]["HumanEval"].append(pair)
+            else:
+                if "ultrachat" in src or "openmath" in src:
+                    if len(fallback_ret) < per_task * 4:
+                        fallback_ret.append(pair)
+                else:
+                    if len(fallback_ar) < per_task * 7:
+                        fallback_ar.append(pair)
 
-            if all(len(v) >= per_task for v in suites["arabic"].values() if v is not suites["arabic"]["AraTrust"]) and all(
+            if all(len(v) >= per_task for k, v in suites["arabic"].items() if k != "AraTrust") and all(
                 len(v) >= per_task for v in suites["retention"].values()
             ):
                 break
@@ -347,18 +361,33 @@ def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple
         for row in dpo_ds:
             prompt_str = str(row.get("prompt", ""))
             chosen_str = str(row.get("chosen", ""))
-            if prompt_str and chosen_str and marker in prompt_str:
-                suites["arabic"]["AraTrust"].append((prompt_str, prompt_str + chosen_str))
-            else:
+            matched_dpo = False
+            if prompt_str and chosen_str:
+                for m in markers:
+                    if m in prompt_str:
+                        pref = prompt_str.split(m, 1)[0] + m
+                        suites["arabic"]["AraTrust"].append((pref, pref + chosen_str))
+                        matched_dpo = True
+                        break
+            if not matched_dpo:
                 raw_p = str(row.get("raw_prompt", "")).strip()
                 msgs = row.get("chosen_messages")
                 if raw_p and isinstance(msgs, list) and len(msgs) >= 2:
                     full_rendered = format_gemma4_chat(msgs, enable_thinking=False)
-                    if marker in full_rendered:
-                        pref = full_rendered.split(marker, 1)[0] + marker
-                        suites["arabic"]["AraTrust"].append((pref, full_rendered))
+                    pair = _split_on_marker(full_rendered)
+                    if pair is not None:
+                        suites["arabic"]["AraTrust"].append(pair)
             if len(suites["arabic"]["AraTrust"]) >= per_task:
                 break
+
+    for k, v in suites["arabic"].items():
+        if len(v) < per_task and fallback_ar:
+            need = per_task - len(v)
+            v.extend(fallback_ar[:need])
+    for k, v in suites["retention"].items():
+        if len(v) < per_task and fallback_ret:
+            need = per_task - len(v)
+            v.extend(fallback_ret[:need])
 
     return suites
 
@@ -371,16 +400,24 @@ def _evaluate_checkpoint_on_suites(
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Run teacher-forced GPU forward passes to measure exact NLL and token accuracy."""
     import torch
-    from transformers import AutoModelForImageTextToText, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
     logger.info("[%s] Loading model on %s: %s", tag, device, model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map={"": device},
-        trust_remote_code=True,
-    )
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map={"": device},
+            trust_remote_code=True,
+        )
+    except Exception:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map={"": device},
+            trust_remote_code=True,
+        )
     model.eval()
 
     out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": {}, "retention": {}}
