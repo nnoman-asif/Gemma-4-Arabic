@@ -278,7 +278,7 @@ def run_lm_eval_task(
 
 
 def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
-    """Build deterministic held-out evaluation suites (`(prompt_prefix, full_text)`) from disk."""
+    """Build deterministic held-out evaluation suites (`(user_prompt, clean_answer)`) from disk."""
     from datasets import load_from_disk
 
     per_task = max(8, min(int(limit or 32), 48))
@@ -306,20 +306,51 @@ def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple
     fallback_ar: List[Tuple[str, str]] = []
     fallback_ret: List[Tuple[str, str]] = []
 
-    def _split_on_marker(text_val: str) -> Optional[Tuple[str, str]]:
+    def _extract_clean_pair(text_val: str) -> Optional[Tuple[str, str]]:
         for m in markers:
             if m in text_val:
-                pref, ans = text_val.split(m, 1)
-                if len(ans.strip()) >= 16:
-                    return (pref + m, text_val)
+                raw_pref, raw_ans = text_val.split(m, 1)
+                user_prompt = raw_pref
+                for tok in (
+                    "<bos>",
+                    "<start_of_turn>user\n",
+                    "<|turn>user\n",
+                    "<|turn|>user\n",
+                    "<end_of_turn>",
+                    "<turn|>",
+                    "<|turn|>",
+                ):
+                    user_prompt = user_prompt.replace(tok, "")
+                user_prompt = user_prompt.strip()
+
+                clean_ans = raw_ans
+                for tok in ("<end_of_turn>", "<turn|>", "<|turn|>"):
+                    clean_ans = clean_ans.replace(tok, "")
+                if "</|>" in clean_ans:
+                    clean_ans = clean_ans.rsplit("</|>", 1)[-1]
+                if "<|think|>" in clean_ans:
+                    parts = [p.strip() for p in clean_ans.split("<|think|>") if p.strip()]
+                    if not parts:
+                        return None
+                    if len(parts) == 1:
+                        clean_ans = parts[0]
+                    elif len(parts[-1]) >= 24:
+                        clean_ans = parts[-1]
+                    else:
+                        clean_ans = f"{parts[0]}\n{parts[-1]}"
+                clean_ans = clean_ans.replace("تحليل المسألة وخطوات الحل:", "").strip()
+                if len(user_prompt) >= 8 and len(clean_ans) >= 16:
+                    return (user_prompt, clean_ans)
         return None
 
     if sft_dir.exists():
-        sft_ds = load_from_disk(str(sft_dir)).shuffle(seed=3407)
+        raw_sft = load_from_disk(str(sft_dir))
+        tail_start = max(0, len(raw_sft) - 15000)
+        sft_ds = raw_sft.select(range(tail_start, len(raw_sft))).shuffle(seed=9407)
         for row in sft_ds:
             src = str(row.get("source", "")).lower()
             txt = str(row.get("text", ""))
-            pair = _split_on_marker(txt)
+            pair = _extract_clean_pair(txt)
             if pair is None:
                 continue
 
@@ -357,26 +388,23 @@ def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple
                 break
 
     if dpo_dir.exists():
-        dpo_ds = load_from_disk(str(dpo_dir)).shuffle(seed=3407)
+        raw_dpo = load_from_disk(str(dpo_dir))
+        dpo_tail = max(0, len(raw_dpo) - 3000)
+        dpo_ds = raw_dpo.select(range(dpo_tail, len(raw_dpo))).shuffle(seed=9407)
         for row in dpo_ds:
             prompt_str = str(row.get("prompt", ""))
             chosen_str = str(row.get("chosen", ""))
-            matched_dpo = False
+            pair_dpo: Optional[Tuple[str, str]] = None
             if prompt_str and chosen_str:
-                for m in markers:
-                    if m in prompt_str:
-                        pref = prompt_str.split(m, 1)[0] + m
-                        suites["arabic"]["AraTrust"].append((pref, pref + chosen_str))
-                        matched_dpo = True
-                        break
-            if not matched_dpo:
+                pair_dpo = _extract_clean_pair(prompt_str + chosen_str)
+            if pair_dpo is None:
                 raw_p = str(row.get("raw_prompt", "")).strip()
                 msgs = row.get("chosen_messages")
                 if raw_p and isinstance(msgs, list) and len(msgs) >= 2:
                     full_rendered = format_gemma4_chat(msgs, enable_thinking=False)
-                    pair = _split_on_marker(full_rendered)
-                    if pair is not None:
-                        suites["arabic"]["AraTrust"].append(pair)
+                    pair_dpo = _extract_clean_pair(full_rendered)
+            if pair_dpo is not None:
+                suites["arabic"]["AraTrust"].append(pair_dpo)
             if len(suites["arabic"]["AraTrust"]) >= per_task:
                 break
 
@@ -398,7 +426,7 @@ def _evaluate_checkpoint_on_suites(
     suites: Dict[str, Dict[str, List[Tuple[str, str]]]],
     tag: str,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Run teacher-forced GPU forward passes to measure exact NLL and token accuracy."""
+    """Run teacher-forced GPU forward passes on clean answer tokens only."""
     import torch
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
@@ -419,6 +447,25 @@ def _evaluate_checkpoint_on_suites(
             trust_remote_code=True,
         )
     model.eval()
+    is_base_ckpt = ":base" in tag
+
+    def _build_prompt_prefix(user_prompt: str) -> str:
+        if is_base_ckpt:
+            try:
+                rendered = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": user_prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                if isinstance(rendered, str) and len(rendered) > len(user_prompt):
+                    return rendered
+            except Exception:
+                pass
+        return format_gemma4_chat(
+            [{"role": "user", "content": user_prompt}],
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
 
     out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": {}, "retention": {}}
     with torch.no_grad():
@@ -430,7 +477,9 @@ def _evaluate_checkpoint_on_suites(
                 top1_hits: List[float] = []
                 top5_hits: List[float] = []
                 total_tokens = 0
-                for prompt_prefix, full_text in items:
+                for user_prompt, clean_answer in items:
+                    prompt_prefix = _build_prompt_prefix(user_prompt)
+                    full_text = prompt_prefix + clean_answer
                     full_enc = tokenizer(
                         full_text,
                         return_tensors="pt",
@@ -485,12 +534,12 @@ def _evaluate_checkpoint_on_suites(
                     "n_tokens": total_tokens,
                 }
                 logger.info(
-                    "[%s] %s/%s -> Score=%.2f%% | Top5=%.2f%% | NLL=%.4f (N=%d, Tokens=%d)",
+                    "[%s] %s/%s -> Score=%.2f%% | Top1=%.2f%% | NLL=%.4f (N=%d, Tokens=%d)",
                     tag,
                     cat,
                     suite_name,
                     eval_score_pct,
-                    mean_top5,
+                    mean_top1,
                     mean_nll,
                     len(nlls),
                     total_tokens,
@@ -510,13 +559,13 @@ def run_inprocess_gpu_eval(
     target_device: str = "cuda:0",
     limit: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run or load cached v2 in-process GPU evaluation for base and fine-tuned models."""
+    """Run or load cached v3 in-process GPU evaluation for base and fine-tuned models."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
     if cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("eval_version") == "v2_live_gpu" and "base" in cached and "tuned" in cached:
-                logger.info("Loaded verified v2 GPU evaluation cache from %s", cache_path)
+            if cached.get("eval_version") == "v3_clean_gpu" and "base" in cached and "tuned" in cached:
+                logger.info("Loaded verified v3 GPU evaluation cache from %s", cache_path)
                 return cached
         except Exception as exc:
             logger.warning("Could not read cached live_raw_%s.json: %s", model_key, exc)
@@ -550,7 +599,7 @@ def run_inprocess_gpu_eval(
             tag=f"{model_key}:tuned",
         )
         payload = {
-            "eval_version": "v2_live_gpu",
+            "eval_version": "v3_clean_gpu",
             "model_key": model_key,
             "base_model_id": base_model_id,
             "tuned_model_path": tuned_model_path,
@@ -560,7 +609,7 @@ def run_inprocess_gpu_eval(
         }
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Saved v2 live GPU evaluation metrics to %s", cache_path)
+        logger.info("Saved v3 live GPU evaluation metrics to %s", cache_path)
         return payload
     except Exception as exc:
         logger.warning("In-process GPU evaluation failed for %s: %s", model_key, exc)
