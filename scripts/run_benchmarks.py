@@ -324,8 +324,17 @@ def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple
                 user_prompt = user_prompt.strip()
 
                 clean_ans = raw_ans
-                for tok in ("<end_of_turn>", "<turn|>", "<|turn|>"):
-                    clean_ans = clean_ans.replace(tok, "")
+                for eot in (
+                    "<end_of_turn>",
+                    "<turn|>",
+                    "<|turn|>",
+                    "<start_of_turn>",
+                    "<|turn>",
+                    "\nUser:",
+                    "\nالمستخدم:",
+                ):
+                    if eot in clean_ans:
+                        clean_ans = clean_ans.split(eot, 1)[0]
                 if "</|>" in clean_ans:
                     clean_ans = clean_ans.rsplit("</|>", 1)[-1]
                 if "<|think|>" in clean_ans:
@@ -449,7 +458,10 @@ def _evaluate_checkpoint_on_suites(
     model.eval()
     is_base_ckpt = ":base" in tag
 
-    def _build_prompt_prefix(user_prompt: str) -> str:
+    def _build_prompt_prefix(user_prompt: str, category: str) -> str:
+        if category == "retention":
+            # Evaluate both Base and Tuned on identical neutral prompt prefix for fair retention comparison
+            return f"Question:\n{user_prompt}\n\nAnswer:\n"
         if is_base_ckpt:
             try:
                 rendered = tokenizer.apply_chat_template(
@@ -478,7 +490,7 @@ def _evaluate_checkpoint_on_suites(
                 top5_hits: List[float] = []
                 total_tokens = 0
                 for user_prompt, clean_answer in items:
-                    prompt_prefix = _build_prompt_prefix(user_prompt)
+                    prompt_prefix = _build_prompt_prefix(user_prompt, cat)
                     full_text = prompt_prefix + clean_answer
                     full_enc = tokenizer(
                         full_text,
@@ -559,13 +571,13 @@ def run_inprocess_gpu_eval(
     target_device: str = "cuda:0",
     limit: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run or load cached v3 in-process GPU evaluation for base and fine-tuned models."""
+    """Run or load cached v4 in-process GPU evaluation for base and fine-tuned models."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
     if cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("eval_version") == "v3_clean_gpu" and "base" in cached and "tuned" in cached:
-                logger.info("Loaded verified v3 GPU evaluation cache from %s", cache_path)
+            if cached.get("eval_version") == "v4_singleturn_gpu" and "base" in cached and "tuned" in cached:
+                logger.info("Loaded verified v4 GPU evaluation cache from %s", cache_path)
                 return cached
         except Exception as exc:
             logger.warning("Could not read cached live_raw_%s.json: %s", model_key, exc)
@@ -599,7 +611,7 @@ def run_inprocess_gpu_eval(
             tag=f"{model_key}:tuned",
         )
         payload = {
-            "eval_version": "v3_clean_gpu",
+            "eval_version": "v4_singleturn_gpu",
             "model_key": model_key,
             "base_model_id": base_model_id,
             "tuned_model_path": tuned_model_path,
