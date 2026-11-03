@@ -256,8 +256,8 @@ def load_and_normalize_dpo_source(
 def mix_dpo_preference_datasets(
     saudi_dpo_samples: List[Dict[str, Any]],
     arcee_dpo_samples: List[Dict[str, Any]],
-    saudi_weight: float = 0.40,
-    arcee_weight: float = 0.60,
+    saudi_weight: float = 0.35,
+    arcee_weight: float = 0.65,
     seed: int = 3407,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Combine and shuffle Stage 2 DPO preference pairs according to target weights."""

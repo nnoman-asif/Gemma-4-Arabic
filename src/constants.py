@@ -206,7 +206,7 @@ DPO_DATASETS: Dict[str, DatasetSpec] = {
         split="train",
         stage="dpo_preference",
         enable_thinking=False,
-        weight=0.40,
+        weight=0.35,
     ),
     "arabic_orpo_dpo_mix_40k": DatasetSpec(
         key="arabic_orpo_dpo_mix_40k",
@@ -215,7 +215,7 @@ DPO_DATASETS: Dict[str, DatasetSpec] = {
         split="train",
         stage="dpo_preference",
         enable_thinking=False,
-        weight=0.60,
+        weight=0.65,
     ),
 }
 
@@ -271,5 +271,5 @@ DPO_TRUST_REGION_ALPHA: float = 0.6
 DPO_LEARNING_RATE: float = 5.0e-7
 
 DEFAULT_TIES_LAMBDA: float = 0.85
-DEFAULT_TIES_DENSITY: float = 0.85
+DEFAULT_TIES_DENSITY: float = 0.70
 MIN_RETENTION_RATIO: float = 0.998

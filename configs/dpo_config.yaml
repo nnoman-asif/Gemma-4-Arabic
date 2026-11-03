@@ -85,7 +85,7 @@ datasets:
       repo_id: "HeshamHaroon/arabic-dialect-dpo"
       config_name: "saudi"
       split: "train"
-      weight: 0.40
+      weight: 0.35
       enable_thinking: false
       requires_explicit_config: true
 
@@ -93,6 +93,6 @@ datasets:
       repo_id: "arcee-globe/arabic-orpo-dpo-mix-40k-filtered"
       config_name: "default"
       split: "train"
-      weight: 0.60
+      weight: 0.65
       enable_thinking: false
       unify_prompt_from_chosen: true

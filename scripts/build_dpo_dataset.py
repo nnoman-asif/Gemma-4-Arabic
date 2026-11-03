@@ -227,10 +227,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     pref_sources = ds_cfg.get("preference_sources", {})
 
     saudi_weight = float(
-        pref_sources.get("arabic_dialect_dpo_saudi", {}).get("weight", 0.40)
+        pref_sources.get("arabic_dialect_dpo_saudi", {}).get("weight", 0.35)
     )
     arcee_weight = float(
-        pref_sources.get("arabic_orpo_dpo_mix_40k", {}).get("weight", 0.60)
+        pref_sources.get("arabic_orpo_dpo_mix_40k", {}).get("weight", 0.65)
     )
     total_target = int(
         args.max_samples

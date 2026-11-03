@@ -8,7 +8,7 @@ Verifies:
 4. Dynamic `named_modules()` discovery, CPU forward hook for `embed_tokens_per_layer`,
    and CPU offload/restoration for `audio_tower` and `vision_tower`.
 5. Stage 2 Trust-Region DPO reference EMA math (`tr_alpha=0.6`).
-6. TIES-Merging (`lambda=0.85`, `density=0.85`) sign election, trimming, and state dict interpolation.
+6. TIES-Merging (`lambda=0.85`, `density=0.70`) sign election, trimming, and state dict interpolation.
 7. Zero-forgetting retention gate evaluation and YAML configuration integrity.
 """
 

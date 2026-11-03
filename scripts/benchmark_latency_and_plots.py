@@ -396,21 +396,11 @@ def generate_all_family_plots(
         for k in labels
     ]
     moe_base = [
-        float(
-            moe_ar_real.get(k, {}).get(
-                "baseline_score",
-                ar_benchmarks[k].get("baseline_score_26b", ar_benchmarks[k].get("baseline_score_26b", 60.0)),
-            )
-        )
+        float(moe_ar_real.get(k, {}).get("baseline_score", ar_benchmarks[k].get("baseline_score_26b", 60.0)))
         for k in labels
     ]
     moe_tuned = [
-        float(
-            moe_ar_real.get(k, {}).get(
-                "evaluated_score",
-                ar_benchmarks[k].get("evaluated_score_26b", 70.0),
-            )
-        )
+        float(moe_ar_real.get(k, {}).get("evaluated_score", ar_benchmarks[k].get("evaluated_score_26b", 70.0)))
         for k in labels
     ]
 
@@ -483,21 +473,11 @@ def generate_all_family_plots(
         for k in ret_labels
     ]
     r_moe_base = [
-        float(
-            moe_ret_real.get(k, {}).get(
-                "baseline_score",
-                ret_anchors[k].get("baseline_score_26b", ret_anchors[k].get("min_acceptable_score", 80.0)),
-            )
-        )
+        float(moe_ret_real.get(k, {}).get("baseline_score", ret_anchors[k].get("min_acceptable_score", 80.0)))
         for k in ret_labels
     ]
     r_moe_tuned = [
-        float(
-            moe_ret_real.get(k, {}).get(
-                "evaluated_score",
-                ret_anchors[k].get("baseline_score_26b", ret_anchors[k].get("min_acceptable_score", 80.0)),
-            )
-        )
+        float(moe_ret_real.get(k, {}).get("evaluated_score", ret_anchors[k].get("min_acceptable_score", 80.0)))
         for k in ret_labels
     ]
 
@@ -696,18 +676,30 @@ def generate_all_family_plots(
     # Plot 4: Dual-Model Stage 1 SFT Loss & Stage 2 TR-DPO Reward Margin Curves
     # -------------------------------------------------------------------------
     sft_e4b_real = _load_training_curve_series(
+        PROJECT_ROOT / "outputs" / "sft_e4b_stage1" / "training_metrics.json",
+        ("loss",),
+    ) or _load_training_curve_series(
         PROJECT_ROOT / "outputs" / "sft_e4b_a100" / "training_metrics.json",
         ("loss",),
     )
     sft_moe_real = _load_training_curve_series(
+        PROJECT_ROOT / "outputs" / "sft_26b_a4b_stage1" / "training_metrics.json",
+        ("loss",),
+    ) or _load_training_curve_series(
         PROJECT_ROOT / "outputs" / "sft_26b_a4b_a100" / "training_metrics.json",
         ("loss",),
     )
     dpo_e4b_real = _load_training_curve_series(
+        PROJECT_ROOT / "outputs" / "dpo_e4b_stage2" / "dpo_metrics.json",
+        ("rewards/margins", "loss"),
+    ) or _load_training_curve_series(
         PROJECT_ROOT / "outputs" / "dpo_e4b_a100" / "dpo_metrics.json",
         ("rewards/margins", "loss"),
     )
     dpo_moe_real = _load_training_curve_series(
+        PROJECT_ROOT / "outputs" / "dpo_26b_a4b_stage2" / "dpo_metrics.json",
+        ("rewards/margins", "loss"),
+    ) or _load_training_curve_series(
         PROJECT_ROOT / "outputs" / "dpo_26b_a4b_a100" / "dpo_metrics.json",
         ("rewards/margins", "loss"),
     )

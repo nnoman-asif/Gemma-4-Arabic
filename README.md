@@ -164,7 +164,7 @@ Gemma-4-Arabic/
 |   |-- dpo_formatter.py                 # Normalizers for Saudi & MSA DPO preference datasets
 |   |-- train_sft.py                     # Stage 1 SFT trainer with completion-only loss masking
 |   |-- train_dpo.py                     # Stage 2 Trust-Region DPO trainer with EMA reference anchor
-|   `-- merge_and_export.py              # TIES-Merging (lambda=0.85, density=0.85) & 16-bit safetensors export
+|   `-- merge_and_export.py              # TIES-Merging (lambda=0.85, density=0.70) & 16-bit safetensors export
 |-- scripts/
 |   |-- build_sft_dataset.py             # CLI builder for 120,000-row Stage 1 SFT dataset
 |   |-- build_dpo_dataset.py             # CLI builder for 20,000-pair Stage 2 DPO dataset

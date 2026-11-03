@@ -39,7 +39,7 @@ retention_gate:
   min_retention_ratio: 0.998
   max_allowed_drop_pct: 0.20
   default_ties_lambda: 0.85
-  ties_density: 0.85
+  ties_density: 0.70
   sweep_lambdas_on_regression:
     - 0.80
     - 0.85

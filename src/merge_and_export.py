@@ -2,7 +2,7 @@
 
 Implements:
 1. TIES-Merging (Trim, Elect Sign, Disjoint Merge) and alpha interpolation (`lambda=0.85`):
-   - Trims redundant small parameter deltas below top `density` (`0.85`) magnitude.
+   - Trims redundant small parameter deltas below top `density` (`0.70`) magnitude.
    - Resolves sign conflicts across Stage 1 SFT and Stage 2 DPO task vectors.
    - Scales the merged delta by `lambda=0.85` (`W_final = W_base + lambda * Delta_TIES`)
      to guarantee zero catastrophic forgetting on baseline English/Math/Code benchmarks.
@@ -304,7 +304,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--density",
         type=float,
         default=DEFAULT_TIES_DENSITY,
-        help="Fraction of top-magnitude adapter delta parameters to retain (default: 0.85).",
+        help="Fraction of top-magnitude adapter delta parameters to retain (default: 0.70).",
     )
     parser.add_argument(
         "--export-format",
@@ -327,7 +327,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--offload-to-cpu",
         action="store_true",
-        help="Enable 8.0 GB laptop CPU offload hooks during model loading.",
+        help="Enable low-VRAM CPU offload hooks during model loading.",
     )
     parser.add_argument(
         "--dry-run",

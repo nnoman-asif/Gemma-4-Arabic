@@ -68,7 +68,7 @@ else
       --sft-adapter-dir outputs/sft_e4b_a100 \
       --output-dir outputs/dpo_e4b_a100
 
-    echo "[GPU 0] Running TIES-Merging (lambda=0.85, density=0.85) -> merged_16bit..."
+    echo "[GPU 0] Running TIES-Merging (lambda=0.85, density=0.70) -> merged_16bit..."
     "${PYTHON_BIN}" src/merge_and_export.py \
       --base-model unsloth/gemma-4-E4B-it \
       --sft-adapter-dir outputs/sft_e4b_a100 \
@@ -94,7 +94,7 @@ else
       --sft-adapter-dir outputs/sft_26b_a4b_a100 \
       --output-dir outputs/dpo_26b_a4b_a100
 
-    echo "[GPU 1] Running TIES-Merging (lambda=0.85, density=0.85) -> merged_16bit..."
+    echo "[GPU 1] Running TIES-Merging (lambda=0.85, density=0.70) -> merged_16bit..."
     "${PYTHON_BIN}" src/merge_and_export.py \
       --base-model unsloth/gemma-4-26B-A4B-it \
       --sft-adapter-dir outputs/sft_26b_a4b_a100 \

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gemma-4-arabic"
 version = "0.1.0"
-description = "Gemma 4 E4B Arabic and Saudi dialect fine-tuning, Trust-Region DPO alignment, and zero-forgetting benchmark evaluation pipeline on an 8.0 GB GPU."
+description = "Gemma 4 Arabic and Saudi dialect fine-tuning (rsLoRA SFT, Trust-Region DPO, TIES-Merging) and evaluation pipeline for E4B and 26B-A4B."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

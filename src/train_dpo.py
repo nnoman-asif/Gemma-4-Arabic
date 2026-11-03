@@ -13,7 +13,6 @@ Configures:
 """
 
 import argparse
-import builtins
 import inspect
 import json
 import logging
@@ -146,6 +145,9 @@ class TrustRegionDPOCallback(TrainerCallback):
                     ref_state=self.ref_adapter_state,
                     tr_alpha=self.tr_alpha,
                 )
+                with torch.no_grad():
+                    for name, param in trainable.items():
+                        param.copy_(self.ref_adapter_state[name].to(device=param.device, dtype=param.dtype))
                 self.num_updates += 1
                 logger.info(
                     "[TR-DPO step %d] Updated reference EMA state (alpha=%.2f, total_updates=%d).",
@@ -497,9 +499,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     last_ckpt = None
     out_dir_path = pathlib.Path(output_dir)
     if not args.smoke_test and out_dir_path.exists():
-        if (out_dir_path / "adapter_config.json").exists():
-            logger.info("Stage 2 DPO final adapter already exists at %s; skipping training.", output_dir)
-            return 0
         from transformers.trainer_utils import get_last_checkpoint
 
         last_ckpt = get_last_checkpoint(output_dir)
