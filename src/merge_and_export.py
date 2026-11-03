@@ -373,6 +373,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
+    out_16bit_cfg = pathlib.Path(args.output_dir) / "merged_16bit" / "config.json"
+    if effective_format == "merged_16bit" and out_16bit_cfg.exists():
+        logger.info(
+            "Merged 16-bit checkpoint already exists at %s; skipping TIES merge.",
+            out_16bit_cfg.parent,
+        )
+        return 0
+
     use_4bit_for_merge = bool(args.offload_to_cpu) or (effective_format == "gguf")
     model, tokenizer, offload_state = load_gemma4_8gb_model_and_tokenizer(
         model_name=args.base_model,
