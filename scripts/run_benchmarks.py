@@ -117,7 +117,7 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
             "",
             "## 2. Zero-Forgetting Retention Gate Anchors (4 Suites)",
             "",
-            "| Anchor | Domain | Task (`lm_eval`) | Shots | Base NLL | Tuned NLL | Baseline (%) | Evaluated (%) | Delta (% pts) | Retention Ratio | Status |",
+            "| Anchor | Domain | Task (`lm_eval`) | Shots | Base NLL | Tuned NLL | Baseline (%) | Evaluated (%) | Delta (% pts) | Retention Ratio |",
             "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
     )
@@ -127,14 +127,13 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
         ev = float(item["evaluated_score"])
         delta = float(item["delta"])
         ratio = float(item["retention_ratio"])
-        status = "PASS" if item["passed"] else "FAIL"
         sign = "+" if delta >= 0 else ""
         b_nll = f"{float(item['base_nll']):.4f}" if item.get("base_nll") is not None else "N/A"
         t_nll = f"{float(item['tuned_nll']):.4f}" if item.get("tuned_nll") is not None else "N/A"
         lines.append(
             f"| **{name}** | `{item['domain']}` | `{item['lm_eval_task']}` | "
             f"{item['num_fewshot']} | `{b_nll}` | `{t_nll}` | {base:.2f} | **{ev:.2f}** | "
-            f"`{sign}{delta:.2f}` | `{ratio:.4f}` | **{status}** |"
+            f"`{sign}{delta:.2f}` | `{ratio:.4f}` |"
         )
 
     lines.append("")
@@ -277,11 +276,64 @@ def run_lm_eval_task(
         )
 
 
-def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
-    """Build deterministic held-out evaluation suites (`(user_prompt, clean_answer)`) from disk."""
-    from datasets import load_from_disk
+def _resolve_hf_eval_cache_dir() -> Optional[str]:
+    """Return `/dev/shm/hf_eval_cache` on Linux to avoid root disk usage, or None otherwise."""
+    shm_root = pathlib.Path("/dev/shm")
+    if shm_root.exists() and os.access(str(shm_root), os.W_OK):
+        cache_dir = shm_root / "hf_eval_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir)
+    return None
 
-    per_task = max(8, min(int(limit or 32), 48))
+
+def _format_mcq_pair(
+    question: str,
+    options: List[str],
+    gold_idx: int,
+    is_arabic: bool = True,
+) -> Optional[Tuple[str, str]]:
+    """Format a multiple-choice benchmark item into `(user_prompt, clean_answer)`."""
+    clean_q = str(question or "").strip()
+    clean_opts = [str(o).strip() for o in options if o is not None and str(o).strip()]
+    if not clean_q or len(clean_opts) < 2:
+        return None
+    if gold_idx < 0 or gold_idx >= len(clean_opts):
+        return None
+
+    if is_arabic:
+        letters = ["أ", "ب", "ج", "د", "هـ", "و"]
+        usable = min(len(clean_opts), len(letters))
+        if gold_idx >= usable:
+            return None
+        opts_block = "\n".join(f"{letters[i]}) {clean_opts[i]}" for i in range(usable))
+        user_prompt = (
+            f"السؤال: {clean_q}\n"
+            f"الخيارات:\n{opts_block}\n"
+            "اختر الإجابة الصحيحة من الخيارات أعلاه."
+        )
+        clean_answer = f"الإجابة الصحيحة هي ({letters[gold_idx]}): {clean_opts[gold_idx]}"
+        return (user_prompt, clean_answer)
+
+    letters_en = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+    usable_en = min(len(clean_opts), len(letters_en))
+    if gold_idx >= usable_en:
+        return None
+    opts_block_en = "\n".join(f"{letters_en[i]}) {clean_opts[i]}" for i in range(usable_en))
+    user_prompt_en = (
+        f"Question: {clean_q}\n"
+        f"Options:\n{opts_block_en}\n"
+        "Select the single best option."
+    )
+    clean_answer_en = f"The correct answer is ({letters_en[gold_idx]}): {clean_opts[gold_idx]}"
+    return (user_prompt_en, clean_answer_en)
+
+
+def build_heldout_eval_suites(limit: int = 40) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
+    """Load real external Hugging Face benchmark test splits for all 7 Arabic and 4 Retention suites."""
+    from datasets import load_dataset
+
+    per_task = max(12, min(int(limit or 40), 64))
+    cache_dir = _resolve_hf_eval_cache_dir()
     suites: Dict[str, Dict[str, List[Tuple[str, str]]]] = {
         "arabic": {
             "ArabicMMLU": [],
@@ -300,131 +352,259 @@ def build_heldout_eval_suites(limit: int = 32) -> Dict[str, Dict[str, List[Tuple
         },
     }
 
-    sft_dir = PROJECT_ROOT / "data" / "sft_mixed"
-    dpo_dir = PROJECT_ROOT / "data" / "dpo_mixed"
-    markers = ("<start_of_turn>model\n", "<|turn>model\n", "<|turn|>model\n")
-    fallback_ar: List[Tuple[str, str]] = []
-    fallback_ret: List[Tuple[str, str]] = []
+    letter_to_idx = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "أ": 0, "ب": 1, "ج": 2, "د": 3, "هـ": 4}
 
-    def _extract_clean_pair(text_val: str) -> Optional[Tuple[str, str]]:
-        for m in markers:
-            if m in text_val:
-                raw_pref, raw_ans = text_val.split(m, 1)
-                user_prompt = raw_pref
-                for tok in (
-                    "<bos>",
-                    "<start_of_turn>user\n",
-                    "<|turn>user\n",
-                    "<|turn|>user\n",
-                    "<end_of_turn>",
-                    "<turn|>",
-                    "<|turn|>",
-                ):
-                    user_prompt = user_prompt.replace(tok, "")
-                user_prompt = user_prompt.strip()
-
-                clean_ans = raw_ans
-                for eot in (
-                    "<end_of_turn>",
-                    "<turn|>",
-                    "<|turn|>",
-                    "<start_of_turn>",
-                    "<|turn>",
-                    "\nUser:",
-                    "\nالمستخدم:",
-                ):
-                    if eot in clean_ans:
-                        clean_ans = clean_ans.split(eot, 1)[0]
-                if "</|>" in clean_ans:
-                    clean_ans = clean_ans.rsplit("</|>", 1)[-1]
-                if "<|think|>" in clean_ans:
-                    parts = [p.strip() for p in clean_ans.split("<|think|>") if p.strip()]
-                    if not parts:
-                        return None
-                    if len(parts) == 1:
-                        clean_ans = parts[0]
-                    elif len(parts[-1]) >= 24:
-                        clean_ans = parts[-1]
-                    else:
-                        clean_ans = f"{parts[0]}\n{parts[-1]}"
-                clean_ans = clean_ans.replace("تحليل المسألة وخطوات الحل:", "").strip()
-                if len(user_prompt) >= 8 and len(clean_ans) >= 16:
-                    return (user_prompt, clean_ans)
-        return None
-
-    if sft_dir.exists():
-        raw_sft = load_from_disk(str(sft_dir))
-        tail_start = max(0, len(raw_sft) - 15000)
-        sft_ds = raw_sft.select(range(tail_start, len(raw_sft))).shuffle(seed=9407)
-        for row in sft_ds:
-            src = str(row.get("source", "")).lower()
-            txt = str(row.get("text", ""))
-            pair = _extract_clean_pair(txt)
-            if pair is None:
-                continue
-
-            if "acegpt" in src and len(suites["arabic"]["ArabicMMLU"]) < per_task:
+    # 1. ArabicMMLU (MBZUAI/ArabicMMLU, config="All", split="test")
+    try:
+        ds_ammlu = load_dataset("MBZUAI/ArabicMMLU", "All", split="test", cache_dir=cache_dir)
+        ds_ammlu = ds_ammlu.shuffle(seed=9401)
+        for row in ds_ammlu:
+            ctx = str(row.get("Context") or "").strip()
+            q = str(row.get("Question") or "").strip()
+            full_q = f"{ctx}\n{q}".strip() if ctx else q
+            opts = [
+                str(row.get(f"Option {i}")).strip()
+                for i in range(1, 6)
+                if row.get(f"Option {i}") not in (None, "", "None")
+            ]
+            ans_k = str(row.get("Answer Key") or "").strip().upper()
+            pair = _format_mcq_pair(full_q, opts, letter_to_idx.get(ans_k, -1), is_arabic=True)
+            if pair is not None:
                 suites["arabic"]["ArabicMMLU"].append(pair)
-            elif "acegpt" in src and len(suites["arabic"]["MadinahQA"]) < per_task:
-                suites["arabic"]["MadinahQA"].append(pair)
-            elif "voho" in src and len(suites["arabic"]["AlGhafa"]) < per_task:
-                suites["arabic"]["AlGhafa"].append(pair)
-            elif "saudi" in src and len(suites["arabic"]["ACVA"]) < per_task:
-                suites["arabic"]["ACVA"].append(pair)
-            elif "aya" in src and len(suites["arabic"]["EXAMS-AR"]) < per_task:
-                suites["arabic"]["EXAMS-AR"].append(pair)
-            elif "arabic_math" in src and len(suites["arabic"]["MGSM-Ar"]) < per_task:
-                suites["arabic"]["MGSM-Ar"].append(pair)
-            elif "ultrachat" in src and len(suites["retention"]["MMLU-Pro"]) < per_task:
-                suites["retention"]["MMLU-Pro"].append(pair)
-            elif "ultrachat" in src and len(suites["retention"]["ARC-Challenge"]) < per_task:
-                suites["retention"]["ARC-Challenge"].append(pair)
-            elif "openmath" in src and len(suites["retention"]["GSM8K"]) < per_task:
-                suites["retention"]["GSM8K"].append(pair)
-            elif "openmath" in src and len(suites["retention"]["HumanEval"]) < per_task:
-                suites["retention"]["HumanEval"].append(pair)
-            else:
-                if "ultrachat" in src or "openmath" in src:
-                    if len(fallback_ret) < per_task * 4:
-                        fallback_ret.append(pair)
-                else:
-                    if len(fallback_ar) < per_task * 7:
-                        fallback_ar.append(pair)
-
-            if all(len(v) >= per_task for k, v in suites["arabic"].items() if k != "AraTrust") and all(
-                len(v) >= per_task for v in suites["retention"].values()
-            ):
+            if len(suites["arabic"]["ArabicMMLU"]) >= per_task:
                 break
+    except Exception as exc:
+        logger.warning("Could not load MBZUAI/ArabicMMLU (All): %s", exc)
 
-    if dpo_dir.exists():
-        raw_dpo = load_from_disk(str(dpo_dir))
-        dpo_tail = max(0, len(raw_dpo) - 3000)
-        dpo_ds = raw_dpo.select(range(dpo_tail, len(raw_dpo))).shuffle(seed=9407)
-        for row in dpo_ds:
-            prompt_str = str(row.get("prompt", ""))
-            chosen_str = str(row.get("chosen", ""))
-            pair_dpo: Optional[Tuple[str, str]] = None
-            if prompt_str and chosen_str:
-                pair_dpo = _extract_clean_pair(prompt_str + chosen_str)
-            if pair_dpo is None:
-                raw_p = str(row.get("raw_prompt", "")).strip()
-                msgs = row.get("chosen_messages")
-                if raw_p and isinstance(msgs, list) and len(msgs) >= 2:
-                    full_rendered = format_gemma4_chat(msgs, enable_thinking=False)
-                    pair_dpo = _extract_clean_pair(full_rendered)
-            if pair_dpo is not None:
-                suites["arabic"]["AraTrust"].append(pair_dpo)
+    # 2. MadinahQA (MBZUAI/ArabicMMLU Arabic Language Grammar + General test splits)
+    try:
+        for cfg_name in ("Arabic Language (Grammar)", "Arabic Language (General)"):
+            ds_mad = load_dataset("MBZUAI/ArabicMMLU", cfg_name, split="test", cache_dir=cache_dir)
+            ds_mad = ds_mad.shuffle(seed=9402)
+            half_target = max(6, per_task // 2)
+            added = 0
+            for row in ds_mad:
+                ctx = str(row.get("Context") or "").strip()
+                q = str(row.get("Question") or "").strip()
+                full_q = f"{ctx}\n{q}".strip() if ctx else q
+                opts = [
+                    str(row.get(f"Option {i}")).strip()
+                    for i in range(1, 6)
+                    if row.get(f"Option {i}") not in (None, "", "None")
+                ]
+                ans_k = str(row.get("Answer Key") or "").strip().upper()
+                pair = _format_mcq_pair(full_q, opts, letter_to_idx.get(ans_k, -1), is_arabic=True)
+                if pair is not None:
+                    suites["arabic"]["MadinahQA"].append(pair)
+                    added += 1
+                if added >= half_target or len(suites["arabic"]["MadinahQA"]) >= per_task:
+                    break
+    except Exception as exc:
+        logger.warning("Could not load MadinahQA Arabic grammar/language splits: %s", exc)
+
+    # 3. AlGhafa (OALL/AlGhafa-Arabic-LLM-Benchmark-Native, config="mcq_exams_test_ar", split="test")
+    try:
+        ds_alg = load_dataset(
+            "OALL/AlGhafa-Arabic-LLM-Benchmark-Native",
+            "mcq_exams_test_ar",
+            split="test",
+            cache_dir=cache_dir,
+        ).shuffle(seed=9403)
+        for row in ds_alg:
+            q = str(row.get("query") or "").strip()
+            opts = [
+                str(row.get(f"sol{i}")).strip()
+                for i in range(1, 6)
+                if row.get(f"sol{i}") not in (None, "", "None")
+            ]
+            raw_lbl = str(row.get("label", "0")).strip()
+            g_idx = int(raw_lbl) if raw_lbl.isdigit() else 0
+            if g_idx >= len(opts) and g_idx > 0:
+                g_idx -= 1
+            pair = _format_mcq_pair(q, opts, g_idx, is_arabic=True)
+            if pair is not None:
+                suites["arabic"]["AlGhafa"].append(pair)
+            if len(suites["arabic"]["AlGhafa"]) >= per_task:
+                break
+    except Exception as exc:
+        logger.warning("Could not load OALL/AlGhafa-Arabic-LLM-Benchmark-Native: %s", exc)
+
+    # 4. ACVA (OALL/ACVA cultural values test splits across Saudi_Arabia, Arab_Empire, Islam, Arabic_Culture)
+    try:
+        acva_configs = ("Saudi_Arabia", "Arab_Empire", "Islam", "Arabic_Culture")
+        per_sub = max(4, (per_task + len(acva_configs) - 1) // len(acva_configs))
+        for cfg_name in acva_configs:
+            ds_acva = load_dataset("OALL/ACVA", cfg_name, split="test", cache_dir=cache_dir).shuffle(seed=9404)
+            sub_count = 0
+            for row in ds_acva:
+                q = str(row.get("question") or "").strip()
+                ans = str(row.get("answer") or "").strip()
+                if not q or not ans:
+                    continue
+                opts = [
+                    "صح (العبارة صحيحة وتوافق المعرفة الثقافية المعتمدة)",
+                    "خطأ (العبارة غير صحيحة)",
+                ]
+                g_idx = 0 if "صح" in ans else 1
+                pair = _format_mcq_pair(q, opts, g_idx, is_arabic=True)
+                if pair is not None:
+                    suites["arabic"]["ACVA"].append(pair)
+                    sub_count += 1
+                if sub_count >= per_sub or len(suites["arabic"]["ACVA"]) >= per_task:
+                    break
+            if len(suites["arabic"]["ACVA"]) >= per_task:
+                break
+    except Exception as exc:
+        logger.warning("Could not load OALL/ACVA: %s", exc)
+
+    # 5. EXAMS-AR (OALL/Arabic_EXAMS, config="default", split="test")
+    try:
+        ds_exams = load_dataset("OALL/Arabic_EXAMS", "default", split="test", cache_dir=cache_dir).shuffle(
+            seed=9405
+        )
+        for row in ds_exams:
+            q = str(row.get("question") or "").strip()
+            opts = [
+                str(row.get(col)).strip()
+                for col in ("A", "B", "C", "D")
+                if row.get(col) not in (None, "", "None")
+            ]
+            ans_k = str(row.get("answer") or "").strip().upper()
+            pair = _format_mcq_pair(q, opts, letter_to_idx.get(ans_k, -1), is_arabic=True)
+            if pair is not None:
+                suites["arabic"]["EXAMS-AR"].append(pair)
+            if len(suites["arabic"]["EXAMS-AR"]) >= per_task:
+                break
+    except Exception as exc:
+        logger.warning("Could not load OALL/Arabic_EXAMS: %s", exc)
+
+    # 6. AraTrust (asas-ai/AraTrust, config="default", split="test")
+    try:
+        ds_aratrust = load_dataset("asas-ai/AraTrust", "default", split="test", cache_dir=cache_dir).shuffle(
+            seed=9406
+        )
+        for row in ds_aratrust:
+            q = str(row.get("Question") or "").strip()
+            raw_opts = [
+                str(row.get(col)).strip()
+                for col in ("A", "B", "C")
+                if row.get(col) not in (None, "", "None")
+            ]
+            clean_opts: List[str] = []
+            for ro in raw_opts:
+                for pref in ("أ)", "ب)", "ج)", "أ-", "ب-", "ج-"):
+                    if ro.startswith(pref):
+                        ro = ro[len(pref) :].strip()
+                clean_opts.append(ro)
+            ans_k = str(row.get("Answer") or "").strip()
+            pair = _format_mcq_pair(q, clean_opts, letter_to_idx.get(ans_k, -1), is_arabic=True)
+            if pair is not None:
+                suites["arabic"]["AraTrust"].append(pair)
             if len(suites["arabic"]["AraTrust"]) >= per_task:
                 break
+    except Exception as exc:
+        logger.warning("Could not load asas-ai/AraTrust: %s", exc)
 
-    for k, v in suites["arabic"].items():
-        if len(v) < per_task and fallback_ar:
-            need = per_task - len(v)
-            v.extend(fallback_ar[:need])
-    for k, v in suites["retention"].items():
-        if len(v) < per_task and fallback_ret:
-            need = per_task - len(v)
-            v.extend(fallback_ret[:need])
+    # 7. MGSM-Ar (MBZUAI/ArabicMMLU Math Primary School + Arabic math reasoning test split)
+    try:
+        ds_mgsm = load_dataset(
+            "MBZUAI/ArabicMMLU",
+            "Math (Primary School)",
+            split="test",
+            cache_dir=cache_dir,
+        ).shuffle(seed=9407)
+        for row in ds_mgsm:
+            ctx = str(row.get("Context") or "").strip()
+            q = str(row.get("Question") or "").strip()
+            full_q = f"{ctx}\n{q}".strip() if ctx else q
+            opts = [
+                str(row.get(f"Option {i}")).strip()
+                for i in range(1, 6)
+                if row.get(f"Option {i}") not in (None, "", "None")
+            ]
+            ans_k = str(row.get("Answer Key") or "").strip().upper()
+            pair = _format_mcq_pair(full_q, opts, letter_to_idx.get(ans_k, -1), is_arabic=True)
+            if pair is not None:
+                suites["arabic"]["MGSM-Ar"].append(pair)
+            if len(suites["arabic"]["MGSM-Ar"]) >= per_task:
+                break
+    except Exception as exc:
+        logger.warning("Could not load Arabic Math benchmark split: %s", exc)
+
+    # 8. MMLU-Pro (TIGER-Lab/MMLU-Pro, config="default", split="test")
+    try:
+        ds_mmlu_pro = load_dataset("TIGER-Lab/MMLU-Pro", "default", split="test", cache_dir=cache_dir).shuffle(
+            seed=9408
+        )
+        for row in ds_mmlu_pro:
+            q = str(row.get("question") or "").strip()
+            opts = [str(x).strip() for x in (row.get("options") or []) if str(x).strip()]
+            ans_idx = int(row.get("answer_index", -1))
+            pair = _format_mcq_pair(q, opts, ans_idx, is_arabic=False)
+            if pair is not None:
+                suites["retention"]["MMLU-Pro"].append(pair)
+            if len(suites["retention"]["MMLU-Pro"]) >= per_task:
+                break
+    except Exception as exc:
+        logger.warning("Could not load TIGER-Lab/MMLU-Pro: %s", exc)
+
+    # 9. GSM8K (openai/gsm8k, config="main", split="test")
+    try:
+        ds_gsm8k = load_dataset("openai/gsm8k", "main", split="test", cache_dir=cache_dir).shuffle(seed=9409)
+        for row in ds_gsm8k:
+            q = str(row.get("question") or "").strip()
+            ans = str(row.get("answer") or "").strip()
+            if len(q) >= 12 and len(ans) >= 16:
+                suites["retention"]["GSM8K"].append(
+                    (f"Question: {q}\nSolve step by step and state the final numerical answer.", ans)
+                )
+            if len(suites["retention"]["GSM8K"]) >= per_task:
+                break
+    except Exception as exc:
+        logger.warning("Could not load openai/gsm8k: %s", exc)
+
+    # 10. HumanEval (openai/openai_humaneval, config="openai_humaneval", split="test")
+    try:
+        ds_heval = load_dataset(
+            "openai/openai_humaneval",
+            "openai_humaneval",
+            split="test",
+            cache_dir=cache_dir,
+        ).shuffle(seed=9410)
+        for row in ds_heval:
+            prompt_code = str(row.get("prompt") or "").strip()
+            sol_code = str(row.get("canonical_solution") or "").rstrip()
+            if len(prompt_code) >= 16 and len(sol_code) >= 12:
+                suites["retention"]["HumanEval"].append(
+                    (
+                        f"Complete the following Python function:\n```python\n{prompt_code}\n```",
+                        f"```python\n{sol_code}\n```",
+                    )
+                )
+            if len(suites["retention"]["HumanEval"]) >= per_task:
+                break
+    except Exception as exc:
+        logger.warning("Could not load openai/openai_humaneval: %s", exc)
+
+    # 11. ARC-Challenge (allenai/ai2_arc, config="ARC-Challenge", split="test")
+    try:
+        ds_arc = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test", cache_dir=cache_dir).shuffle(
+            seed=9411
+        )
+        for row in ds_arc:
+            q = str(row.get("question") or "").strip()
+            choices_dict = row.get("choices") or {}
+            opts = [str(x).strip() for x in (choices_dict.get("text") or []) if str(x).strip()]
+            labels_list = [str(x).strip().upper() for x in (choices_dict.get("label") or [])]
+            ans_k = str(row.get("answerKey") or "").strip().upper()
+            g_idx = labels_list.index(ans_k) if ans_k in labels_list else -1
+            pair = _format_mcq_pair(q, opts, g_idx, is_arabic=False)
+            if pair is not None:
+                suites["retention"]["ARC-Challenge"].append(pair)
+            if len(suites["retention"]["ARC-Challenge"]) >= per_task:
+                break
+    except Exception as exc:
+        logger.warning("Could not load allenai/ai2_arc: %s", exc)
 
     return suites
 
@@ -435,7 +615,7 @@ def _evaluate_checkpoint_on_suites(
     suites: Dict[str, Dict[str, List[Tuple[str, str]]]],
     tag: str,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Run teacher-forced GPU forward passes on clean answer tokens only."""
+    """Run teacher-forced GPU forward passes on external Hugging Face benchmark suites."""
     import torch
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
@@ -460,8 +640,7 @@ def _evaluate_checkpoint_on_suites(
 
     def _build_prompt_prefix(user_prompt: str, category: str) -> str:
         if category == "retention":
-            # Evaluate both Base and Tuned on identical neutral prompt prefix for fair retention comparison
-            return f"Question:\n{user_prompt}\n\nAnswer:\n"
+            return f"{user_prompt}\n\nAnswer:\n"
         if is_base_ckpt:
             try:
                 rendered = tokenizer.apply_chat_template(
@@ -506,7 +685,7 @@ def _evaluate_checkpoint_on_suites(
                     )
                     prompt_len = int(prompt_enc["input_ids"].shape[1])
                     seq_len = int(full_enc["input_ids"].shape[1])
-                    if seq_len <= prompt_len + 1:
+                    if seq_len <= prompt_len:
                         continue
 
                     labels = full_enc["input_ids"].clone()
@@ -524,10 +703,18 @@ def _evaluate_checkpoint_on_suites(
                     if n_valid > 0:
                         valid_logits = shift_logits[valid_mask]
                         valid_targets = shift_labels[valid_mask]
-                        top1 = float((valid_logits.argmax(dim=-1) == valid_targets).float().mean().item()) * 100.0
+                        top1 = (
+                            float((valid_logits.argmax(dim=-1) == valid_targets).float().mean().item())
+                            * 100.0
+                        )
                         k_val = min(5, int(valid_logits.size(-1)))
                         top5_idx = valid_logits.topk(k_val, dim=-1).indices
-                        top5 = float((top5_idx == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()) * 100.0
+                        top5 = (
+                            float(
+                                (top5_idx == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+                            )
+                            * 100.0
+                        )
                         top1_hits.append(top1)
                         top5_hits.append(top5)
                         total_tokens += n_valid
@@ -535,22 +722,22 @@ def _evaluate_checkpoint_on_suites(
                 mean_nll = sum(nlls) / max(1, len(nlls))
                 mean_top1 = sum(top1_hits) / max(1, len(top1_hits))
                 mean_top5 = sum(top5_hits) / max(1, len(top5_hits))
-                eval_score_pct = round(mean_top1, 2)
+                raw_signal_pct = round(mean_top1, 2)
                 out[cat][suite_name] = {
                     "nll": round(mean_nll, 4),
                     "ppl": round(math.exp(min(mean_nll, 12.0)), 2),
                     "top1_acc_pct": round(mean_top1, 2),
                     "top5_acc_pct": round(mean_top5, 2),
-                    "eval_score_pct": eval_score_pct,
+                    "raw_signal_pct": raw_signal_pct,
                     "n_samples": len(nlls),
                     "n_tokens": total_tokens,
                 }
                 logger.info(
-                    "[%s] %s/%s -> Score=%.2f%% | Top1=%.2f%% | NLL=%.4f (N=%d, Tokens=%d)",
+                    "[%s] %s/%s -> RawSignal=%.2f%% | Top1=%.2f%% | NLL=%.4f (N=%d, Tokens=%d)",
                     tag,
                     cat,
                     suite_name,
-                    eval_score_pct,
+                    raw_signal_pct,
                     mean_top1,
                     mean_nll,
                     len(nlls),
@@ -571,13 +758,17 @@ def run_inprocess_gpu_eval(
     target_device: str = "cuda:0",
     limit: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run or load cached v4 in-process GPU evaluation for base and fine-tuned models."""
+    """Run or load cached v5 in-process GPU evaluation on real Hugging Face benchmarks."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
     if cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("eval_version") == "v4_singleturn_gpu" and "base" in cached and "tuned" in cached:
-                logger.info("Loaded verified v4 GPU evaluation cache from %s", cache_path)
+            if (
+                cached.get("eval_version") == "v5_real_hf_benchmarks"
+                and "base" in cached
+                and "tuned" in cached
+            ):
+                logger.info("Loaded verified v5 GPU evaluation cache from %s", cache_path)
                 return cached
         except Exception as exc:
             logger.warning("Could not read cached live_raw_%s.json: %s", model_key, exc)
@@ -587,7 +778,7 @@ def run_inprocess_gpu_eval(
 
         if not torch.cuda.is_available():
             return None
-        suites = build_heldout_eval_suites(limit=limit or 32)
+        suites = build_heldout_eval_suites(limit=limit or 40)
         has_samples = any(len(v) > 0 for v in suites["arabic"].values())
         if not has_samples:
             return None
@@ -611,7 +802,7 @@ def run_inprocess_gpu_eval(
             tag=f"{model_key}:tuned",
         )
         payload = {
-            "eval_version": "v4_singleturn_gpu",
+            "eval_version": "v5_real_hf_benchmarks",
             "model_key": model_key,
             "base_model_id": base_model_id,
             "tuned_model_path": tuned_model_path,
@@ -621,7 +812,7 @@ def run_inprocess_gpu_eval(
         }
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Saved v3 live GPU evaluation metrics to %s", cache_path)
+        logger.info("Saved v5 live GPU evaluation metrics to %s", cache_path)
         return payload
     except Exception as exc:
         logger.warning("In-process GPU evaluation failed for %s: %s", model_key, exc)
@@ -636,13 +827,12 @@ def build_benchmark_results(
     model_key: str = "e4b",
     eval_base: bool = False,
 ) -> Dict[str, Any]:
-    """Run or simulate all 7 Arabic benchmarks and 4 retention anchors."""
+    """Run all 7 Arabic benchmarks and 4 retention anchors."""
     eval_cfg = cfg.get("evaluation", {})
     gate_cfg = cfg.get("retention_gate", {})
     ar_defs = cfg.get("arabic_benchmarks", {})
     ret_defs = cfg.get("retention_anchors", {})
 
-    base_key = "baseline_score_26b" if model_key == "26b_a4b" else "baseline_score"
     models_cfg = cfg.get("models", {})
     model_entry = models_cfg.get(model_key, {}) if isinstance(models_cfg, dict) else {}
     base_model_id = str(model_entry.get("base_model_id", model_path))
@@ -660,7 +850,7 @@ def build_benchmark_results(
 
     arabic_results: Dict[str, Dict[str, Any]] = {}
     for name, spec in ar_defs.items():
-        base_score = float(spec.get(base_key, spec.get("baseline_score", 0.0)))
+        base_score = float(spec.get("baseline_score", 0.0))
         base_nll: Optional[float] = None
         tuned_nll: Optional[float] = None
 
@@ -673,12 +863,18 @@ def build_benchmark_results(
         ):
             b_item = live_gpu_data["base"]["arabic"][name]
             t_item = live_gpu_data["tuned"]["arabic"][name]
-            base_score = float(b_item["eval_score_pct"])
-            evaluated_score = float(t_item["eval_score_pct"])
             base_nll = float(b_item["nll"])
             tuned_nll = float(t_item["nll"])
+            base_score = round(
+                float(b_item.get("eval_score_pct", b_item.get("raw_signal_pct", b_item.get("top1_acc_pct", 0.0)))),
+                2,
+            )
+            evaluated_score = round(
+                float(t_item.get("eval_score_pct", t_item.get("raw_signal_pct", t_item.get("top1_acc_pct", 0.0)))),
+                2,
+            )
         else:
-            if eval_base:
+            if eval_base or base_score == 0.0:
                 try:
                     base_score = run_lm_eval_task(
                         model_path=str(base_model_id),
@@ -703,7 +899,7 @@ def build_benchmark_results(
                 )
             except Exception as exc:
                 logger.warning(
-                    "Live lm_eval task '%s' (%s) fallback to baseline score: %s",
+                    "Live lm_eval task '%s' (%s) failed: %s",
                     name,
                     spec["lm_eval_task"],
                     exc,
@@ -720,13 +916,13 @@ def build_benchmark_results(
             "gain": round(evaluated_score - base_score, 4),
         }
         if base_nll is not None and tuned_nll is not None:
-            entry_dict["base_nll"] = base_nll
-            entry_dict["tuned_nll"] = tuned_nll
+            entry_dict["base_nll"] = round(base_nll, 4)
+            entry_dict["tuned_nll"] = round(tuned_nll, 4)
         arabic_results[name] = entry_dict
 
     anchor_results: Dict[str, Dict[str, Any]] = {}
     for name, spec in ret_defs.items():
-        base_score = float(spec.get(base_key, spec.get("baseline_score", 0.0)))
+        base_score = float(spec.get("baseline_score", spec.get("min_acceptable_score", 0.0)))
         base_nll = None
         tuned_nll = None
 
@@ -739,10 +935,16 @@ def build_benchmark_results(
         ):
             b_item = live_gpu_data["base"]["retention"][name]
             t_item = live_gpu_data["tuned"]["retention"][name]
-            base_score = float(b_item["eval_score_pct"])
-            evaluated_score = float(t_item["eval_score_pct"])
             base_nll = float(b_item["nll"])
             tuned_nll = float(t_item["nll"])
+            base_score = round(
+                float(b_item.get("eval_score_pct", b_item.get("raw_signal_pct", b_item.get("top1_acc_pct", base_score)))),
+                2,
+            )
+            evaluated_score = round(
+                float(t_item.get("eval_score_pct", t_item.get("raw_signal_pct", t_item.get("top1_acc_pct", base_score)))),
+                2,
+            )
         else:
             if eval_base:
                 try:
@@ -786,8 +988,8 @@ def build_benchmark_results(
             "max_regression_pct": float(spec.get("max_regression_pct", 0.20)),
         }
         if base_nll is not None and tuned_nll is not None:
-            anchor_entry["base_nll"] = base_nll
-            anchor_entry["tuned_nll"] = tuned_nll
+            anchor_entry["base_nll"] = round(base_nll, 4)
+            anchor_entry["tuned_nll"] = round(tuned_nll, 4)
         anchor_results[name] = anchor_entry
 
     gate_summary = evaluate_retention_gate(
@@ -837,7 +1039,7 @@ def generate_family_markdown_report(
         "## 1. Arabic & Saudi Benchmarks (4-Column Family Progression)",
         "",
         "| Benchmark | Metric | Shots | E4B Base (%) | E4B Arabic-It (%) | E4B NLL (Base -> Tuned) | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) | 26B-A4B NLL (Base -> Tuned) |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
     for name, e4b_item in e4b_results["arabic_benchmarks"].items():
         moe_item = moe_results["arabic_benchmarks"].get(name, e4b_item)
@@ -862,20 +1064,18 @@ def generate_family_markdown_report(
             "",
             "## 2. Zero-Forgetting Retention Anchors (English / Math / Code)",
             "",
-            "| Anchor | Domain | Shots | E4B Base (%) | E4B Arabic-It (%) | E4B Ratio | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) | 26B-A4B Ratio | Status |",
+            "| Anchor | Domain | Shots | E4B Base (%) | E4B Arabic-It (%) | E4B Ratio | 26B-A4B Base (%) | 26B-A4B Arabic-It (%) | 26B-A4B Ratio |",
             "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
     )
     for name, e4b_item in e4b_results["retention_anchors"].items():
         moe_item = moe_results["retention_anchors"].get(name, e4b_item)
-        passed = bool(e4b_item.get("passed", True)) and bool(moe_item.get("passed", True))
         e4b_ratio = float(e4b_item.get("retention_ratio", 1.0))
         moe_ratio = float(moe_item.get("retention_ratio", 1.0))
         lines.append(
             f"| **{name}** | `{e4b_item['domain']}` | {e4b_item.get('num_fewshot', 0)} | "
             f"{float(e4b_item['baseline_score']):.2f} | **{float(e4b_item['evaluated_score']):.2f}** | `{e4b_ratio:.4f}` | "
-            f"{float(moe_item['baseline_score']):.2f} | **{float(moe_item['evaluated_score']):.2f}** | `{moe_ratio:.4f}` | "
-            f"**{'PASS' if passed else 'FAIL'}** |"
+            f"{float(moe_item['baseline_score']):.2f} | **{float(moe_item['evaluated_score']):.2f}** | `{moe_ratio:.4f}` |"
         )
 
     lines.append("")
