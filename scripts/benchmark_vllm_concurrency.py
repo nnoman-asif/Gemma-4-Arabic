@@ -190,6 +190,10 @@ def profile_pytorch_batched_live(
     from src.chat_template import format_gemma4_chat
 
     target_device = device if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available() and ":" in target_device:
+        dev_idx = int(target_device.split(":")[1])
+        if dev_idx >= torch.cuda.device_count():
+            target_device = "cuda:0"
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(target_device)
@@ -229,8 +233,8 @@ def profile_pytorch_batched_live(
         enable_thinking=False,
         add_generation_prompt=True,
     )
-    if formatted_prompt.endswith("<|turn>model\n<|thought>\n</|>"):
-        formatted_prompt = formatted_prompt[: -len("<|thought>\n</|>")]
+    if formatted_prompt.endswith("<|turn>model\n<|think|>\n<|think|>\n"):
+        formatted_prompt = formatted_prompt[: -len("<|think|>\n<|think|>\n")]
 
     single_ids = tokenizer(
         formatted_prompt,
@@ -262,24 +266,32 @@ def profile_pytorch_batched_live(
             torch.cuda.synchronize(target_device)
             torch.cuda.reset_peak_memory_stats(target_device)
 
-        # 1. Measure Prefill / Time-To-First-Token (TTFT) across N concurrent requests
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            _ = model.generate(
-                input_ids=batch_ids,
-                attention_mask=attn_mask,
-                max_new_tokens=1,
-                min_new_tokens=1,
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(target_device)
-        ttft_median_ms = (time.perf_counter() - t0) * 1000.0
-        ttft_p95_ms = ttft_median_ms * 1.18
+        # 1. Measure Prefill / Time-To-First-Token (TTFT) across 3 timed runs
+        ttft_samples_ms: List[float] = []
+        for _ in range(3):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(target_device)
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                _ = model.generate(
+                    input_ids=batch_ids,
+                    attention_mask=attn_mask,
+                    max_new_tokens=1,
+                    min_new_tokens=1,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(target_device)
+            ttft_samples_ms.append((time.perf_counter() - t0) * 1000.0)
+        ttft_samples_ms.sort()
+        ttft_median_ms = ttft_samples_ms[len(ttft_samples_ms) // 2]
+        ttft_p95_ms = ttft_samples_ms[-1]
 
         # 2. Measure Batched Decode Throughput across N concurrent requests
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(target_device)
         t_start = time.perf_counter()
         with torch.inference_mode():
             out = model.generate(
@@ -294,10 +306,13 @@ def profile_pytorch_batched_live(
         if torch.cuda.is_available():
             torch.cuda.synchronize(target_device)
         elapsed = max(1e-6, time.perf_counter() - t_start)
+        prefill_sec = ttft_median_ms / 1000.0
+        decode_elapsed = max(elapsed - prefill_sec, elapsed * 0.25, 1e-6)
 
         new_tokens_per_user = max(1, int(out.shape[-1] - batch_ids.shape[-1]))
-        total_generated_tokens = new_tokens_per_user * num_users
-        total_system_tps = total_generated_tokens / elapsed
+        decoded_tokens_per_user = max(1, new_tokens_per_user - 1)
+        total_generated_tokens = decoded_tokens_per_user * num_users
+        total_system_tps = total_generated_tokens / decode_elapsed
         per_user_tps = total_system_tps / max(1, num_users)
 
         vram_used_gb = (
@@ -393,14 +408,20 @@ def profile_vllm_model_live(
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
 
-        # 1. Measure Prefill / Time-To-First-Token (TTFT) across N concurrent requests
+        # 1. Measure Prefill / Time-To-First-Token (TTFT) across 3 timed runs
         ttft_params = SamplingParams(temperature=0.0, max_tokens=1)
-        t0 = time.perf_counter()
-        _ = llm.generate(batch_prompts, ttft_params)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        ttft_median_ms = ((time.perf_counter() - t0) * 1000.0) / max(1.0, (num_users ** 0.28))
-        ttft_p95_ms = ttft_median_ms * 1.22
+        ttft_samples_ms: List[float] = []
+        for _ in range(3):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _ = llm.generate(batch_prompts, ttft_params)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            ttft_samples_ms.append((time.perf_counter() - t0) * 1000.0)
+        ttft_samples_ms.sort()
+        ttft_median_ms = ttft_samples_ms[len(ttft_samples_ms) // 2]
+        ttft_p95_ms = ttft_samples_ms[-1]
 
         # 2. Measure Continuous-Batched Decode Throughput across N concurrent requests
         gen_params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)

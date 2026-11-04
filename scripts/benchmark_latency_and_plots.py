@@ -170,29 +170,47 @@ def profile_single_model_live(
                 torch.cuda.synchronize(target_device)
                 torch.cuda.reset_peak_memory_stats(target_device)
 
-            # Measure TTFT (1 new token)
-            t0 = time.perf_counter()
+            # Measure TTFT (1 new token) across timed runs
+            ttft_samples_ms: List[float] = []
             with torch.no_grad():
-                _ = model.generate(**inputs, max_new_tokens=1, do_sample=False)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(target_device)
-            ttft_ms = (time.perf_counter() - t0) * 1000.0
+                for _ in range(max(1, timed_runs)):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(target_device)
+                    t0 = time.perf_counter()
+                    _ = model.generate(
+                        **inputs,
+                        max_new_tokens=1,
+                        min_new_tokens=1,
+                        do_sample=False,
+                        use_cache=True,
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(target_device)
+                    ttft_samples_ms.append((time.perf_counter() - t0) * 1000.0)
+            ttft_samples_ms.sort()
+            ttft_ms = ttft_samples_ms[len(ttft_samples_ms) // 2]
 
-            # Measure Decode Throughput
+            # Measure Decode Throughput (subtracting prefill latency to avoid double-counting)
             decode_times: List[float] = []
             with torch.no_grad():
                 for _ in range(max(1, timed_runs)):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(target_device)
                     t_start = time.perf_counter()
                     out = model.generate(
                         **inputs,
                         max_new_tokens=max_new_tokens,
+                        min_new_tokens=max_new_tokens,
                         do_sample=False,
+                        use_cache=True,
                     )
                     if torch.cuda.is_available():
                         torch.cuda.synchronize(target_device)
                     elapsed = max(1e-6, time.perf_counter() - t_start)
-                    gen_tokens = max(1, int(out.shape[-1] - inputs["input_ids"].shape[-1]))
-                    decode_times.append(gen_tokens / elapsed)
+                    prefill_sec = ttft_ms / 1000.0
+                    decode_elapsed = max(elapsed - prefill_sec, elapsed * 0.25, 1e-6)
+                    gen_tokens = max(1, int(out.shape[-1] - inputs["input_ids"].shape[-1]) - 1)
+                    decode_times.append(gen_tokens / decode_elapsed)
 
             peak_vram_gb = (
                 max(
@@ -853,6 +871,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text(json.dumps(latency_profile, indent=2), encoding="utf-8")
+    legacy_json_path = profile_path.parent / "latency_vram_report.json"
+    legacy_json_path.write_text(json.dumps(latency_profile, indent=2), encoding="utf-8")
 
     md_report_path = profile_path.parent / "latency_vram_report.md"
     md_report_path.write_text(

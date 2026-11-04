@@ -125,7 +125,7 @@ echo "======================================================================"
   --config configs/eval_config.yaml \
   --live-profile
 
-CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" scripts/benchmark_vllm_concurrency.py \
+"${PYTHON_BIN}" scripts/benchmark_vllm_concurrency.py \
   --config configs/eval_config.yaml \
   --live-vllm
 
