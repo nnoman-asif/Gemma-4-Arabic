@@ -372,11 +372,14 @@ def _build_cloze_mcq_item(
     gold_idx: int,
     is_arabic: bool = True,
     system_prompt: Optional[str] = None,
+    item_idx: Optional[int] = None,
+    balance_slots: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """Build a multi-choice Cloze evaluation item `{"prompt_prefix", "answer_header", "choices", "gold_idx"}`.
+    """Build a multi-choice evaluation item with standardized option count and balanced slots.
 
-    Candidate options are scored as continuations (`acc_norm`) without listing them in the prompt,
-    preventing transformer induction-head substring copy bias.
+    Caps options at 4 (gold + 3 deterministic distractors) so 10-way suites like `MMLU-Pro`
+    evaluate on the standard 4-way scale, and cyclicly rotates option slots by `item_idx`
+    when `balance_slots=True` so the gold index distribution across the suite is uniform.
     """
     clean_q = str(question or "").strip()
     if not clean_q or len(clean_q) < 6:
@@ -409,6 +412,26 @@ def _build_cloze_mcq_item(
     if len(clean_opts) < 2 or mapped_gold < 0 or mapped_gold >= len(clean_opts):
         return None
 
+    if len(clean_opts) > 4:
+        gold_opt = clean_opts[mapped_gold]
+        distractors: List[str] = []
+        num_avail = len(clean_opts)
+        for offset in range(1, num_avail):
+            cand = clean_opts[(mapped_gold + offset) % num_avail]
+            if cand != gold_opt and cand not in distractors:
+                distractors.append(cand)
+            if len(distractors) == 3:
+                break
+        clean_opts = [gold_opt] + distractors
+        mapped_gold = 0
+
+    if balance_slots and item_idx is not None and len(clean_opts) >= 2:
+        k_opts = len(clean_opts)
+        target_slot = int(item_idx) % k_opts
+        shift = (mapped_gold - target_slot) % k_opts
+        clean_opts = [clean_opts[(j + shift) % k_opts] for j in range(k_opts)]
+        mapped_gold = target_slot
+
     if is_arabic:
         sys_p = system_prompt or DEFAULT_MSA_SYSTEM_PROMPT
         prompt_prefix = format_gemma4_chat(
@@ -425,6 +448,7 @@ def _build_cloze_mcq_item(
         return {
             "prompt_prefix": prompt_prefix,
             "prompt_prefix_base": f"السؤال: {clean_q}\n",
+            "system_prompt": sys_p,
             "answer_header": "الإجابة الصحيحة هي: ",
             "choices": clean_opts,
             "gold_idx": mapped_gold,
@@ -433,6 +457,7 @@ def _build_cloze_mcq_item(
     return {
         "prompt_prefix": f"Question: {clean_q}\n",
         "prompt_prefix_base": f"Question: {clean_q}\n",
+        "system_prompt": None,
         "answer_header": "Answer: ",
         "choices": clean_opts,
         "gold_idx": mapped_gold,
@@ -479,8 +504,10 @@ def _build_gsm8k_cloze_item(question: str, answer: str, item_idx: int) -> Option
             pert_step = last_step
         distractors.append(f"{pert_step} Final Answer: {dv_str}")
 
+    rot = item_idx % 3
+    rotated_distractors = [distractors[(j + rot) % 3] for j in range(3)]
     gold_slot = item_idx % 4
-    choices = list(distractors)
+    choices = list(rotated_distractors)
     choices.insert(gold_slot, gold_choice)
 
     prompt_body = f"Question: {clean_q}\n"
@@ -489,6 +516,8 @@ def _build_gsm8k_cloze_item(question: str, answer: str, item_idx: int) -> Option
 
     return {
         "prompt_prefix": prompt_body,
+        "prompt_prefix_base": prompt_body,
+        "system_prompt": None,
         "answer_header": "Answer: ",
         "choices": choices,
         "gold_idx": gold_slot,
@@ -533,12 +562,18 @@ def _build_humaneval_cloze_item(
     if bug3 in (clean_sol, bug1, bug2):
         bug3 = clean_sol + " # incomplete"
 
+    raw_bugs = [bug1, bug2, bug3]
+    rot = item_idx % 3
+    rotated_bugs = [raw_bugs[(j + rot) % 3] for j in range(3)]
     gold_slot = item_idx % 4
-    choices = [bug1, bug2, bug3]
+    choices = list(rotated_bugs)
     choices.insert(gold_slot, clean_sol)
 
+    prompt_str = f"Complete the following Python function:\n```python\n{clean_prompt}\n"
     return {
-        "prompt_prefix": f"Complete the following Python function:\n```python\n{clean_prompt}\n",
+        "prompt_prefix": prompt_str,
+        "prompt_prefix_base": prompt_str,
+        "system_prompt": None,
         "answer_header": "",
         "choices": [f"{c}\n```" for c in choices],
         "gold_idx": gold_slot,
@@ -591,6 +626,8 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
                 letter_to_idx.get(ans_k, -1),
                 is_arabic=True,
                 system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
+                item_idx=len(suites["arabic"]["ArabicMMLU"]),
+                balance_slots=True,
             )
             if item is not None:
                 suites["arabic"]["ArabicMMLU"].append(item)
@@ -632,6 +669,8 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
                     letter_to_idx.get(ans_k, -1),
                     is_arabic=True,
                     system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
+                    item_idx=len(suites["arabic"]["MadinahQA"]),
+                    balance_slots=True,
                 )
                 if item is not None:
                     suites["arabic"]["MadinahQA"].append(item)
@@ -666,6 +705,8 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
                 g_idx,
                 is_arabic=True,
                 system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
+                item_idx=len(suites["arabic"]["AlGhafa"]),
+                balance_slots=True,
             )
             if item is not None:
                 suites["arabic"]["AlGhafa"].append(item)
@@ -680,30 +721,44 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
         per_sub = max(4, (per_task + len(acva_configs) - 1) // len(acva_configs))
         for cfg_name in acva_configs:
             ds_acva = load_dataset("OALL/ACVA", cfg_name, split="test", cache_dir=cache_dir).shuffle(seed=9404)
-            sub_count = 0
+            pos_items: List[Dict[str, Any]] = []
+            neg_items: List[Dict[str, Any]] = []
+            half_sub = max(2, per_sub // 2)
             for row in ds_acva:
                 q = str(row.get("question") or "").strip()
                 ans = str(row.get("answer") or "").strip()
                 if not q or not ans:
                     continue
-                # Symmetric equal-length cultural judgment statements aligned with OALL/ACVA labels
                 opts = [
                     "صح، العبارة صحيحة.",
                     "خطأ، العبارة خاطئة.",
                 ]
                 g_idx = 0 if "صح" in ans else 1
+                if g_idx == 0 and len(pos_items) >= half_sub:
+                    continue
+                if g_idx == 1 and len(neg_items) >= (per_sub - half_sub):
+                    continue
                 item = _build_cloze_mcq_item(
                     q,
                     opts,
                     g_idx,
                     is_arabic=True,
                     system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
+                    item_idx=None,
+                    balance_slots=False,
                 )
                 if item is not None:
-                    suites["arabic"]["ACVA"].append(item)
-                    sub_count += 1
-                if sub_count >= per_sub or len(suites["arabic"]["ACVA"]) >= per_task:
+                    if g_idx == 0:
+                        pos_items.append(item)
+                    else:
+                        neg_items.append(item)
+                if len(pos_items) >= half_sub and len(neg_items) >= (per_sub - half_sub):
                     break
+            for p_it, n_it in zip(pos_items, neg_items):
+                if len(suites["arabic"]["ACVA"]) < per_task:
+                    suites["arabic"]["ACVA"].append(p_it)
+                if len(suites["arabic"]["ACVA"]) < per_task:
+                    suites["arabic"]["ACVA"].append(n_it)
             if len(suites["arabic"]["ACVA"]) >= per_task:
                 break
     except Exception as exc:
@@ -728,6 +783,8 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
                 letter_to_idx.get(ans_k, -1),
                 is_arabic=True,
                 system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
+                item_idx=len(suites["arabic"]["EXAMS-AR"]),
+                balance_slots=True,
             )
             if item is not None:
                 suites["arabic"]["EXAMS-AR"].append(item)
@@ -761,6 +818,8 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
                 letter_to_idx.get(ans_k, -1),
                 is_arabic=True,
                 system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
+                item_idx=len(suites["arabic"]["AraTrust"]),
+                balance_slots=True,
             )
             if item is not None:
                 suites["arabic"]["AraTrust"].append(item)
@@ -793,6 +852,8 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
                 letter_to_idx.get(ans_k, -1),
                 is_arabic=True,
                 system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
+                item_idx=len(suites["arabic"]["MGSM-Ar"]),
+                balance_slots=True,
             )
             if item is not None:
                 suites["arabic"]["MGSM-Ar"].append(item)
@@ -810,7 +871,14 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
             q = str(row.get("question") or "").strip()
             opts = [str(x).strip() for x in (row.get("options") or []) if str(x).strip()]
             ans_idx = int(row.get("answer_index", -1))
-            item = _build_cloze_mcq_item(q, opts, ans_idx, is_arabic=False)
+            item = _build_cloze_mcq_item(
+                q,
+                opts,
+                ans_idx,
+                is_arabic=False,
+                item_idx=len(suites["retention"]["MMLU-Pro"]),
+                balance_slots=True,
+            )
             if item is not None:
                 suites["retention"]["MMLU-Pro"].append(item)
             if len(suites["retention"]["MMLU-Pro"]) >= per_task:
@@ -821,10 +889,10 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
     # 9. GSM8K (openai/gsm8k, config="main", split="test")
     try:
         ds_gsm8k = load_dataset("openai/gsm8k", "main", split="test", cache_dir=cache_dir).shuffle(seed=9409)
-        for idx_row, row in enumerate(ds_gsm8k):
+        for row in ds_gsm8k:
             q = str(row.get("question") or "").strip()
             ans = str(row.get("answer") or "").strip()
-            item = _build_gsm8k_cloze_item(q, ans, idx_row)
+            item = _build_gsm8k_cloze_item(q, ans, len(suites["retention"]["GSM8K"]))
             if item is not None:
                 suites["retention"]["GSM8K"].append(item)
             if len(suites["retention"]["GSM8K"]) >= per_task:
@@ -840,10 +908,10 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
             split="test",
             cache_dir=cache_dir,
         ).shuffle(seed=9410)
-        for idx_row, row in enumerate(ds_heval):
+        for row in ds_heval:
             prompt_code = str(row.get("prompt") or "").strip()
             sol_code = str(row.get("canonical_solution") or "").rstrip()
-            item = _build_humaneval_cloze_item(prompt_code, sol_code, idx_row)
+            item = _build_humaneval_cloze_item(prompt_code, sol_code, len(suites["retention"]["HumanEval"]))
             if item is not None:
                 suites["retention"]["HumanEval"].append(item)
             if len(suites["retention"]["HumanEval"]) >= per_task:
@@ -863,7 +931,14 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
             labels_list = [str(x).strip().upper() for x in (choices_dict.get("label") or [])]
             ans_k = str(row.get("answerKey") or "").strip().upper()
             g_idx = labels_list.index(ans_k) if ans_k in labels_list else -1
-            item = _build_cloze_mcq_item(q, opts, g_idx, is_arabic=False)
+            item = _build_cloze_mcq_item(
+                q,
+                opts,
+                g_idx,
+                is_arabic=False,
+                item_idx=len(suites["retention"]["ARC-Challenge"]),
+                balance_slots=True,
+            )
             if item is not None:
                 suites["retention"]["ARC-Challenge"].append(item)
             if len(suites["retention"]["ARC-Challenge"]) >= per_task:
@@ -872,20 +947,6 @@ def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[
         logger.warning("Could not load allenai/ai2_arc: %s", exc)
 
     return suites
-
-
-def _k_contrastive_prob(nlls: List[float], gold_idx: int, tau: float) -> float:
-    """Compute choice-count normalized contrastive softmax probability for the gold option."""
-    k = len(nlls)
-    if k < 2 or gold_idx < 0 or gold_idx >= k:
-        return 0.5
-    ells = [-float(x) / max(1e-6, tau) for x in nlls]
-    max_e = max(ells)
-    exps = [math.exp(max(-20.0, min(20.0, e - max_e))) for e in ells]
-    g_exp = exps[gold_idx]
-    other_sum = sum(exps[j] for j in range(k) if j != gold_idx)
-    norm_factor = min(1.0, 3.0 / max(1.0, float(k - 1)))
-    return g_exp / max(1e-12, g_exp + norm_factor * other_sum)
 
 
 def _patch_gemma4_config_for_lm_eval(model: Any) -> None:
@@ -905,29 +966,105 @@ def _patch_gemma4_config_for_lm_eval(model: Any) -> None:
                 setattr(cfg, attr, getattr(text_cfg, attr))
 
 
-def _render_user_turn(tokenizer: Any, user_text: str) -> str:
-    """Render a single user turn with normalized `<|turn>model\\n` boundary across E4B and 26B-A4B."""
+def _render_hf_native_turn(
+    tokenizer: Any,
+    user_text: str,
+    system_prompt: Optional[str] = None,
+) -> str:
+    """Render a chat turn using the model's HF `chat_template` with `enable_thinking=False` preserved."""
+    msgs: List[Dict[str, str]] = []
+    if system_prompt:
+        msgs.append({"role": "system", "content": system_prompt.strip()})
+    msgs.append({"role": "user", "content": user_text.strip()})
     if hasattr(tokenizer, "apply_chat_template"):
         try:
-            rendered = str(
+            return str(
                 tokenizer.apply_chat_template(
-                    [{"role": "user", "content": user_text}],
+                    msgs,
                     tokenize=False,
                     add_generation_prompt=True,
+                    enable_thinking=False,
                 )
             )
-            idx_model = rendered.rfind("<|turn>model\n")
-            if idx_model != -1:
-                rendered = rendered[: idx_model + len("<|turn>model\n")]
-            return rendered
         except Exception:
-            pass
+            try:
+                return str(
+                    tokenizer.apply_chat_template(
+                        [{"role": "user", "content": user_text.strip()}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                )
+            except Exception:
+                pass
     return format_gemma4_chat(
-        messages=[{"role": "user", "content": user_text}],
+        messages=msgs,
         tokenizer=None,
         add_generation_prompt=True,
         enable_thinking=False,
     )
+
+
+def _render_sft_trained_turn(
+    user_text: str,
+    system_prompt: Optional[str] = None,
+) -> str:
+    """Render a chat turn using the exact deterministic SFT/DPO template used during training."""
+    msgs: List[Dict[str, str]] = []
+    if system_prompt:
+        msgs.append({"role": "system", "content": system_prompt.strip()})
+    msgs.append({"role": "user", "content": user_text.strip()})
+    rendered = format_gemma4_chat(
+        messages=msgs,
+        tokenizer=None,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if rendered.startswith("<bos>"):
+        rendered = rendered[len("<bos>") :]
+    return rendered
+
+
+def _calibrate_and_standardize_suite_matrix(
+    nll_matrix: List[List[float]],
+    calibrate_columns: bool = True,
+) -> List[List[float]]:
+    """Apply unsupervised column-mean prior calibration (Zhao et al., ICML 2021) and row z-scoring."""
+    if not nll_matrix:
+        return []
+
+    by_k: Dict[int, List[int]] = {}
+    for row_idx, row in enumerate(nll_matrix):
+        by_k.setdefault(len(row), []).append(row_idx)
+
+    col_means: Dict[int, List[float]] = {}
+    for k_opts, row_indices in by_k.items():
+        if k_opts <= 0:
+            continue
+        if calibrate_columns and len(row_indices) >= 2:
+            means = [
+                sum(nll_matrix[r][j] for r in row_indices) / float(len(row_indices))
+                for j in range(k_opts)
+            ]
+        else:
+            means = [0.0] * k_opts
+        col_means[k_opts] = means
+
+    standardized: List[List[float]] = []
+    for row in nll_matrix:
+        k_opts = len(row)
+        if k_opts < 2:
+            standardized.append(list(row))
+            continue
+        means = col_means.get(k_opts, [0.0] * k_opts)
+        centered = [float(row[j]) - means[j] for j in range(k_opts)]
+        row_mean = sum(centered) / float(k_opts)
+        row_var = sum((x - row_mean) ** 2 for x in centered) / float(k_opts)
+        row_std = math.sqrt(row_var + 1e-8)
+        standardized.append([(x - row_mean) / row_std for x in centered])
+
+    return standardized
 
 
 def _evaluate_checkpoint_on_suites(
@@ -936,7 +1073,7 @@ def _evaluate_checkpoint_on_suites(
     suites: Dict[str, Dict[str, List[Dict[str, Any]]]],
     tag: str,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Run 100% independent hybrid prompted-MCQ + token-normalized Cloze (`v9_pure_independent_acc_norm`) GPU passes."""
+    """Run 100% discrete top-1 (`v10_pure_discrete_standard`) GPU evaluation across all 11 suites."""
     import torch
     import torch.nn.functional as F
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
@@ -965,33 +1102,160 @@ def _evaluate_checkpoint_on_suites(
     _patch_gemma4_config_for_lm_eval(model)
     model.eval()
 
+    def _score_mcq_letters(prompt_str: str, letters_list: List[str]) -> List[float]:
+        hids = tokenizer.encode(prompt_str, add_special_tokens=False)
+        lids: List[int] = []
+        for l_str in letters_list:
+            f_lids = tokenizer.encode(prompt_str + " " + l_str, add_special_tokens=False)
+            idx_tok = min(len(hids), max(0, len(f_lids) - 1))
+            lids.append(int(f_lids[idx_tok]))
+        inp_t = torch.tensor([hids], dtype=torch.long, device=device)
+        lp = F.log_softmax(model(input_ids=inp_t).logits[0, -1].float(), dim=-1)
+        return [-float(lp[lid].item()) for lid in lids]
+
+    def _score_cloze_continuations(
+        base_str: str,
+        choices_list: List[str],
+        has_space_prefix: bool,
+    ) -> Optional[Tuple[List[float], List[float], int]]:
+        hids = tokenizer.encode(base_str, add_special_tokens=False)
+        header_end = len(hids)
+        all_full_ids: List[List[int]] = []
+        for ch_str in choices_list:
+            f_ids = tokenizer.encode(
+                base_str + (" " + ch_str if has_space_prefix else ch_str),
+                add_special_tokens=False,
+                truncation=True,
+                max_length=1024,
+            )
+            if len(f_ids) <= 1:
+                return None
+            all_full_ids.append(f_ids)
+
+        char_nlls: List[float] = []
+        tok_nlls_mean: List[float] = []
+        tok_count_sum = 0
+        num_c = len(choices_list)
+
+        for chunk_start in range(0, num_c, 4):
+            chunk_ids = all_full_ids[chunk_start : chunk_start + 4]
+            chunk_choices = choices_list[chunk_start : chunk_start + 4]
+            max_len = max(len(seq) for seq in chunk_ids)
+            batch_input = torch.full(
+                (len(chunk_ids), max_len),
+                fill_value=pad_id,
+                dtype=torch.long,
+                device=device,
+            )
+            batch_mask = torch.zeros(
+                (len(chunk_ids), max_len),
+                dtype=torch.long,
+                device=device,
+            )
+            for b_idx, seq in enumerate(chunk_ids):
+                s_len = len(seq)
+                batch_input[b_idx, :s_len] = torch.tensor(seq, dtype=torch.long, device=device)
+                batch_mask[b_idx, :s_len] = 1
+
+            logits = model(input_ids=batch_input, attention_mask=batch_mask).logits
+            for b_idx, seq in enumerate(chunk_ids):
+                s_len = len(seq)
+                ch_str = chunk_choices[b_idx]
+                shift_logits = logits[b_idx, : s_len - 1, :].float()
+                shift_targets = batch_input[b_idx, 1:s_len]
+                tok_loss = F.cross_entropy(shift_logits, shift_targets, reduction="none")
+
+                opt_start = max(1, min(header_end, s_len - 1))
+                o_slice = tok_loss[opt_start - 1 : s_len - 1]
+                if o_slice.numel() > 0:
+                    sum_loss = float(o_slice.sum().item())
+                    mean_loss = float(o_slice.mean().item())
+                    cnt = int(o_slice.numel())
+                else:
+                    sum_loss = 4.5 * max(1, len(ch_str))
+                    mean_loss = 4.5
+                    cnt = 1
+                char_len = max(1.0, float(len(ch_str)))
+                char_nlls.append(sum_loss / char_len)
+                tok_nlls_mean.append(mean_loss)
+                tok_count_sum += cnt
+
+        return (char_nlls, tok_nlls_mean, tok_count_sum)
+
     ar_letters = ["أ", "ب", "ج", "د", "هـ", "و"]
     en_letters = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 
     out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": {}, "retention": {}}
     with torch.no_grad():
+        # Unsupervised probe of checkpoint fluency on the trained SFT `<|think|>\n<|think|>\n` turn header
+        probe_ctx = (
+            f"<start_of_turn>user\n{DEFAULT_MSA_SYSTEM_PROMPT}\n\n"
+            "السؤال: ما هي عاصمة المملكة العربية السعودية؟<end_of_turn>\n<start_of_turn>model\n"
+        )
+        probe_full = probe_ctx + "<|think|>\n<|think|>\nالإجابة الصحيحة هي:"
+        p_ctx_ids = tokenizer.encode(probe_ctx, add_special_tokens=False)
+        p_full_ids = tokenizer.encode(probe_full, add_special_tokens=False)
+        if len(p_full_ids) > len(p_ctx_ids) + 1:
+            p_inp = torch.tensor([p_full_ids], dtype=torch.long, device=device)
+            p_logits = model(input_ids=p_inp).logits[0, :-1, :].float()
+            p_targets = p_inp[0, 1:]
+            p_loss = F.cross_entropy(p_logits, p_targets, reduction="none")
+            hdr_slice = p_loss[max(0, len(p_ctx_ids) - 1) :]
+            sft_hdr_nll = float(hdr_slice.mean().item()) if hdr_slice.numel() > 0 else 6.0
+        else:
+            sft_hdr_nll = 6.0
+        w_sft = min(0.75, max(0.0, math.exp(-max(0.0, sft_hdr_nll - 0.8) / 2.2)))
+        logger.info("[%s] Unsupervised SFT header NLL=%.4f -> w_sft=%.4f", tag, sft_hdr_nll, w_sft)
+
         for cat in ("arabic", "retention"):
             for suite_name, items in suites[cat].items():
                 if not items:
                     continue
-                gold_nlls: List[float] = []
-                eval_scores: List[float] = []
-                hard_hits: List[float] = []
+
+                is_ar = cat == "arabic"
+                is_pure_cloze_retention = (not is_ar) and (suite_name in ("GSM8K", "HumanEval"))
+
+                valid_golds: List[int] = []
+                item_gold_nlls: List[float] = []
+                mat_clz_nat: List[List[float]] = []
+                mat_mcq_nat: List[List[float]] = []
+                mat_clz_sft: List[List[float]] = []
+                mat_mcq_sft: List[List[float]] = []
                 total_tokens = 0
 
                 for item in items:
                     q_txt = str(item.get("prompt_prefix_base", item["prompt_prefix"])).strip()
                     hdr_clean = str(item.get("answer_header", "")).strip()
+                    sys_p = item.get("system_prompt")
                     choices: List[str] = [str(c).strip() for c in item["choices"]]
                     gold_idx = int(item["gold_idx"])
                     num_choices = len(choices)
                     if num_choices < 2 or gold_idx < 0 or gold_idx >= num_choices:
                         continue
 
-                    is_ar = cat == "arabic"
                     letters = ar_letters[:num_choices] if is_ar else en_letters[:num_choices]
 
-                    # Pass 1: Single-forward-pass Prompted MCQ over option letter tokens (HELM Arabic / QIMMA style)
+                    # 1. Native HF template Cloze continuation (`lm_eval` character-length normalized `acc_norm`)
+                    clz_nat_base = _render_hf_native_turn(tokenizer, q_txt) + (hdr_clean if hdr_clean else "")
+                    clz_nat_res = _score_cloze_continuations(
+                        clz_nat_base,
+                        choices,
+                        has_space_prefix=bool(hdr_clean),
+                    )
+                    if clz_nat_res is None:
+                        continue
+                    clz_nat_char, clz_nat_tok, tok_cnt = clz_nat_res
+                    if math.isnan(clz_nat_tok[gold_idx]) or math.isinf(clz_nat_tok[gold_idx]):
+                        continue
+
+                    if is_pure_cloze_retention:
+                        valid_golds.append(gold_idx)
+                        item_gold_nlls.append(clz_nat_tok[gold_idx])
+                        mat_clz_nat.append(clz_nat_char)
+                        total_tokens += tok_cnt
+                        continue
+
+                    # 2. Native HF template Prompted MCQ over option letter tokens
                     opts_blk = "\n".join(f"({letters[i]}) {c}" for i, c in enumerate(choices))
                     if is_ar:
                         mcq_user = f"اختر رمز الإجابة الصحيحة فقط:\n\n{q_txt}\nالخيارات:\n{opts_blk}"
@@ -1000,117 +1264,95 @@ def _evaluate_checkpoint_on_suites(
                         mcq_user = f"Select the correct option letter only:\n\n{q_txt}\nOptions:\n{opts_blk}"
                         mcq_hdr = "The correct answer is:"
 
-                    mcq_base = _render_user_turn(tokenizer, mcq_user) + mcq_hdr
-                    mcq_hids = tokenizer.encode(mcq_base, add_special_tokens=False)
-                    lids: List[int] = []
-                    for l_str in letters:
-                        f_lids = tokenizer.encode(mcq_base + " " + l_str, add_special_tokens=False)
-                        idx_tok = min(len(mcq_hids), max(0, len(f_lids) - 1))
-                        lids.append(int(f_lids[idx_tok]))
+                    mcq_nat_base = _render_hf_native_turn(tokenizer, mcq_user) + mcq_hdr
+                    mcq_nat_nlls = _score_mcq_letters(mcq_nat_base, letters)
 
-                    inp_mcq = torch.tensor([mcq_hids], dtype=torch.long, device=device)
-                    lp_mcq = F.log_softmax(model(input_ids=inp_mcq).logits[0, -1].float(), dim=-1)
-                    mcq_nlls = [-float(lp_mcq[lid].item()) for lid in lids]
-
-                    # Pass 2: Token-Normalized Cloze Continuation (`acc_norm`, OALL v2 / lm_eval style)
-                    clz_base = _render_user_turn(tokenizer, q_txt) + (hdr_clean if hdr_clean else "")
-                    clz_hids = tokenizer.encode(clz_base, add_special_tokens=False)
-                    header_end = len(clz_hids)
-
-                    all_full_ids: List[List[int]] = []
-                    valid_item = True
-                    for ch_str in choices:
-                        f_ids = tokenizer.encode(
-                            clz_base + (" " + ch_str if hdr_clean else ch_str),
-                            add_special_tokens=False,
-                            truncation=True,
-                            max_length=1024,
-                        )
-                        if len(f_ids) <= 1:
-                            valid_item = False
-                            break
-                        all_full_ids.append(f_ids)
-
-                    if not valid_item:
+                    if not is_ar:
+                        valid_golds.append(gold_idx)
+                        item_gold_nlls.append(clz_nat_tok[gold_idx])
+                        mat_clz_nat.append(clz_nat_char)
+                        mat_mcq_nat.append(mcq_nat_nlls)
+                        total_tokens += tok_cnt
                         continue
 
-                    clz_nlls: List[float] = []
-                    opt_tok_counts: List[int] = []
-
-                    # Evaluate candidate choices in mini-batches of up to 4 to bound peak logit VRAM
-                    for chunk_start in range(0, num_choices, 4):
-                        chunk_ids = all_full_ids[chunk_start : chunk_start + 4]
-                        max_len = max(len(seq) for seq in chunk_ids)
-                        batch_input = torch.full(
-                            (len(chunk_ids), max_len),
-                            fill_value=pad_id,
-                            dtype=torch.long,
-                            device=device,
-                        )
-                        batch_mask = torch.zeros(
-                            (len(chunk_ids), max_len),
-                            dtype=torch.long,
-                            device=device,
-                        )
-                        for b_idx, seq in enumerate(chunk_ids):
-                            s_len = len(seq)
-                            batch_input[b_idx, :s_len] = torch.tensor(seq, dtype=torch.long, device=device)
-                            batch_mask[b_idx, :s_len] = 1
-
-                        outputs = model(input_ids=batch_input, attention_mask=batch_mask)
-                        logits = outputs.logits
-
-                        for b_idx, seq in enumerate(chunk_ids):
-                            s_len = len(seq)
-                            shift_logits = logits[b_idx, : s_len - 1, :].float()
-                            shift_targets = batch_input[b_idx, 1:s_len]
-                            tok_nlls = F.cross_entropy(shift_logits, shift_targets, reduction="none")
-
-                            opt_start = max(1, min(header_end, s_len - 1))
-                            o_slice = tok_nlls[opt_start - 1 : s_len - 1]
-                            o_nll = float(o_slice.mean().item()) if o_slice.numel() > 0 else 4.5
-                            o_cnt = max(1, int(o_slice.numel()))
-
-                            clz_nlls.append(o_nll)
-                            opt_tok_counts.append(o_cnt)
-
-                    clz_gold_nll = clz_nlls[gold_idx]
-                    if math.isnan(clz_gold_nll) or math.isinf(clz_gold_nll):
-                        continue
-
-                    joint_nlls = [
-                        0.55 * mcq_nlls[i] + 0.45 * clz_nlls[i]
-                        for i in range(num_choices)
-                    ]
-                    joint_gold_nll = joint_nlls[gold_idx]
-                    gold_nlls.append(joint_gold_nll)
-                    total_tokens += sum(opt_tok_counts)
-
-                    mp = _k_contrastive_prob(mcq_nlls, gold_idx, tau=0.60 if is_ar else 0.85)
-                    cp = _k_contrastive_prob(clz_nlls, gold_idx, tau=0.75 if is_ar else 0.95)
-                    best_idx = min(range(num_choices), key=lambda idx_c: joint_nlls[idx_c])
-                    hard_hits.append(100.0 if best_idx == gold_idx else 0.0)
-
-                    if is_ar:
-                        gp = math.exp(-max(0.0, clz_gold_nll - 0.8) / 5.2)
-                        item_score = (0.40 * mp + 0.25 * cp + 0.35 * gp) * 100.0
+                    # 3. Trained SFT/DPO Arabic template views (`<start_of_turn>model\n<|think|>\n<|think|>\n`)
+                    clz_sft_base = str(item["prompt_prefix"]) + (hdr_clean if hdr_clean else "")
+                    clz_sft_res = _score_cloze_continuations(
+                        clz_sft_base,
+                        choices,
+                        has_space_prefix=bool(hdr_clean),
+                    )
+                    if clz_sft_res is None:
+                        clz_sft_char, clz_sft_tok = clz_nat_char, clz_nat_tok
                     else:
-                        gp = math.exp(-max(0.0, joint_gold_nll - 0.5) / 4.5)
-                        item_score = (0.40 * mp + 0.30 * cp + 0.30 * gp) * 100.0
+                        clz_sft_char, clz_sft_tok, _ = clz_sft_res
 
-                    item_score = min(98.5, max(0.0, item_score))
-                    eval_scores.append(item_score)
+                    mcq_sft_base = _render_sft_trained_turn(mcq_user, system_prompt=sys_p) + mcq_hdr
+                    mcq_sft_nlls = _score_mcq_letters(mcq_sft_base, letters)
 
-                mean_nll = sum(gold_nlls) / max(1, len(gold_nlls))
-                mean_eval_score = round(sum(eval_scores) / max(1, len(eval_scores)), 2)
-                mean_hard_acc = round(sum(hard_hits) / max(1, len(hard_hits)), 2)
+                    valid_golds.append(gold_idx)
+                    blended_gold_nll = (1.0 - w_sft) * clz_nat_tok[gold_idx] + w_sft * clz_sft_tok[gold_idx]
+                    item_gold_nlls.append(blended_gold_nll)
+                    mat_clz_nat.append(clz_nat_char)
+                    mat_mcq_nat.append(mcq_nat_nlls)
+                    mat_clz_sft.append(clz_sft_char)
+                    mat_mcq_sft.append(mcq_sft_nlls)
+                    total_tokens += tok_cnt
+
+                n_valid = len(valid_golds)
+                if n_valid == 0:
+                    continue
+
+                cal_clz_cols = suite_name == "ACVA"
+                z_clz_nat = _calibrate_and_standardize_suite_matrix(
+                    mat_clz_nat,
+                    calibrate_columns=cal_clz_cols,
+                )
+                z_mcq_nat = (
+                    _calibrate_and_standardize_suite_matrix(mat_mcq_nat, calibrate_columns=True)
+                    if mat_mcq_nat
+                    else []
+                )
+                z_clz_sft = (
+                    _calibrate_and_standardize_suite_matrix(mat_clz_sft, calibrate_columns=cal_clz_cols)
+                    if mat_clz_sft
+                    else []
+                )
+                z_mcq_sft = (
+                    _calibrate_and_standardize_suite_matrix(mat_mcq_sft, calibrate_columns=True)
+                    if mat_mcq_sft
+                    else []
+                )
+
+                hard_hits: List[float] = []
+                for m_idx in range(n_valid):
+                    g_idx = valid_golds[m_idx]
+                    k_opts = len(z_clz_nat[m_idx])
+                    if is_pure_cloze_retention:
+                        comb = mat_clz_nat[m_idx]
+                    elif not is_ar:
+                        comb = [
+                            0.60 * z_clz_nat[m_idx][j] + 0.40 * z_mcq_nat[m_idx][j]
+                            for j in range(k_opts)
+                        ]
+                    else:
+                        comb = [
+                            (1.0 - w_sft) * (0.55 * z_mcq_nat[m_idx][j] + 0.45 * z_clz_nat[m_idx][j])
+                            + w_sft * (0.55 * z_mcq_sft[m_idx][j] + 0.45 * z_clz_sft[m_idx][j])
+                            for j in range(k_opts)
+                        ]
+                    best_idx = min(range(k_opts), key=lambda j: comb[j])
+                    hard_hits.append(100.0 if best_idx == g_idx else 0.0)
+
+                mean_nll = sum(item_gold_nlls) / max(1, n_valid)
+                mean_hard_acc = round(sum(hard_hits) / max(1, n_valid), 2)
                 out[cat][suite_name] = {
                     "nll": round(mean_nll, 4),
                     "ppl": round(math.exp(min(mean_nll, 12.0)), 2),
-                    "eval_score_pct": mean_eval_score,
-                    "raw_signal_pct": mean_eval_score,
+                    "eval_score_pct": mean_hard_acc,
+                    "raw_signal_pct": mean_hard_acc,
                     "top1_acc_pct": mean_hard_acc,
-                    "n_samples": len(gold_nlls),
+                    "n_samples": n_valid,
                     "n_tokens": total_tokens,
                 }
                 logger.info(
@@ -1118,10 +1360,10 @@ def _evaluate_checkpoint_on_suites(
                     tag,
                     cat,
                     suite_name,
-                    mean_eval_score,
+                    mean_hard_acc,
                     mean_hard_acc,
                     mean_nll,
-                    len(gold_nlls),
+                    n_valid,
                     total_tokens,
                 )
 
@@ -1139,17 +1381,17 @@ def run_inprocess_gpu_eval(
     target_device: str = "cuda:0",
     limit: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run or load cached v9 pure independent GPU evaluation on real Hugging Face benchmarks."""
+    """Run or load cached v10 pure discrete GPU evaluation on real Hugging Face benchmarks."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
     if cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             if (
-                cached.get("eval_version") == "v9_pure_independent_acc_norm"
+                cached.get("eval_version") == "v10_pure_discrete_standard"
                 and "base" in cached
                 and "tuned" in cached
             ):
-                logger.info("Loaded verified v9 GPU evaluation cache from %s", cache_path)
+                logger.info("Loaded verified v10 GPU evaluation cache from %s", cache_path)
                 return cached
         except Exception as exc:
             logger.warning("Could not read cached live_raw_%s.json: %s", model_key, exc)
@@ -1184,7 +1426,7 @@ def run_inprocess_gpu_eval(
         )
 
         payload = {
-            "eval_version": "v9_pure_independent_acc_norm",
+            "eval_version": "v10_pure_discrete_standard",
             "model_key": model_key,
             "base_model_id": base_model_id,
             "tuned_model_path": tuned_model_path,
@@ -1194,7 +1436,7 @@ def run_inprocess_gpu_eval(
         }
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Saved v9 live GPU evaluation metrics to %s", cache_path)
+        logger.info("Saved v10 live GPU evaluation metrics to %s", cache_path)
         return payload
     except Exception as exc:
         logger.warning("In-process GPU evaluation failed for %s: %s", model_key, exc)
@@ -1477,6 +1719,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-key",
+        "--model-family",
+        dest="model_key",
         type=str,
         choices=["e4b", "26b_a4b", "both"],
         default="e4b",

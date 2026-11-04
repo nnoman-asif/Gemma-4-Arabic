@@ -37,8 +37,11 @@ from scripts.benchmark_vllm_concurrency import (
     render_vllm_markdown_report,
 )
 from scripts.run_benchmarks import (
+    _calibrate_and_standardize_suite_matrix,
+    _patch_gemma4_config_for_lm_eval,
     evaluate_retention_gate,
     generate_markdown_report,
+    parse_args as parse_bench_args,
     parse_lm_eval_results_json,
 )
 from src.chat_template import (
@@ -479,6 +482,34 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             sample_lm_eval, task_name="arabicmmlu", metric_hint="acc_norm"
         )
         self.assertAlmostEqual(parsed_score, 64.50, places=2)
+
+        # Verify --model-family CLI alias and Gemma4Config text_config patch
+        parsed_cli = parse_bench_args(["--model-family", "both", "--eval-base"])
+        self.assertEqual(parsed_cli.model_key, "both")
+        self.assertTrue(parsed_cli.eval_base)
+
+        class _MockTextCfg:
+            vocab_size = 262144
+            hidden_size = 2560
+
+        class _MockGemma4Cfg:
+            text_config = _MockTextCfg()
+
+        mock_cfg = _MockGemma4Cfg()
+        _patch_gemma4_config_for_lm_eval(mock_cfg)
+        self.assertEqual(getattr(mock_cfg, "vocab_size", None), 262144)
+
+        # Verify unsupervised column calibration removes static slot bias
+        biased_nlls = [
+            [1.0 + 5.0, 2.0, 3.0, 4.0],
+            [2.0 + 5.0, 1.0, 3.0, 4.0],
+            [3.0 + 5.0, 2.0, 1.0, 4.0],
+            [4.0 + 5.0, 2.0, 3.0, 1.0],
+        ]
+        cal_z = _calibrate_and_standardize_suite_matrix(biased_nlls, calibrate_columns=True)
+        for row_idx, row in enumerate(cal_z):
+            best_col = min(range(4), key=lambda k: row[k])
+            self.assertEqual(best_col, row_idx)
 
     def test_10_family_benchmark_plots(self) -> None:
         """Verify all 4 comparison plots (PNG + SVG) generation."""
