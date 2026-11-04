@@ -37,13 +37,15 @@ from scripts.benchmark_vllm_concurrency import (
     render_vllm_markdown_report,
 )
 from scripts.run_benchmarks import (
-    _build_mmlu_pro_item,
-    _calibrate_and_standardize_suite_matrix,
     _patch_gemma4_config_for_lm_eval,
+    build_custom_lm_eval_task_dict,
+    compute_effective_task_limit,
     evaluate_retention_gate,
+    extract_lm_eval_detailed_metrics,
     generate_markdown_report,
     parse_args as parse_bench_args,
     parse_lm_eval_results_json,
+    resolve_lm_eval_task_specs,
 )
 from src.chat_template import (
     format_gemma4_chat,
@@ -484,10 +486,15 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         self.assertAlmostEqual(parsed_score, 64.50, places=2)
 
-        # Verify --model-family CLI alias and Gemma4Config text_config patch
-        parsed_cli = parse_bench_args(["--model-family", "both", "--eval-base"])
+        # Verify --model-family CLI alias, --no-reference-fallback default, and Gemma4Config text_config patch
+        parsed_cli = parse_bench_args(
+            ["--model-family", "both", "--eval-base", "--use-vllm", "--use-cached-eval"]
+        )
         self.assertEqual(parsed_cli.model_key, "both")
         self.assertTrue(parsed_cli.eval_base)
+        self.assertTrue(parsed_cli.no_reference_fallback)
+        self.assertTrue(parsed_cli.use_vllm)
+        self.assertTrue(parsed_cli.use_cached_eval)
 
         class _MockTextCfg:
             vocab_size = 262144
@@ -500,48 +507,46 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         _patch_gemma4_config_for_lm_eval(mock_cfg)
         self.assertEqual(getattr(mock_cfg, "vocab_size", None), 262144)
 
-        # Verify unsupervised column calibration removes static slot bias
-        biased_nlls = [
-            [1.0 + 5.0, 2.0, 3.0, 4.0],
-            [2.0 + 5.0, 1.0, 3.0, 4.0],
-            [3.0 + 5.0, 2.0, 1.0, 4.0],
-            [4.0 + 5.0, 2.0, 3.0, 1.0],
-        ]
-        cal_z = _calibrate_and_standardize_suite_matrix(biased_nlls, calibrate_columns=True)
-        for row_idx, row in enumerate(cal_z):
-            best_col = min(range(4), key=lambda k: row[k])
-            self.assertEqual(best_col, row_idx)
+        # Verify custom lm_eval task specs and subtask limit scaling
+        for custom_key in ("arabicmmlu", "madinahqa", "aratrust", "mgsm_ar"):
+            spec_dict = build_custom_lm_eval_task_dict(custom_key, num_fewshot=0)
+            self.assertIn("task", spec_dict)
+            self.assertIn("dataset_path", spec_dict)
+            self.assertIn("output_type", spec_dict)
 
-        # Verify MMLU-Pro item builder extracts intermediate CoT steps without leaking the answer letter
-        mmlu_pro_row = {
-            "category": "physics",
-            "question": "A 2 kg mass experiences a net force of 30 N. What is its acceleration?",
-            "options": [
-                "5 m/s^2",
-                "10 m/s^2",
-                "15 m/s^2",
-                "20 m/s^2",
-                "25 m/s^2",
-                "30 m/s^2",
-                "35 m/s^2",
-                "40 m/s^2",
-                "45 m/s^2",
-                "60 m/s^2",
-            ],
-            "answer_index": 2,
-            "cot_content": (
-                "A: Let's think step by step. By Newton's second law, force equals mass times acceleration (F = m * a). "
-                "Substituting F = 30 N and m = 2 kg gives a = 30 / 2. "
-                "Thus the acceleration is 15 m/s^2. The answer is (C)."
-            ),
+        self.assertEqual(compute_effective_task_limit("arabic_leaderboard_alghafa_light", 180), 20)
+        self.assertEqual(compute_effective_task_limit("arabic_leaderboard_acva_light", 200), 40)
+        self.assertEqual(compute_effective_task_limit("leaderboard_mmlu_pro", 200), 200)
+
+        tasks_acva, primary_acva, eff_acva = resolve_lm_eval_task_specs(
+            "arabic_leaderboard_acva_light", num_fewshot=0, limit=200
+        )
+        self.assertEqual(len(tasks_acva), 5)
+        self.assertEqual(primary_acva, "arabic_leaderboard_acva_light")
+        self.assertEqual(eff_acva, 40)
+
+        # Verify extract_lm_eval_detailed_metrics parses acc_norm, HardTop1 (acc), GoldNLL, and n_samples
+        detailed_payload = {
+            "results": {
+                "arabicmmlu_all": {
+                    "acc,none": 0.610,
+                    "acc_norm,none": 0.645,
+                }
+            },
+            "samples": {
+                "arabicmmlu_all": [
+                    {"target": 1, "resps": [[[-3.2, False]], [[-1.5, True]], [[-4.1, False]]]},
+                    {"target": 0, "resps": [[[-2.5, True]], [[-3.8, False]], [[-4.0, False]]]},
+                ]
+            },
         }
-        mp_item = _build_mmlu_pro_item(mmlu_pro_row, item_idx=1)
-        self.assertIsNotNone(mp_item)
-        assert mp_item is not None
-        self.assertEqual(len(mp_item["choices"]), 4)
-        self.assertEqual(mp_item["choices"][mp_item["gold_idx"]], "15 m/s^2")
-        self.assertIn("Newton's second law", mp_item["prompt_prefix"])
-        self.assertNotIn("The answer is (C)", mp_item["prompt_prefix"])
+        detailed = extract_lm_eval_detailed_metrics(
+            detailed_payload, task_name="arabicmmlu_all", metric_hint="acc_norm"
+        )
+        self.assertAlmostEqual(detailed["eval_score_pct"], 64.50, places=2)
+        self.assertAlmostEqual(detailed["top1_acc_pct"], 61.00, places=2)
+        self.assertAlmostEqual(detailed["nll"], 2.0000, places=4)
+        self.assertEqual(detailed["n_samples"], 2)
 
         # Verify finite-sample retention gate allows a 1-item discretization step at N=50
         finite_gate = evaluate_retention_gate(

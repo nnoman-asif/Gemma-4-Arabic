@@ -10,8 +10,8 @@ evaluation:
   output_report_path: "outputs/eval_reports/benchmark_comparison.md"
   output_json_path: "outputs/eval_reports/benchmark_results.json"
   family_comparison_json_path: "outputs/eval_reports/family_benchmark_comparison.json"
-  batch_size: 4
-  max_seq_length: 2048
+  batch_size: 16
+  max_seq_length: 4096
   dtype: "bfloat16"
   device: "cuda:0"
 
@@ -58,7 +58,7 @@ arabic_benchmarks:
     description: "Native 40-subject curriculum across KSA, Jordan, Egypt, and UAE (STEM, Islamic Studies, Arab Law, History, Civics)"
 
   MadinahQA:
-    lm_eval_task: "arabicmmlu_arabic_language_general,arabicmmlu_arabic_language_grammar"
+    lm_eval_task: "madinahqa"
     lighteval_task: "community|madinah_qa:_average|0"
     helm_task: "madinah_qa"
     qimma_task: "MBZUAI/MadinahQA"
@@ -67,7 +67,7 @@ arabic_benchmarks:
     description: "Classical and MSA Arabic language and grammar (Nahw, Sarf, Irab, Balagha)"
 
   AlGhafa:
-    lm_eval_task: "alghafa_native"
+    lm_eval_task: "arabic_leaderboard_alghafa_light"
     lighteval_task: "community|alghafa:_average|0"
     helm_task: "alghafa"
     qimma_task: "OALL/AlGhafa-Arabic-LLM-Benchmark-Native"
@@ -76,7 +76,7 @@ arabic_benchmarks:
     description: "Native MSA and Saudi/Gulf/Egyptian dialect reading comprehension, grounded QA, and sentiment"
 
   ACVA:
-    lm_eval_task: "acva"
+    lm_eval_task: "arabic_leaderboard_acva_light"
     lighteval_task: "community|acva:_average|0"
     helm_task: "acva"
     qimma_task: "OALL/ACVA"
@@ -85,7 +85,7 @@ arabic_benchmarks:
     description: "Arabic and Islamic cultural values alignment across 58 native subtasks"
 
   EXAMS-AR:
-    lm_eval_task: "exams_ar"
+    lm_eval_task: "arabic_exams"
     lighteval_task: "community|arabic_exams|0"
     helm_task: "arabic_exams"
     qimma_task: "OALL/Arabic_EXAMS"
@@ -97,41 +97,41 @@ arabic_benchmarks:
     lm_eval_task: "aratrust"
     lighteval_task: "community|aratrust:_average|0"
     helm_task: "aratrust"
-    qimma_task: "qimma/MCQ_AraTrust"
+    qimma_task: "asas-ai/AraTrust"
     metric: "acc_norm"
     num_fewshot: 0
     description: "Arabic safety, truthfulness, and trustworthiness evaluation"
 
   MGSM-Ar:
-    lm_eval_task: "mgsm_native_cot_ar"
+    lm_eval_task: "mgsm_ar"
     lighteval_task: "community|mgsm_ar|0"
     helm_task: "mgsm_ar"
-    qimma_task: "juletxara/mgsm"
+    qimma_task: "Omartificial-Intelligence-Space/Arabic-gsm8k-v2"
     metric: "exact_match"
     num_fewshot: 0
-    description: "Generative Arabic multi-step mathematical Chain-of-Thought (<|think|>) reasoning benchmark"
+    description: "Generative Arabic multi-step mathematical Chain-of-Thought reasoning benchmark"
 
 retention_anchors:
   MMLU-Pro:
     domain: "english_reasoning"
-    lm_eval_task: "mmlu_pro"
+    lm_eval_task: "leaderboard_mmlu_pro"
     metric: "acc"
-    num_fewshot: 0
+    num_fewshot: 5
     max_regression_pct: 1.50
     min_acceptable_score: 60.0
 
   GSM8K:
     domain: "math_reasoning"
     lm_eval_task: "gsm8k"
-    metric: "exact_match,strict-match"
-    num_fewshot: 0
+    metric: "exact_match,flexible-extract"
+    num_fewshot: 5
     max_regression_pct: 1.50
     min_acceptable_score: 70.0
 
   HumanEval:
     domain: "code_generation"
     lm_eval_task: "humaneval"
-    metric: "pass@1"
+    metric: "pass@1,create_test"
     num_fewshot: 0
     max_regression_pct: 1.50
     min_acceptable_score: 51.8

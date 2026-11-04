@@ -22,10 +22,11 @@ scipy>=1.11.0
 tqdm>=4.66.0
 
 # Evaluation, Plotting, and Testing
-lm-eval>=0.4.11
+lm-eval>=0.4.8
 evaluate>=0.4.3
 sqlitedict>=2.1.0
 pytablewriter>=1.2.0
 sacrebleu>=2.4.0
+rouge-score>=0.1.2
 matplotlib>=3.8.0
 pytest>=8.0.0

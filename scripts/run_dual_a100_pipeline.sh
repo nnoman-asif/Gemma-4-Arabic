@@ -116,7 +116,8 @@ echo "======================================================================"
   --config configs/eval_config.yaml \
   --model-key both \
   --eval-base \
-  --limit 50
+  --limit 200 \
+  --no-reference-fallback
 
 echo "======================================================================"
 echo "[Phase 4/4] Running Iso-Active Latency & Single-GPU vLLM (1-50 Users) Benchmarks"
