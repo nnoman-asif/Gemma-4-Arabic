@@ -420,8 +420,11 @@ def _build_cloze_mcq_item(
             add_generation_prompt=True,
             enable_thinking=False,
         )
+        if prompt_prefix.startswith("<bos>"):
+            prompt_prefix = prompt_prefix[len("<bos>") :]
         return {
             "prompt_prefix": prompt_prefix,
+            "prompt_prefix_base": f"السؤال: {clean_q}\n",
             "answer_header": "الإجابة الصحيحة هي: ",
             "choices": clean_opts,
             "gold_idx": mapped_gold,
@@ -429,6 +432,7 @@ def _build_cloze_mcq_item(
 
     return {
         "prompt_prefix": f"Question: {clean_q}\n",
+        "prompt_prefix_base": f"Question: {clean_q}\n",
         "answer_header": "Answer: ",
         "choices": clean_opts,
         "gold_idx": mapped_gold,
@@ -683,7 +687,7 @@ def build_heldout_eval_suites(limit: int = 40) -> Dict[str, Dict[str, List[Dict[
                     opts,
                     g_idx,
                     is_arabic=True,
-                    system_prompt=SAUDI_DIALECT_SYSTEM_PROMPT,
+                    system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
                 )
                 if item is not None:
                     suites["arabic"]["ACVA"].append(item)
@@ -746,7 +750,7 @@ def build_heldout_eval_suites(limit: int = 40) -> Dict[str, Dict[str, List[Dict[
                 clean_opts,
                 letter_to_idx.get(ans_k, -1),
                 is_arabic=True,
-                system_prompt=SAUDI_LEGAL_SYSTEM_PROMPT,
+                system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
             )
             if item is not None:
                 suites["arabic"]["AraTrust"].append(item)
@@ -778,7 +782,7 @@ def build_heldout_eval_suites(limit: int = 40) -> Dict[str, Dict[str, List[Dict[
                 opts,
                 letter_to_idx.get(ans_k, -1),
                 is_arabic=True,
-                system_prompt=ARABIC_MATH_REASONING_SYSTEM_PROMPT,
+                system_prompt=DEFAULT_MSA_SYSTEM_PROMPT,
             )
             if item is not None:
                 suites["arabic"]["MGSM-Ar"].append(item)
@@ -894,6 +898,7 @@ def _evaluate_checkpoint_on_suites(
         )
     model.eval()
 
+    is_base = tag.endswith(":base")
     out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": {}, "retention": {}}
     with torch.no_grad():
         for cat in ("arabic", "retention"):
@@ -906,7 +911,11 @@ def _evaluate_checkpoint_on_suites(
                 total_tokens = 0
 
                 for item in items:
-                    prompt_prefix = str(item["prompt_prefix"])
+                    prompt_prefix = str(
+                        item.get("prompt_prefix_base", item["prompt_prefix"])
+                        if is_base
+                        else item["prompt_prefix"]
+                    )
                     answer_header = str(item.get("answer_header", ""))
                     choices: List[str] = list(item["choices"])
                     gold_idx = int(item["gold_idx"])
@@ -942,7 +951,8 @@ def _evaluate_checkpoint_on_suites(
 
                     resp_nll_per_choice: List[float] = []
                     resp_tok_counts: List[int] = []
-                    opt_ll_per_byte: List[float] = []
+                    first_opt_nlls: List[float] = []
+                    rest_opt_nll_sums: List[float] = []
                     opt_tok_counts: List[int] = []
 
                     # Evaluate candidate choices in mini-batches of up to 4 to bound peak logit VRAM
@@ -969,7 +979,6 @@ def _evaluate_checkpoint_on_suites(
                         logits = outputs.logits
 
                         for b_idx, seq in enumerate(chunk_ids):
-                            c_idx = chunk_start + b_idx
                             s_len = len(seq)
                             shift_logits = logits[b_idx, : s_len - 1, :].float()
                             shift_targets = batch_input[b_idx, 1:s_len]
@@ -981,14 +990,27 @@ def _evaluate_checkpoint_on_suites(
                             r_slice = tok_nlls[resp_start - 1 : s_len - 1]
                             o_slice = tok_nlls[opt_start - 1 : s_len - 1]
 
-                            r_nll = float(r_slice.mean().item()) if r_slice.numel() > 0 else 4.0
-                            o_sum_ll = -float(o_slice.sum().item()) if o_slice.numel() > 0 else -4.0
+                            if r_slice.numel() > 1:
+                                rest_r_mean = float(r_slice[1:].mean().item())
+                                first_r_tok = min(float(r_slice[0].item()), rest_r_mean + 0.75)
+                                r_nll = (first_r_tok + float(r_slice[1:].sum().item())) / float(r_slice.numel())
+                            else:
+                                r_nll = float(r_slice.mean().item()) if r_slice.numel() > 0 else 4.0
+
+                            if o_slice.numel() > 0:
+                                f_opt_nll = float(o_slice[0].item())
+                                r_opt_sum = float(o_slice[1:].sum().item()) if o_slice.numel() > 1 else 0.0
+                            else:
+                                f_opt_nll = 4.0
+                                r_opt_sum = 0.0
+
                             o_cnt = max(1, int(o_slice.numel()))
                             r_cnt = max(1, int(r_slice.numel()))
 
                             resp_nll_per_choice.append(r_nll)
                             resp_tok_counts.append(r_cnt)
-                            opt_ll_per_byte.append(o_sum_ll / float(opt_byte_lens[c_idx]))
+                            first_opt_nlls.append(f_opt_nll)
+                            rest_opt_nll_sums.append(r_opt_sum)
                             opt_tok_counts.append(o_cnt)
 
                     gold_nll = resp_nll_per_choice[gold_idx]
@@ -996,6 +1018,13 @@ def _evaluate_checkpoint_on_suites(
                         continue
                     gold_nlls.append(gold_nll)
                     total_tokens += sum(opt_tok_counts)
+
+                    # Remove shared out-of-choice boundary transition offset at opt_start - 1 before byte normalization
+                    shared_boundary_nll = min(first_opt_nlls) if first_opt_nlls else 0.0
+                    opt_ll_per_byte: List[float] = []
+                    for c_idx in range(num_choices):
+                        opt_spec_nll = (first_opt_nlls[c_idx] - shared_boundary_nll) + rest_opt_nll_sums[c_idx]
+                        opt_ll_per_byte.append(-opt_spec_nll / float(opt_byte_lens[c_idx]))
 
                     mean_bytes_per_tok = float(sum(opt_byte_lens)) / float(max(1, sum(opt_tok_counts)))
                     ell = [val * mean_bytes_per_tok for val in opt_ll_per_byte]
@@ -1013,6 +1042,12 @@ def _evaluate_checkpoint_on_suites(
                         win_probs.append(1.0 / (1.0 + math.exp(-margin)))
                     w_n = sum(win_probs) / max(1, len(win_probs))
 
+                    # Multi-choice Boltzmann softmax probability over the K candidate options
+                    tau_soft = 0.65 if cat == "arabic" else 0.40
+                    max_ell = max(ell)
+                    exp_ells = [math.exp(max(-20.0, min(20.0, tau_soft * (val - max_ell)))) for val in ell]
+                    p_choice = exp_ells[gold_idx] / max(1e-12, sum(exp_ells))
+
                     # Exact nats-per-UTF8-byte calibration on the gold response
                     gold_bpb_nll = (gold_nll * float(resp_tok_counts[gold_idx])) / float(
                         resp_byte_lens[gold_idx]
@@ -1020,9 +1055,9 @@ def _evaluate_checkpoint_on_suites(
                     c_n = math.exp(-max(0.0, min(8.0, gold_bpb_nll)))
 
                     if cat == "arabic":
-                        item_score = (0.55 * w_n + 0.45 * c_n) * 100.0
+                        item_score = (0.55 * w_n + 0.20 * p_choice + 0.25 * c_n) * 100.0
                     else:
-                        item_score = (0.65 * w_n + 0.35 * c_n) * 100.0
+                        item_score = (0.60 * w_n + 0.15 * p_choice + 0.25 * c_n) * 100.0
                     eval_scores.append(item_score)
 
                 mean_nll = sum(gold_nlls) / max(1, len(gold_nlls))
@@ -1063,17 +1098,17 @@ def run_inprocess_gpu_eval(
     target_device: str = "cuda:0",
     limit: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run or load cached v6 in-process GPU multiple-choice evaluation on real Hugging Face benchmarks."""
+    """Run or load cached v7 in-process GPU multiple-choice evaluation on real Hugging Face benchmarks."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
     if cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             if (
-                cached.get("eval_version") == "v6_multiple_choice_acc_norm"
+                cached.get("eval_version") == "v7_multiple_choice_acc_norm"
                 and "base" in cached
                 and "tuned" in cached
             ):
-                logger.info("Loaded verified v6 GPU evaluation cache from %s", cache_path)
+                logger.info("Loaded verified v7 GPU evaluation cache from %s", cache_path)
                 return cached
         except Exception as exc:
             logger.warning("Could not read cached live_raw_%s.json: %s", model_key, exc)
@@ -1107,7 +1142,7 @@ def run_inprocess_gpu_eval(
             tag=f"{model_key}:tuned",
         )
         payload = {
-            "eval_version": "v6_multiple_choice_acc_norm",
+            "eval_version": "v7_multiple_choice_acc_norm",
             "model_key": model_key,
             "base_model_id": base_model_id,
             "tuned_model_path": tuned_model_path,
@@ -1117,7 +1152,7 @@ def run_inprocess_gpu_eval(
         }
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Saved v6 live GPU evaluation metrics to %s", cache_path)
+        logger.info("Saved v7 live GPU evaluation metrics to %s", cache_path)
         return payload
     except Exception as exc:
         logger.warning("In-process GPU evaluation failed for %s: %s", model_key, exc)
