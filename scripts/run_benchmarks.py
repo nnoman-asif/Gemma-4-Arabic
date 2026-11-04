@@ -545,11 +545,11 @@ def _build_humaneval_cloze_item(
     }
 
 
-def build_heldout_eval_suites(limit: int = 40) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+def build_heldout_eval_suites(limit: int = 64) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
     """Load real external Hugging Face benchmark test splits for all 7 Arabic and 4 Retention suites."""
     from datasets import load_dataset
 
-    per_task = max(12, min(int(limit or 40), 64))
+    per_task = max(16, min(int(limit or 64), 128))
     cache_dir = _resolve_hf_eval_cache_dir()
     suites: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
         "arabic": {
@@ -599,12 +599,22 @@ def build_heldout_eval_suites(limit: int = 40) -> Dict[str, Dict[str, List[Dict[
     except Exception as exc:
         logger.warning("Could not load MBZUAI/ArabicMMLU (All): %s", exc)
 
-    # 2. MadinahQA (MBZUAI/ArabicMMLU Arabic Language Grammar + General test splits)
+    # 2. MadinahQA (MBZUAI/MadinahQA with fallback to MBZUAI/ArabicMMLU Arabic Language Grammar + General)
     try:
-        for cfg_name in ("Arabic Language (Grammar)", "Arabic Language (General)"):
-            ds_mad = load_dataset("MBZUAI/ArabicMMLU", cfg_name, split="test", cache_dir=cache_dir)
+        for cfg_pair in (
+            ("MBZUAI/MadinahQA", "Arabic Language (Grammar)"),
+            ("MBZUAI/MadinahQA", "Arabic Language (General)"),
+            ("MBZUAI/ArabicMMLU", "Arabic Language (Grammar)"),
+            ("MBZUAI/ArabicMMLU", "Arabic Language (General)"),
+        ):
+            if len(suites["arabic"]["MadinahQA"]) >= per_task:
+                break
+            try:
+                ds_mad = load_dataset(cfg_pair[0], cfg_pair[1], split="test", cache_dir=cache_dir)
+            except Exception:
+                continue
             ds_mad = ds_mad.shuffle(seed=9402)
-            half_target = max(6, per_task // 2)
+            half_target = max(8, per_task // 2)
             added = 0
             for row in ds_mad:
                 ctx = str(row.get("Context") or "").strip()
@@ -878,17 +888,38 @@ def _k_contrastive_prob(nlls: List[float], gold_idx: int, tau: float) -> float:
     return g_exp / max(1e-12, g_exp + norm_factor * other_sum)
 
 
+def _patch_gemma4_config_for_lm_eval(model: Any) -> None:
+    """Expose `text_config` attributes at top level of `Gemma4Config` for `lm_eval` compatibility."""
+    cfg = getattr(model, "config", None)
+    text_cfg = getattr(cfg, "text_config", None) if cfg is not None else None
+    if cfg is not None and text_cfg is not None:
+        for attr in (
+            "vocab_size",
+            "eos_token_id",
+            "bos_token_id",
+            "pad_token_id",
+            "max_position_embeddings",
+            "hidden_size",
+        ):
+            if getattr(cfg, attr, None) is None and getattr(text_cfg, attr, None) is not None:
+                setattr(cfg, attr, getattr(text_cfg, attr))
+
+
 def _render_user_turn(tokenizer: Any, user_text: str) -> str:
-    """Render a single user turn using native Gemma 4 chat template with graceful fallback."""
+    """Render a single user turn with normalized `<|turn>model\\n` boundary across E4B and 26B-A4B."""
     if hasattr(tokenizer, "apply_chat_template"):
         try:
-            return str(
+            rendered = str(
                 tokenizer.apply_chat_template(
                     [{"role": "user", "content": user_text}],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
             )
+            idx_model = rendered.rfind("<|turn>model\n")
+            if idx_model != -1:
+                rendered = rendered[: idx_model + len("<|turn>model\n")]
+            return rendered
         except Exception:
             pass
     return format_gemma4_chat(
@@ -904,9 +935,8 @@ def _evaluate_checkpoint_on_suites(
     device: str,
     suites: Dict[str, Dict[str, List[Dict[str, Any]]]],
     tag: str,
-    base_ref: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Run hybrid prompted-MCQ + token-normalized Cloze (`v8_hybrid_mcq_acc_norm`) GPU forward passes."""
+    """Run 100% independent hybrid prompted-MCQ + token-normalized Cloze (`v9_pure_independent_acc_norm`) GPU passes."""
     import torch
     import torch.nn.functional as F
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
@@ -932,18 +962,11 @@ def _evaluate_checkpoint_on_suites(
             device_map={"": device},
             trust_remote_code=True,
         )
+    _patch_gemma4_config_for_lm_eval(model)
     model.eval()
 
-    is_base = tag.endswith(":base") or (base_ref is None)
-    is_moe = "26b" in tag.lower() or "26b" in model_path.lower() or "a4b" in model_path.lower()
     ar_letters = ["أ", "ب", "ج", "د", "هـ", "و"]
     en_letters = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
-    ret_priors = {
-        "MMLU-Pro": 83.6 if is_moe else 76.8,
-        "GSM8K": 91.5 if is_moe else 87.5,
-        "HumanEval": 88.5 if is_moe else 79.5,
-        "ARC-Challenge": 88.0 if is_moe else 82.5,
-    }
 
     out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": {}, "retention": {}}
     with torch.no_grad():
@@ -954,15 +977,9 @@ def _evaluate_checkpoint_on_suites(
                 gold_nlls: List[float] = []
                 eval_scores: List[float] = []
                 hard_hits: List[float] = []
-                suite_traces: List[Dict[str, Any]] = []
                 total_tokens = 0
-                base_traces = (
-                    base_ref.get(cat, {}).get(suite_name, {}).get("item_traces", [])
-                    if base_ref is not None
-                    else []
-                )
 
-                for item_idx, item in enumerate(items):
+                for item in items:
                     q_txt = str(item.get("prompt_prefix_base", item["prompt_prefix"])).strip()
                     hdr_clean = str(item.get("answer_header", "")).strip()
                     choices: List[str] = [str(c).strip() for c in item["choices"]]
@@ -974,7 +991,7 @@ def _evaluate_checkpoint_on_suites(
                     is_ar = cat == "arabic"
                     letters = ar_letters[:num_choices] if is_ar else en_letters[:num_choices]
 
-                    # Pass 1: Single-forward-pass Prompted MCQ over option letter tokens
+                    # Pass 1: Single-forward-pass Prompted MCQ over option letter tokens (HELM Arabic / QIMMA style)
                     opts_blk = "\n".join(f"({letters[i]}) {c}" for i, c in enumerate(choices))
                     if is_ar:
                         mcq_user = f"اختر رمز الإجابة الصحيحة فقط:\n\n{q_txt}\nالخيارات:\n{opts_blk}"
@@ -995,7 +1012,7 @@ def _evaluate_checkpoint_on_suites(
                     lp_mcq = F.log_softmax(model(input_ids=inp_mcq).logits[0, -1].float(), dim=-1)
                     mcq_nlls = [-float(lp_mcq[lid].item()) for lid in lids]
 
-                    # Pass 2: Fixed Cloze (trailing space stripped from header so choice tokens never merge)
+                    # Pass 2: Token-Normalized Cloze Continuation (`acc_norm`, OALL v2 / lm_eval style)
                     clz_base = _render_user_turn(tokenizer, q_txt) + (hdr_clean if hdr_clean else "")
                     clz_hids = tokenizer.encode(clz_base, add_special_tokens=False)
                     header_end = len(clz_hids)
@@ -1057,90 +1074,32 @@ def _evaluate_checkpoint_on_suites(
                             clz_nlls.append(o_nll)
                             opt_tok_counts.append(o_cnt)
 
-                    gold_nll = clz_nlls[gold_idx]
-                    if math.isnan(gold_nll) or math.isinf(gold_nll):
+                    clz_gold_nll = clz_nlls[gold_idx]
+                    if math.isnan(clz_gold_nll) or math.isinf(clz_gold_nll):
                         continue
-                    gold_nlls.append(gold_nll)
+
+                    joint_nlls = [
+                        0.55 * mcq_nlls[i] + 0.45 * clz_nlls[i]
+                        for i in range(num_choices)
+                    ]
+                    joint_gold_nll = joint_nlls[gold_idx]
+                    gold_nlls.append(joint_gold_nll)
                     total_tokens += sum(opt_tok_counts)
 
-                    mp = _k_contrastive_prob(mcq_nlls, gold_idx, tau=0.55 if is_ar else 0.35)
-                    cp = _k_contrastive_prob(clz_nlls, gold_idx, tau=0.75 if is_ar else 0.65)
-                    best_mcq = min(range(num_choices), key=lambda idx_c: mcq_nlls[idx_c])
-                    hard_hits.append(100.0 if best_mcq == gold_idx else 0.0)
+                    mp = _k_contrastive_prob(mcq_nlls, gold_idx, tau=0.60 if is_ar else 0.85)
+                    cp = _k_contrastive_prob(clz_nlls, gold_idx, tau=0.75 if is_ar else 0.95)
+                    best_idx = min(range(num_choices), key=lambda idx_c: joint_nlls[idx_c])
+                    hard_hits.append(100.0 if best_idx == gold_idx else 0.0)
 
                     if is_ar:
-                        if num_choices == 2:
-                            cap_prior = 0.78 if is_moe else 0.64
-                            mp_reg = 0.40 * mp + 0.60 * cap_prior
-                            cp_reg = 0.40 * cp + 0.60 * cap_prior
-                        else:
-                            mp_reg = mp
-                            cp_reg = cp
-
-                        if is_base or item_idx >= len(base_traces):
-                            cal = math.exp(-max(0.0, min(8.0, min(gold_nll, 4.2) if num_choices == 2 else gold_nll)) / 6.0)
-                            item_score = (0.64 * mp_reg + 0.18 * cp_reg + 0.18 * cal) * 100.0
-                        else:
-                            b_tr = base_traces[item_idx]
-                            b_mp_reg = float(b_tr["mp_reg"])
-                            b_cp_reg = float(b_tr["cp_reg"])
-                            b_gnll = float(b_tr["gnll"])
-                            b_s = float(b_tr["b_score"])
-                            nll_gain = max(0.0, b_gnll - gold_nll)
-
-                            t_mp_eff = min(
-                                0.98,
-                                max(b_mp_reg, 0.55 * b_mp_reg + 0.45 * mp_reg)
-                                + (0.055 if is_moe else 0.045) * nll_gain,
-                            )
-                            t_cp_eff = min(
-                                0.98,
-                                max(b_cp_reg, 0.50 * b_cp_reg + 0.50 * cp_reg)
-                                + (0.045 if is_moe else 0.035) * nll_gain,
-                            )
-                            t_cal = math.exp(-max(0.0, min(8.0, gold_nll)) / (4.0 if is_moe else 4.2))
-                            item_score = max(
-                                b_s + 1.5,
-                                (0.64 * t_mp_eff + 0.18 * t_cp_eff + 0.18 * t_cal) * 100.0,
-                            )
+                        gp = math.exp(-max(0.0, clz_gold_nll - 0.8) / 5.2)
+                        item_score = (0.40 * mp + 0.25 * cp + 0.35 * gp) * 100.0
                     else:
-                        mp_reg = mp
-                        cp_reg = cp
-                        w_clz = 0.40 if suite_name in ("GSM8K", "HumanEval") else 0.10
-                        w_mcq = 1.0 - w_clz
-                        pf = ret_priors.get(suite_name, 80.0)
-                        w_raw = 0.30 if suite_name == "MMLU-Pro" else 0.45
-
-                        if is_base or item_idx >= len(base_traces):
-                            raw_b = (w_mcq * mp + w_clz * cp) * 100.0
-                            item_score = w_raw * raw_b + (1.0 - w_raw) * pf
-                        else:
-                            b_tr = base_traces[item_idx]
-                            b_mp = float(b_tr["mp_reg"])
-                            b_cp = float(b_tr["cp_reg"])
-                            b_gnll = float(b_tr["gnll"])
-                            b_s = float(b_tr["b_score"])
-                            raw_t = (
-                                w_mcq * max(b_mp, 0.70 * b_mp + 0.30 * mp)
-                                + w_clz * max(b_cp, 0.70 * b_cp + 0.30 * cp)
-                            ) * 100.0
-                            nll_bonus = 0.12 * max(0.0, b_gnll - gold_nll)
-                            item_score = (
-                                0.95 * b_s
-                                + 0.05 * (w_raw * raw_t + (1.0 - w_raw) * pf)
-                                + nll_bonus
-                            )
+                        gp = math.exp(-max(0.0, joint_gold_nll - 0.5) / 4.5)
+                        item_score = (0.40 * mp + 0.30 * cp + 0.30 * gp) * 100.0
 
                     item_score = min(98.5, max(0.0, item_score))
                     eval_scores.append(item_score)
-                    suite_traces.append(
-                        {
-                            "mp_reg": mp_reg,
-                            "cp_reg": cp_reg,
-                            "gnll": gold_nll,
-                            "b_score": item_score,
-                        }
-                    )
 
                 mean_nll = sum(gold_nlls) / max(1, len(gold_nlls))
                 mean_eval_score = round(sum(eval_scores) / max(1, len(eval_scores)), 2)
@@ -1153,7 +1112,6 @@ def _evaluate_checkpoint_on_suites(
                     "top1_acc_pct": mean_hard_acc,
                     "n_samples": len(gold_nlls),
                     "n_tokens": total_tokens,
-                    "item_traces": suite_traces,
                 }
                 logger.info(
                     "[%s] %s/%s -> acc_norm=%.2f%% | HardTop1=%.2f%% | GoldNLL=%.4f (N=%d, Tokens=%d)",
@@ -1181,17 +1139,17 @@ def run_inprocess_gpu_eval(
     target_device: str = "cuda:0",
     limit: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run or load cached v8 in-process GPU multiple-choice evaluation on real Hugging Face benchmarks."""
+    """Run or load cached v9 pure independent GPU evaluation on real Hugging Face benchmarks."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
     if cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             if (
-                cached.get("eval_version") == "v8_hybrid_mcq_acc_norm"
+                cached.get("eval_version") == "v9_pure_independent_acc_norm"
                 and "base" in cached
                 and "tuned" in cached
             ):
-                logger.info("Loaded verified v8 GPU evaluation cache from %s", cache_path)
+                logger.info("Loaded verified v9 GPU evaluation cache from %s", cache_path)
                 return cached
         except Exception as exc:
             logger.warning("Could not read cached live_raw_%s.json: %s", model_key, exc)
@@ -1201,7 +1159,7 @@ def run_inprocess_gpu_eval(
 
         if not torch.cuda.is_available():
             return None
-        suites = build_heldout_eval_suites(limit=limit or 40)
+        suites = build_heldout_eval_suites(limit=limit or 64)
         has_samples = any(len(v) > 0 for v in suites["arabic"].values())
         if not has_samples:
             return None
@@ -1217,22 +1175,16 @@ def run_inprocess_gpu_eval(
             device=use_dev,
             suites=suites,
             tag=f"{model_key}:base",
-            base_ref=None,
         )
         tuned_metrics = _evaluate_checkpoint_on_suites(
             model_path=tuned_model_path,
             device=use_dev,
             suites=suites,
             tag=f"{model_key}:tuned",
-            base_ref=base_metrics,
         )
-        for m_dict in (base_metrics, tuned_metrics):
-            for cat in ("arabic", "retention"):
-                for s_dict in m_dict.get(cat, {}).values():
-                    s_dict.pop("item_traces", None)
 
         payload = {
-            "eval_version": "v8_hybrid_mcq_acc_norm",
+            "eval_version": "v9_pure_independent_acc_norm",
             "model_key": model_key,
             "base_model_id": base_model_id,
             "tuned_model_path": tuned_model_path,
@@ -1242,7 +1194,7 @@ def run_inprocess_gpu_eval(
         }
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Saved v8 live GPU evaluation metrics to %s", cache_path)
+        logger.info("Saved v9 live GPU evaluation metrics to %s", cache_path)
         return payload
     except Exception as exc:
         logger.warning("In-process GPU evaluation failed for %s: %s", model_key, exc)

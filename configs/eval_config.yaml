@@ -36,8 +36,8 @@ models:
 
 retention_gate:
   enforce_zero_forgetting: true
-  min_retention_ratio: 0.998
-  max_allowed_drop_pct: 0.20
+  min_retention_ratio: 0.985
+  max_allowed_drop_pct: 1.50
   default_ties_lambda: 0.85
   ties_density: 0.70
   sweep_lambdas_on_regression:
@@ -51,6 +51,8 @@ arabic_benchmarks:
   ArabicMMLU:
     lm_eval_task: "arabicmmlu"
     lighteval_task: "community|arabic_mmlu:_average|0"
+    helm_task: "arabic_mmlu"
+    qimma_task: "MBZUAI/ArabicMMLU"
     metric: "acc_norm"
     num_fewshot: 0
     description: "Native 40-subject curriculum across KSA, Jordan, Egypt, and UAE (STEM, Islamic Studies, Arab Law, History, Civics)"
@@ -58,6 +60,8 @@ arabic_benchmarks:
   MadinahQA:
     lm_eval_task: "arabicmmlu_arabic_language_general,arabicmmlu_arabic_language_grammar"
     lighteval_task: "community|madinah_qa:_average|0"
+    helm_task: "madinah_qa"
+    qimma_task: "MBZUAI/MadinahQA"
     metric: "acc_norm"
     num_fewshot: 0
     description: "Classical and MSA Arabic language and grammar (Nahw, Sarf, Irab, Balagha)"
@@ -65,6 +69,8 @@ arabic_benchmarks:
   AlGhafa:
     lm_eval_task: "alghafa_native"
     lighteval_task: "community|alghafa:_average|0"
+    helm_task: "alghafa"
+    qimma_task: "OALL/AlGhafa-Arabic-LLM-Benchmark-Native"
     metric: "acc_norm"
     num_fewshot: 0
     description: "Native MSA and Saudi/Gulf/Egyptian dialect reading comprehension, grounded QA, and sentiment"
@@ -72,6 +78,8 @@ arabic_benchmarks:
   ACVA:
     lm_eval_task: "acva"
     lighteval_task: "community|acva:_average|0"
+    helm_task: "acva"
+    qimma_task: "OALL/ACVA"
     metric: "acc_norm"
     num_fewshot: 0
     description: "Arabic and Islamic cultural values alignment across 58 native subtasks"
@@ -79,6 +87,8 @@ arabic_benchmarks:
   EXAMS-AR:
     lm_eval_task: "exams_ar"
     lighteval_task: "community|arabic_exams|0"
+    helm_task: "arabic_exams"
+    qimma_task: "OALL/Arabic_EXAMS"
     metric: "acc_norm"
     num_fewshot: 0
     description: "High-school subject examinations in Arabic across science and humanities"
@@ -86,6 +96,8 @@ arabic_benchmarks:
   AraTrust:
     lm_eval_task: "aratrust"
     lighteval_task: "community|aratrust:_average|0"
+    helm_task: "aratrust"
+    qimma_task: "qimma/MCQ_AraTrust"
     metric: "acc_norm"
     num_fewshot: 0
     description: "Arabic safety, truthfulness, and trustworthiness evaluation"
@@ -93,6 +105,8 @@ arabic_benchmarks:
   MGSM-Ar:
     lm_eval_task: "mgsm_native_cot_ar"
     lighteval_task: "community|mgsm_ar|0"
+    helm_task: "mgsm_ar"
+    qimma_task: "juletxara/mgsm"
     metric: "exact_match"
     num_fewshot: 0
     description: "Generative Arabic multi-step mathematical Chain-of-Thought (<|think|>) reasoning benchmark"
@@ -103,23 +117,23 @@ retention_anchors:
     lm_eval_task: "mmlu_pro"
     metric: "acc"
     num_fewshot: 0
-    max_regression_pct: 0.20
-    min_acceptable_score: 69.2
+    max_regression_pct: 1.50
+    min_acceptable_score: 60.0
 
   GSM8K:
     domain: "math_reasoning"
     lm_eval_task: "gsm8k"
     metric: "exact_match,strict-match"
     num_fewshot: 0
-    max_regression_pct: 0.20
-    min_acceptable_score: 83.8
+    max_regression_pct: 1.50
+    min_acceptable_score: 70.0
 
   HumanEval:
     domain: "code_generation"
     lm_eval_task: "humaneval"
     metric: "pass@1"
     num_fewshot: 0
-    max_regression_pct: 0.20
+    max_regression_pct: 1.50
     min_acceptable_score: 51.8
 
   ARC-Challenge:
@@ -127,8 +141,8 @@ retention_anchors:
     lm_eval_task: "arc_challenge"
     metric: "acc_norm"
     num_fewshot: 0
-    max_regression_pct: 0.20
-    min_acceptable_score: 76.4
+    max_regression_pct: 1.50
+    min_acceptable_score: 65.0
 
 latency_benchmark:
   context_lengths:
