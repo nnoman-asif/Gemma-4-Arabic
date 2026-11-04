@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v12_lm_eval_standard"
+EVAL_CACHE_VERSION = "v13_lm_eval_standard"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -216,6 +217,66 @@ def _process_aratrust_docs(dataset: Any) -> Any:
     return filtered.map(_map_row)
 
 
+_EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
+    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
+    "01234567890123456789",
+)
+
+
+def _normalize_arabic_digits(text: str) -> str:
+    """Translate Eastern Arabic (`٠-٩`) and Extended Arabic-Indic (`۰-۹`) digits to ASCII `0-9`."""
+    return str(text or "").translate(_EASTERN_ARABIC_DIGIT_MAP)
+
+
+def _extract_mgsm_ar_target_number(answer: str) -> str:
+    """Extract normalized ASCII target number from `Arabic-gsm8k-v2` gold `answer` strings."""
+    normalized = _normalize_arabic_digits(str(answer or "")).strip()
+    m = re.search(r"#+\s*(-?[\d,]+(?:\.\d+)?)", normalized)
+    if m:
+        return m.group(1).replace(",", "")
+    nums = re.findall(r"-?[\d,]+(?:\.\d+)?", normalized)
+    if nums:
+        return nums[-1].replace(",", "")
+    return normalized
+
+
+def _process_mgsm_ar_docs(dataset: Any) -> Any:
+    """Normalize Eastern Arabic digits and extract `target_number` for `Omartificial-Intelligence-Space/Arabic-gsm8k-v2`."""
+
+    def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
+        raw_ans = _normalize_arabic_digits(str(doc.get("answer") or "")).strip()
+        target_num = _extract_mgsm_ar_target_number(raw_ans)
+        # Ensure few-shot demonstrations from main_train end with canonical `#### <target_number>`
+        if re.search(r"#+\s*-?[\d,]+(?:\.\d+)?", raw_ans):
+            norm_ans = re.sub(r"#+\s*(-?[\d,]+(?:\.\d+)?)\s*$", f"#### {target_num}", raw_ans)
+        elif target_num:
+            norm_ans = f"{raw_ans}\n#### {target_num}"
+        else:
+            norm_ans = raw_ans
+        return {
+            "question": str(doc.get("question") or "").strip(),
+            "answer": norm_ans,
+            "target_number": target_num,
+        }
+
+    return dataset.map(_map_row)
+
+
+def _normalize_arabic_digits_filter(
+    resps: List[Any],
+    docs: List[Dict[str, Any]],
+) -> List[List[str]]:
+    """Custom `lm_eval` filter that converts Eastern Arabic digits (`٠-٩`) in model generations to ASCII `0-9`."""
+    _ = docs
+    out: List[List[str]] = []
+    for inst in resps:
+        if isinstance(inst, (list, tuple)):
+            out.append([_normalize_arabic_digits(str(r)) for r in inst])
+        else:
+            out.append([_normalize_arabic_digits(str(inst))])
+    return out
+
+
 def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict[str, Any]:
     """Return a native `lm_eval` `ConfigurableTask` dictionary for custom Arabic suites."""
     key = task_name.strip().lower()
@@ -288,8 +349,14 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "fewshot_split": "main_train",
             "num_fewshot": int(num_fewshot),
             "output_type": "generate_until",
+            "process_docs": _process_mgsm_ar_docs,
             "doc_to_text": "السؤال: {{question}}\nالإجابة:",
-            "doc_to_target": "{{answer}}",
+            "doc_to_target": "{{target_number}}",
+            "fewshot_config": {
+                "sampler": "default",
+                "split": "main_train",
+                "doc_to_target": "{{answer}}",
+            },
             "generation_kwargs": {
                 "until": ["السؤال:", "</s>", "<|im_end|>", "<turn|>"],
                 "do_sample": False,
@@ -301,6 +368,10 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                     "name": "flexible-extract",
                     "filter": [
                         {
+                            "function": "custom",
+                            "filter_fn": _normalize_arabic_digits_filter,
+                        },
+                        {
                             "function": "regex",
                             "group_select": -1,
                             "regex_pattern": "(-?[$0-9.,]{2,})|(-?[0-9]+)",
@@ -311,6 +382,10 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                 {
                     "name": "strict-match",
                     "filter": [
+                        {
+                            "function": "custom",
+                            "filter_fn": _normalize_arabic_digits_filter,
+                        },
                         {
                             "function": "regex",
                             "regex_pattern": "#### (\\-?[0-9\\.\\,]+)",
@@ -326,7 +401,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                     "higher_is_better": True,
                     "ignore_case": True,
                     "ignore_punctuation": True,
-                    "regexes_to_ignore": [",", "\\$", "(?s).*#### ", "\\.$"],
+                    "regexes_to_ignore": [",", "\\$", "\\.$"],
                 }
             ],
             "metadata": {"version": 1.0},
@@ -686,30 +761,71 @@ def _evaluate_checkpoint_with_lm_eval(
     if use_vllm:
         from lm_eval.models.vllm_causallms import VLLM
 
-        lm_obj = VLLM(
-            pretrained=model_path,
-            dtype="bfloat16",
-            trust_remote_code=True,
-            gpu_memory_utilization=0.85,
-            max_model_len=max_seq_len,
-            batch_size="auto",
-        )
+        model_dir = pathlib.Path(model_path)
+        if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
+            adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+            base_model_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+            lm_obj = VLLM(
+                pretrained=base_model_path,
+                lora_local_path=str(model_path),
+                dtype="bfloat16",
+                trust_remote_code=True,
+                gpu_memory_utilization=0.85,
+                max_model_len=max_seq_len,
+                batch_size="auto",
+            )
+        else:
+            lm_obj = VLLM(
+                pretrained=model_path,
+                dtype="bfloat16",
+                trust_remote_code=True,
+                gpu_memory_utilization=0.85,
+                max_model_len=max_seq_len,
+                batch_size="auto",
+            )
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model_dir = pathlib.Path(model_path)
+        is_peft_adapter = (model_dir / "adapter_config.json").exists() and not (
+            model_dir / "config.json"
+        ).exists()
+        load_target_path = model_path
+        if is_peft_adapter:
+            adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+            load_target_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+            if not load_target_path:
+                raise ValueError(
+                    f"Unmerged PEFT adapter directory '{model_path}' is missing 'base_model_name_or_path' in adapter_config.json"
+                )
+            logger.info(
+                "[%s] Detected unmerged PEFT adapter at %s -> loading base model %s",
+                tag,
+                model_path,
+                load_target_path,
+            )
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        except Exception:
+            tokenizer = AutoTokenizer.from_pretrained(load_target_path, trust_remote_code=True)
+
         try:
             model_obj = AutoModelForImageTextToText.from_pretrained(
-                model_path,
+                load_target_path,
                 torch_dtype=torch.bfloat16,
                 device_map={"": device},
                 trust_remote_code=True,
             )
         except Exception:
             model_obj = AutoModelForCausalLM.from_pretrained(
-                model_path,
+                load_target_path,
                 torch_dtype=torch.bfloat16,
                 device_map={"": device},
                 trust_remote_code=True,
             )
+        if is_peft_adapter:
+            from peft import PeftModel
+
+            model_obj = PeftModel.from_pretrained(model_obj, model_path)
         _patch_gemma4_config_for_lm_eval(model_obj)
         model_obj.eval()
         lm_obj = HFLM(

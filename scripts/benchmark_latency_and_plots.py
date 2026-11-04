@@ -286,6 +286,9 @@ def _save_fig_pair(fig: Any, stem_path: pathlib.Path, dpi: int = 300) -> Tuple[s
 
 def _load_real_eval_scores(eval_cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Load evaluated benchmark scores from outputs/eval_reports if present on disk."""
+    _ = eval_cfg
+    e4b_data: Dict[str, Any] = {}
+    moe_data: Dict[str, Any] = {}
     for rel_path in (
         "outputs/eval_reports/family_benchmark_comparison.json",
         "outputs/eval_reports/benchmark_results.json",
@@ -295,11 +298,21 @@ def _load_real_eval_scores(eval_cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Di
             try:
                 data = json.loads(cand.read_text(encoding="utf-8"))
                 models_block = data.get("models", {})
-                if "e4b" in models_block and "26b_a4b" in models_block:
-                    return models_block["e4b"], models_block["26b_a4b"]
+                if isinstance(models_block, dict) and ("e4b" in models_block or "26b_a4b" in models_block):
+                    if "e4b" in models_block and not e4b_data:
+                        e4b_data = models_block["e4b"]
+                    if "26b_a4b" in models_block and not moe_data:
+                        moe_data = models_block["26b_a4b"]
+                    if e4b_data and moe_data:
+                        return e4b_data, moe_data
+                model_key = data.get("model_key")
+                if model_key == "e4b" and not e4b_data:
+                    e4b_data = data
+                elif model_key == "26b_a4b" and not moe_data:
+                    moe_data = data
             except Exception as exc:
                 logger.warning("Could not parse %s: %s", cand, exc)
-    return {}, {}
+    return e4b_data, moe_data
 
 
 def _load_training_curve_series(
@@ -371,6 +384,13 @@ def generate_all_family_plots(
 
     ar_benchmarks = eval_cfg.get("arabic_benchmarks", {})
     ret_anchors = eval_cfg.get("retention_anchors", {})
+    min_ret_ratio = float(
+        eval_cfg.get("evaluation", {}).get(
+            "min_retention_ratio",
+            eval_cfg.get("retention_gate", {}).get("min_retention_ratio", 0.985),
+        )
+    )
+    gate_pct = min_ret_ratio * 100.0
     real_e4b, real_moe = _load_real_eval_scores(eval_cfg)
 
     try:
@@ -382,7 +402,7 @@ def generate_all_family_plots(
         logger.warning("matplotlib not found; using pure-Python SVG/PNG fallback generator.")
         for stem, title, sub in [
             ("oall_v2_arabic_comparison", "Gemma-4-Arabic Family: 7 Arabic & Saudi Benchmarks", "E4B Base vs E4B Arabic-It vs 26B-A4B Base vs 26B-A4B Arabic-It"),
-            ("zero_forgetting_retention_shield", "Zero-Forgetting Retention Gate (English / Math / Code)", "Min Retention Ratio >= 99.8% across MMLU-Pro, GSM8K, HumanEval, ARC-C"),
+            ("zero_forgetting_retention_shield", "Zero-Forgetting Retention Gate (English / Math / Code)", f"Min Retention Ratio >= {gate_pct:.1f}% across MMLU-Pro, GSM8K, HumanEval, ARC-C"),
             ("iso_active_latency_vram_pareto", "Iso-Active Inference Efficiency: Decode Throughput vs VRAM", "E4B (4.0B Active) vs 26B-A4B MoE (3.8B Active)"),
             ("sft_dpo_training_curves", "Stage 1 rsLoRA SFT Loss & Stage 2 Trust-Region DPO Reward Margin", "Dual-Model Training Convergence on 2x A100 80GB"),
         ]:
@@ -541,13 +561,13 @@ def generate_all_family_plots(
     ratios_moe = [100.0 * (t / max(1e-6, b)) for t, b in zip(r_moe_tuned, r_moe_base)]
     rr1 = ax2_right.bar(rx - 0.15, ratios_e4b, 0.28, label="Gemma-4-E4B-Arabic-It Retention (%)", color="#0284c7")
     rr2 = ax2_right.bar(rx + 0.15, ratios_moe, 0.28, label="Gemma-4-26B-A4B-Arabic-It Retention (%)", color="#16a34a")
-    ax2_right.axhline(99.8, color="#dc2626", linestyle="--", linewidth=2.0, label="Zero-Forgetting Gate (99.80%)")
+    ax2_right.axhline(gate_pct, color="#dc2626", linestyle="--", linewidth=2.0, label=f"Zero-Forgetting Gate ({gate_pct:.2f}%)")
     ax2_right.set_xticks(rx)
     ax2_right.set_xticklabels(ret_labels, fontsize=10.5, fontweight="bold")
-    all_ratios = ratios_e4b + ratios_moe + [99.8]
+    all_ratios = ratios_e4b + ratios_moe + [gate_pct]
     ax2_right.set_ylim(max(90.0, min(all_ratios) - 2.0), max(all_ratios) + 3.5)
     ax2_right.set_ylabel("Retention Ratio (%)", fontsize=11, fontweight="bold")
-    ax2_right.set_title("Zero-Forgetting Retention Shield (>= 99.8% Required)", fontsize=12.5, fontweight="bold")
+    ax2_right.set_title(f"Zero-Forgetting Retention Shield (>= {gate_pct:.1f}% Required)", fontsize=12.5, fontweight="bold")
     ax2_right.legend(loc="lower right", fontsize=8.5)
 
     for rect_group, col in [(rr1, "#0369a1"), (rr2, "#15803d")]:

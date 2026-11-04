@@ -37,6 +37,8 @@ from scripts.benchmark_vllm_concurrency import (
     render_vllm_markdown_report,
 )
 from scripts.run_benchmarks import (
+    _extract_mgsm_ar_target_number,
+    _normalize_arabic_digits_filter,
     _patch_gemma4_config_for_lm_eval,
     build_custom_lm_eval_task_dict,
     compute_effective_task_limit,
@@ -513,6 +515,26 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             self.assertIn("task", spec_dict)
             self.assertIn("dataset_path", spec_dict)
             self.assertIn("output_type", spec_dict)
+
+        mgsm_spec = build_custom_lm_eval_task_dict("mgsm_ar", num_fewshot=5)
+        self.assertEqual(mgsm_spec["doc_to_target"], "{{target_number}}")
+        self.assertEqual(
+            mgsm_spec["metric_list"][0]["regexes_to_ignore"],
+            [",", "\\$", "\\.$"],
+        )
+        self.assertEqual(_extract_mgsm_ar_target_number("خطوات الحل...\n### 70000"), "70000")
+        self.assertEqual(_extract_mgsm_ar_target_number("خطوات الحل...\n##### 57,500"), "57500")
+        self.assertEqual(_extract_mgsm_ar_target_number("المجموع هو 126+240 = 366"), "366")
+        self.assertEqual(_extract_mgsm_ar_target_number("الناتج النهائي #### ٧٠٠٠٠"), "70000")
+        self.assertEqual(
+            _normalize_arabic_digits_filter([["الإجابة هي ٥٧٥٠٠"]], [{}]),
+            [["الإجابة هي 57500"]],
+        )
+
+        eval_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["MGSM-Ar"]["num_fewshot"], 5)
 
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_alghafa_light", 180), 20)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_acva_light", 200), 40)
