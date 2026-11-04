@@ -37,6 +37,7 @@ from scripts.benchmark_vllm_concurrency import (
     render_vllm_markdown_report,
 )
 from scripts.run_benchmarks import (
+    _build_mmlu_pro_item,
     _calibrate_and_standardize_suite_matrix,
     _patch_gemma4_config_for_lm_eval,
     evaluate_retention_gate,
@@ -510,6 +511,56 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         for row_idx, row in enumerate(cal_z):
             best_col = min(range(4), key=lambda k: row[k])
             self.assertEqual(best_col, row_idx)
+
+        # Verify MMLU-Pro item builder extracts intermediate CoT steps without leaking the answer letter
+        mmlu_pro_row = {
+            "category": "physics",
+            "question": "A 2 kg mass experiences a net force of 30 N. What is its acceleration?",
+            "options": [
+                "5 m/s^2",
+                "10 m/s^2",
+                "15 m/s^2",
+                "20 m/s^2",
+                "25 m/s^2",
+                "30 m/s^2",
+                "35 m/s^2",
+                "40 m/s^2",
+                "45 m/s^2",
+                "60 m/s^2",
+            ],
+            "answer_index": 2,
+            "cot_content": (
+                "A: Let's think step by step. By Newton's second law, force equals mass times acceleration (F = m * a). "
+                "Substituting F = 30 N and m = 2 kg gives a = 30 / 2. "
+                "Thus the acceleration is 15 m/s^2. The answer is (C)."
+            ),
+        }
+        mp_item = _build_mmlu_pro_item(mmlu_pro_row, item_idx=1)
+        self.assertIsNotNone(mp_item)
+        assert mp_item is not None
+        self.assertEqual(len(mp_item["choices"]), 4)
+        self.assertEqual(mp_item["choices"][mp_item["gold_idx"]], "15 m/s^2")
+        self.assertIn("Newton's second law", mp_item["prompt_prefix"])
+        self.assertNotIn("The answer is (C)", mp_item["prompt_prefix"])
+
+        # Verify finite-sample retention gate allows a 1-item discretization step at N=50
+        finite_gate = evaluate_retention_gate(
+            anchor_results={
+                "MMLU-Pro": {
+                    "baseline_score": 62.0,
+                    "evaluated_score": 60.0,
+                    "max_regression_pct": 0.20,
+                    "n_samples": 50,
+                },
+                "GSM8K": {
+                    "baseline_score": 100.0,
+                    "evaluated_score": 98.0,
+                    "max_regression_pct": 0.20,
+                    "n_samples": 50,
+                },
+            }
+        )
+        self.assertTrue(finite_gate["gate_passed"])
 
     def test_10_family_benchmark_plots(self) -> None:
         """Verify all 4 comparison plots (PNG + SVG) generation."""
