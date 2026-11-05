@@ -521,6 +521,58 @@ def install_chunked_causal_lm_loss(model: nn.Module) -> None:
                 pass
 
 
+def ensure_tied_lm_head(model: nn.Module) -> bool:
+    """Ensure `model.config.tie_word_embeddings = True` and tie `lm_head.weight` to `embed_tokens.weight`."""
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    for obj in (model, base):
+        cfg = getattr(obj, "config", None)
+        if cfg is not None:
+            try:
+                cfg.tie_word_embeddings = True
+            except Exception:
+                pass
+            if getattr(cfg, "text_config", None) is not None:
+                try:
+                    cfg.text_config.tie_word_embeddings = True
+                except Exception:
+                    pass
+
+    in_emb: Any = None
+    if hasattr(base, "get_input_embeddings"):
+        try:
+            in_emb = base.get_input_embeddings()
+        except Exception:
+            in_emb = None
+    if in_emb is None:
+        lm_backbone = getattr(getattr(base, "model", None), "language_model", None)
+        in_emb = getattr(lm_backbone, "embed_tokens", None) or getattr(
+            getattr(base, "model", base), "embed_tokens", None
+        )
+
+    out_emb: Any = getattr(base, "lm_head", None)
+    if out_emb is None and hasattr(base, "get_output_embeddings"):
+        try:
+            out_emb = base.get_output_embeddings()
+        except Exception:
+            out_emb = None
+    if out_emb is None and hasattr(base, "model"):
+        out_emb = getattr(base.model, "lm_head", None)
+
+    if (
+        in_emb is not None
+        and out_emb is not None
+        and hasattr(in_emb, "weight")
+        and hasattr(out_emb, "weight")
+        and in_emb.weight is not None
+        and out_emb.weight is not None
+    ):
+        if in_emb.weight.data_ptr() != out_emb.weight.data_ptr():
+            out_emb.weight = in_emb.weight
+            logger.info("Tied lm_head.weight to embed_tokens.weight (ptr=%d).", in_emb.weight.data_ptr())
+        return out_emb.weight.data_ptr() == in_emb.weight.data_ptr()
+    return False
+
+
 def _configure_trainable_model_flags(model: nn.Module, is_trainable: bool = True) -> None:
     """Ensure `use_cache=False` across top-level and nested `text_config` objects during training."""
     if not is_trainable:
@@ -709,6 +761,12 @@ def load_gemma4_8gb_model_and_tokenizer(
         from transformers import AutoConfig
 
         hf_config = AutoConfig.from_pretrained(model_name)
+        try:
+            hf_config.tie_word_embeddings = True
+            if getattr(hf_config, "text_config", None) is not None:
+                hf_config.text_config.tie_word_embeddings = True
+        except Exception:
+            pass
         if is_trainable:
             try:
                 hf_config.use_cache = False
@@ -809,6 +867,12 @@ def load_gemma4_8gb_model_and_tokenizer(
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if hf_config is None:
             hf_config = AutoConfig.from_pretrained(model_name)
+        try:
+            hf_config.tie_word_embeddings = True
+            if getattr(hf_config, "text_config", None) is not None:
+                hf_config.text_config.tie_word_embeddings = True
+        except Exception:
+            pass
         if is_trainable:
             try:
                 hf_config.use_cache = False
@@ -881,6 +945,7 @@ def load_gemma4_8gb_model_and_tokenizer(
             )
             install_chunked_causal_lm_loss(model)
 
+    ensure_tied_lm_head(model)
     _configure_trainable_model_flags(model, is_trainable=is_trainable)
 
     # Freeze embeddings, multimodal towers, and MoE router gates
@@ -927,6 +992,7 @@ def load_gemma4_8gb_model_and_tokenizer(
         )
         # Re-verify PLE, multimodal towers, and MoE routers remain frozen after PEFT wrapping
         freeze_embeddings_and_towers(model, freeze_moe_router=freeze_moe_router)
+        ensure_tied_lm_head(model)
         setattr(model, "_vram_offload_state", offload_state)
 
     if not used_unsloth_loader and not getattr(model, "_is_unsloth_model", False):

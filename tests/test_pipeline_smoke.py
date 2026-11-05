@@ -37,6 +37,7 @@ from scripts.benchmark_vllm_concurrency import (
     render_vllm_markdown_report,
 )
 from scripts.run_benchmarks import (
+    _ensure_gemma4_tied_lm_head,
     _extract_mgsm_ar_target_number,
     _normalize_arabic_digits_filter,
     _patch_gemma4_config_for_lm_eval,
@@ -81,11 +82,16 @@ from src.dpo_formatter import (
     validate_dpo_load_config,
 )
 from src.merge_and_export import (
+    _patch_exported_gemma4_config_tie_embeddings,
     apply_ties_interpolation_to_state_dict,
     ties_merge_deltas,
     ties_trim_tensor,
 )
-from src.model_loader import build_8gb_device_map, freeze_embeddings_and_towers
+from src.model_loader import (
+    build_8gb_device_map,
+    ensure_tied_lm_head,
+    freeze_embeddings_and_towers,
+)
 from src.replay_mixer import (
     compute_mix_allocation,
     mix_arabic_and_replay_samples,
@@ -535,6 +541,57 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
         )
         self.assertEqual(eval_cfg["arabic_benchmarks"]["MGSM-Ar"]["num_fewshot"], 5)
+        self.assertEqual(eval_cfg["evaluation"]["base_model_id"], "unsloth/gemma-4-E4B-it")
+        self.assertEqual(eval_cfg["evaluation"]["batch_size"], 32)
+
+        # Verify _ensure_gemma4_tied_lm_head and ensure_tied_lm_head fix untied lm_head.weight
+        class _MockUntiedGemma4(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = _MockGemma4Cfg()
+                self.config.tie_word_embeddings = False
+                self.config.text_config.tie_word_embeddings = False
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.embed_tokens = nn.Embedding(32, 16)
+                self.lm_head = nn.Linear(16, 32, bias=False)
+
+        untied_m1 = _MockUntiedGemma4()
+        self.assertNotEqual(
+            untied_m1.lm_head.weight.data_ptr(),
+            untied_m1.model.language_model.embed_tokens.weight.data_ptr(),
+        )
+        _ensure_gemma4_tied_lm_head(untied_m1, tag="unit_test")
+        self.assertEqual(
+            untied_m1.lm_head.weight.data_ptr(),
+            untied_m1.model.language_model.embed_tokens.weight.data_ptr(),
+        )
+        self.assertTrue(untied_m1.config.tie_word_embeddings)
+        self.assertTrue(untied_m1.config.text_config.tie_word_embeddings)
+
+        untied_m2 = _MockUntiedGemma4()
+        self.assertTrue(ensure_tied_lm_head(untied_m2))
+        self.assertEqual(
+            untied_m2.lm_head.weight.data_ptr(),
+            untied_m2.model.language_model.embed_tokens.weight.data_ptr(),
+        )
+
+        with tempfile.TemporaryDirectory(prefix="gemma4_tie_cfg_") as tmp_dir:
+            tmp_p = pathlib.Path(tmp_dir)
+            cfg_file = tmp_p / "config.json"
+            cfg_file.write_text(
+                json.dumps(
+                    {
+                        "tie_word_embeddings": False,
+                        "text_config": {"tie_word_embeddings": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(_patch_exported_gemma4_config_tie_embeddings(tmp_p))
+            patched_cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+            self.assertTrue(patched_cfg["tie_word_embeddings"])
+            self.assertTrue(patched_cfg["text_config"]["tie_word_embeddings"])
 
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_alghafa_light", 180), 20)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_acva_light", 200), 40)

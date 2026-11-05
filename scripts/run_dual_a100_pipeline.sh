@@ -112,6 +112,10 @@ fi
 echo "======================================================================"
 echo "[Phase 3/4] Evaluating Both Models on 7 Arabic + 4 Retention Benchmarks"
 echo "======================================================================"
+if ! "${PYTHON_BIN}" -c "import lm_eval, evaluate, sqlitedict, pytablewriter, sacrebleu, rouge_score" >/dev/null 2>&1; then
+  echo "[Setup] Installing lm-eval and evaluation dependencies..."
+  "${PYTHON_BIN}" -m pip install -q "lm-eval>=0.4.8" "evaluate>=0.4.3" "sqlitedict>=2.1.0" "pytablewriter>=1.2.0" "sacrebleu>=2.4.0" "rouge-score>=0.1.2"
+fi
 "${PYTHON_BIN}" scripts/run_benchmarks.py \
   --config configs/eval_config.yaml \
   --model-key both \

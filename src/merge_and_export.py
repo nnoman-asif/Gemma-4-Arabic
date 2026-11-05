@@ -188,6 +188,67 @@ def scale_and_trim_peft_lora_weights(
     return modified_count
 
 
+def _patch_exported_gemma4_config_tie_embeddings(out_16bit: pathlib.Path) -> bool:
+    """Ensure `tie_word_embeddings: true` is saved in `config.json` (root and `text_config`) when `lm_head.weight` is tied."""
+    cfg_path = out_16bit / "config.json"
+    if not cfg_path.exists():
+        return False
+    has_separate_lm_head = False
+    idx_path = out_16bit / "model.safetensors.index.json"
+    st_path = out_16bit / "model.safetensors"
+    if idx_path.exists():
+        try:
+            idx_data = json.loads(idx_path.read_text(encoding="utf-8"))
+            wmap = idx_data.get("weight_map", {})
+            has_separate_lm_head = any(
+                k in wmap for k in ("lm_head.weight", "language_model.lm_head.weight")
+            )
+        except Exception:
+            has_separate_lm_head = False
+    elif st_path.exists():
+        try:
+            import struct
+
+            with st_path.open("rb") as fh:
+                hdr_bytes = fh.read(8)
+                if len(hdr_bytes) == 8:
+                    hdr_len = struct.unpack("<Q", hdr_bytes)[0]
+                    if 0 < hdr_len < 100_000_000:
+                        hdr_json = json.loads(fh.read(hdr_len).decode("utf-8"))
+                        has_separate_lm_head = any(
+                            k in hdr_json for k in ("lm_head.weight", "language_model.lm_head.weight")
+                        )
+        except Exception:
+            has_separate_lm_head = False
+
+    if has_separate_lm_head:
+        return False
+
+    try:
+        cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        changed = False
+        if cfg_data.get("tie_word_embeddings") is not True:
+            cfg_data["tie_word_embeddings"] = True
+            changed = True
+        if isinstance(cfg_data.get("text_config"), dict):
+            if cfg_data["text_config"].get("tie_word_embeddings") is not True:
+                cfg_data["text_config"]["tie_word_embeddings"] = True
+                changed = True
+        if changed:
+            cfg_path.write_text(
+                json.dumps(cfg_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info(
+                "Patched exported %s with tie_word_embeddings=true (root + text_config).",
+                cfg_path,
+            )
+        return True
+    except Exception as exc:
+        logger.warning("Could not verify/patch exported config.json tie_word_embeddings: %s", exc)
+        return False
+
+
 def export_merged_checkpoint(
     model: nn.Module,
     tokenizer: Any,
@@ -202,6 +263,14 @@ def export_merged_checkpoint(
     if export_format in {"merged_16bit", "both"}:
         out_16bit = output_dir / "merged_16bit"
         out_16bit.mkdir(parents=True, exist_ok=True)
+        cfg = getattr(model, "config", None)
+        if cfg is not None:
+            try:
+                cfg.tie_word_embeddings = True
+                if getattr(cfg, "text_config", None) is not None:
+                    cfg.text_config.tie_word_embeddings = True
+            except Exception:
+                pass
         saved_via_unsloth = False
         if hasattr(model, "save_pretrained_merged"):
             try:
@@ -226,6 +295,7 @@ def export_merged_checkpoint(
                 model.save_pretrained(str(out_16bit), safe_serialization=True)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(str(out_16bit))
+        _patch_exported_gemma4_config_tie_embeddings(out_16bit)
         tc_path = out_16bit / "tokenizer_config.json"
         if tc_path.exists():
             try:

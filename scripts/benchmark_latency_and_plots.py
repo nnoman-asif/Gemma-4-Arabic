@@ -105,10 +105,11 @@ def profile_single_model_live(
     device: str = "cuda:0",
 ) -> Dict[str, Any]:
     """Run live CUDA event timing for TTFT, decode tokens/sec, and peak VRAM if model is present."""
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    from scripts.run_benchmarks import _ensure_gemma4_tied_lm_head, _prepare_gemma4_config_for_load
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    hf_cfg = _prepare_gemma4_config_for_load(model_path)
     arch_list = getattr(hf_cfg, "architectures", None) or []
     is_multimodal = (
         getattr(hf_cfg, "model_type", "") == "gemma4"
@@ -126,6 +127,7 @@ def profile_single_model_live(
 
         model = AutoModelForImageTextToText.from_pretrained(
             model_path,
+            config=hf_cfg,
             torch_dtype=target_dtype,
             device_map=dev_map,
             trust_remote_code=True,
@@ -133,10 +135,12 @@ def profile_single_model_live(
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
+            config=hf_cfg,
             torch_dtype=target_dtype,
             device_map=dev_map,
             trust_remote_code=True,
         )
+    _ensure_gemma4_tied_lm_head(model, tag="latency_profile")
     model.eval()
 
     from src.chat_template import format_gemma4_chat

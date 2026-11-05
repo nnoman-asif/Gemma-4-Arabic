@@ -37,7 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v13_lm_eval_standard"
+EVAL_CACHE_VERSION = "v14_lm_eval_tied_lm_head"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -76,7 +76,16 @@ def _patch_gemma4_config_for_lm_eval(model: Any) -> None:
     """Expose `text_config` attributes at top level of `Gemma4Config` for `lm_eval` compatibility."""
     cfg = getattr(model, "config", None) or model
     text_cfg = getattr(cfg, "text_config", None) if cfg is not None else None
+    if cfg is not None:
+        try:
+            cfg.tie_word_embeddings = True
+        except Exception:
+            pass
     if cfg is not None and text_cfg is not None:
+        try:
+            text_cfg.tie_word_embeddings = True
+        except Exception:
+            pass
         for attr in (
             "vocab_size",
             "eos_token_id",
@@ -87,6 +96,140 @@ def _patch_gemma4_config_for_lm_eval(model: Any) -> None:
         ):
             if getattr(cfg, attr, None) is None and getattr(text_cfg, attr, None) is not None:
                 setattr(cfg, attr, getattr(text_cfg, attr))
+
+
+def _has_separate_lm_head_in_checkpoint(model_dir: pathlib.Path) -> bool:
+    """Return True only if `lm_head.weight` is explicitly stored as an independent tensor in `model_dir`."""
+    idx_path = model_dir / "model.safetensors.index.json"
+    if idx_path.exists():
+        try:
+            idx_data = json.loads(idx_path.read_text(encoding="utf-8"))
+            weight_map = idx_data.get("weight_map", {})
+            return any(k in weight_map for k in ("lm_head.weight", "language_model.lm_head.weight"))
+        except Exception:
+            return False
+    st_path = model_dir / "model.safetensors"
+    if st_path.exists():
+        try:
+            import struct
+
+            with st_path.open("rb") as fh:
+                header_size_bytes = fh.read(8)
+                if len(header_size_bytes) == 8:
+                    header_len = struct.unpack("<Q", header_size_bytes)[0]
+                    if 0 < header_len < 100_000_000:
+                        header_json = json.loads(fh.read(header_len).decode("utf-8"))
+                        return any(
+                            k in header_json
+                            for k in ("lm_head.weight", "language_model.lm_head.weight")
+                        )
+        except Exception:
+            return False
+    return False
+
+
+def _prepare_gemma4_config_for_load(model_path: str) -> Any:
+    """Ensure `tie_word_embeddings=True` on disk (if local) and in `AutoConfig` before `from_pretrained`."""
+    model_dir = pathlib.Path(model_path)
+    cfg_path = model_dir / "config.json"
+    if model_dir.is_dir() and cfg_path.exists():
+        try:
+            cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if not _has_separate_lm_head_in_checkpoint(model_dir):
+                changed = False
+                if cfg_data.get("tie_word_embeddings") is not True:
+                    cfg_data["tie_word_embeddings"] = True
+                    changed = True
+                if isinstance(cfg_data.get("text_config"), dict):
+                    if cfg_data["text_config"].get("tie_word_embeddings") is not True:
+                        cfg_data["text_config"]["tie_word_embeddings"] = True
+                        changed = True
+                if changed:
+                    cfg_path.write_text(
+                        json.dumps(cfg_data, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    logger.info(
+                        "Patched %s on disk with tie_word_embeddings=true (root + text_config).",
+                        cfg_path,
+                    )
+        except Exception as exc:
+            logger.warning("Could not inspect/patch %s: %s", cfg_path, exc)
+
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    try:
+        config.tie_word_embeddings = True
+    except Exception:
+        pass
+    if getattr(config, "text_config", None) is not None:
+        try:
+            config.text_config.tie_word_embeddings = True
+        except Exception:
+            pass
+    _patch_gemma4_config_for_lm_eval(config)
+    return config
+
+
+def _ensure_gemma4_tied_lm_head(model: Any, tag: str = "") -> None:
+    """Guarantee `lm_head.weight` shares the exact storage pointer of `embed_tokens.weight`."""
+    inner = getattr(model, "model", model) if hasattr(model, "_model") or type(model).__name__ == "HFLM" else model
+    base = inner.get_base_model() if hasattr(inner, "get_base_model") else inner
+
+    for obj in (model, inner, base):
+        cfg = getattr(obj, "config", None)
+        if cfg is not None:
+            try:
+                cfg.tie_word_embeddings = True
+            except Exception:
+                pass
+            if getattr(cfg, "text_config", None) is not None:
+                try:
+                    cfg.text_config.tie_word_embeddings = True
+                except Exception:
+                    pass
+
+    in_emb: Any = None
+    if hasattr(base, "get_input_embeddings"):
+        try:
+            in_emb = base.get_input_embeddings()
+        except Exception:
+            in_emb = None
+    if in_emb is None:
+        lm_backbone = getattr(getattr(base, "model", None), "language_model", None)
+        in_emb = getattr(lm_backbone, "embed_tokens", None) or getattr(
+            getattr(base, "model", base), "embed_tokens", None
+        )
+
+    out_emb: Any = getattr(base, "lm_head", None)
+    if out_emb is None and hasattr(base, "get_output_embeddings"):
+        try:
+            out_emb = base.get_output_embeddings()
+        except Exception:
+            out_emb = None
+    if out_emb is None and hasattr(base, "model"):
+        out_emb = getattr(base.model, "lm_head", None)
+
+    if (
+        in_emb is not None
+        and out_emb is not None
+        and hasattr(in_emb, "weight")
+        and hasattr(out_emb, "weight")
+        and in_emb.weight is not None
+        and out_emb.weight is not None
+    ):
+        if in_emb.weight.data_ptr() != out_emb.weight.data_ptr():
+            out_emb.weight = in_emb.weight
+            logger.info(
+                "[%s] Explicitly tied lm_head.weight -> embed_tokens.weight (data_ptr=%d)",
+                tag or "gemma4",
+                in_emb.weight.data_ptr(),
+            )
+        assert out_emb.weight.data_ptr() == in_emb.weight.data_ptr(), (
+            f"[{tag or 'gemma4'}] lm_head.weight data_ptr ({out_emb.weight.data_ptr()}) "
+            f"!= embed_tokens.weight data_ptr ({in_emb.weight.data_ptr()})"
+        )
 
 
 def compute_effective_task_limit(
@@ -696,12 +839,17 @@ def run_lm_eval_task(
         num_fewshot=num_fewshot,
         limit=limit,
     )
+    if pathlib.Path(model_path).is_dir():
+        try:
+            _prepare_gemma4_config_for_load(model_path)
+        except Exception:
+            pass
     model_backend = "vllm" if use_vllm else "hf"
     model_args = (
         f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,"
         f"gpu_memory_utilization=0.85,max_model_len=4096"
         if use_vllm
-        else f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True"
+        else f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,tie_word_embeddings=True"
     )
     payload = lm_eval.simple_evaluate(
         model=model_backend,
@@ -765,6 +913,8 @@ def _evaluate_checkpoint_with_lm_eval(
         if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
             adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
             base_model_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+            if pathlib.Path(base_model_path).is_dir():
+                _prepare_gemma4_config_for_load(base_model_path)
             lm_obj = VLLM(
                 pretrained=base_model_path,
                 lora_local_path=str(model_path),
@@ -775,6 +925,8 @@ def _evaluate_checkpoint_with_lm_eval(
                 batch_size="auto",
             )
         else:
+            if model_dir.is_dir():
+                _prepare_gemma4_config_for_load(model_path)
             lm_obj = VLLM(
                 pretrained=model_path,
                 dtype="bfloat16",
@@ -808,9 +960,11 @@ def _evaluate_checkpoint_with_lm_eval(
         except Exception:
             tokenizer = AutoTokenizer.from_pretrained(load_target_path, trust_remote_code=True)
 
+        hf_config = _prepare_gemma4_config_for_load(load_target_path)
         try:
             model_obj = AutoModelForImageTextToText.from_pretrained(
                 load_target_path,
+                config=hf_config,
                 torch_dtype=torch.bfloat16,
                 device_map={"": device},
                 trust_remote_code=True,
@@ -818,14 +972,17 @@ def _evaluate_checkpoint_with_lm_eval(
         except Exception:
             model_obj = AutoModelForCausalLM.from_pretrained(
                 load_target_path,
+                config=hf_config,
                 torch_dtype=torch.bfloat16,
                 device_map={"": device},
                 trust_remote_code=True,
             )
+        _ensure_gemma4_tied_lm_head(model_obj, tag=tag)
         if is_peft_adapter:
             from peft import PeftModel
 
             model_obj = PeftModel.from_pretrained(model_obj, model_path)
+            _ensure_gemma4_tied_lm_head(model_obj, tag=f"{tag}:peft")
         _patch_gemma4_config_for_lm_eval(model_obj)
         model_obj.eval()
         lm_obj = HFLM(
@@ -836,6 +993,7 @@ def _evaluate_checkpoint_with_lm_eval(
             max_length=max_seq_len,
             trust_remote_code=True,
         )
+        _ensure_gemma4_tied_lm_head(lm_obj, tag=f"{tag}:hflm")
 
     task_manager = TaskManager()
     out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": {}, "retention": {}}

@@ -3,14 +3,14 @@
 # and Iso-Active Latency/Throughput/VRAM profiling across Gemma-4-Arabic and Gemma-4-26B-A4B-Arabic.
 
 evaluation:
-  base_model_id: "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
+  base_model_id: "unsloth/gemma-4-E4B-it"
   sft_checkpoint_dir: "outputs/sft_stage1"
   dpo_checkpoint_dir: "outputs/dpo_stage2"
   merged_checkpoint_dir: "outputs/merged_gemma4_e4b_arabic/merged_16bit"
   output_report_path: "outputs/eval_reports/benchmark_comparison.md"
   output_json_path: "outputs/eval_reports/benchmark_results.json"
   family_comparison_json_path: "outputs/eval_reports/family_benchmark_comparison.json"
-  batch_size: 16
+  batch_size: 32
   max_seq_length: 4096
   dtype: "bfloat16"
   device: "cuda:0"
