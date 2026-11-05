@@ -579,6 +579,14 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             ),
             "def foo(a, b):\n    x = a + b\n    return x\n",
         )
+        self.assertEqual(
+            _extract_humaneval_code(
+                "We need to add a and b together.\n    x = a + b\n    return x\n",
+                "def foo(a, b):\n",
+                "foo",
+            ),
+            "def foo(a, b):\n    x = a + b\n    return x\n",
+        )
         he_code = _extract_humaneval_code(
             "<|think|>\n<|think|>\n```python\ndef add(a, b):\n    return a + b\n```",
             "def add(a, b):\n",
@@ -655,8 +663,12 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(compute_effective_task_limit("arabicmmlu", 200), 5)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_alghafa_light", 180), 20)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_acva_light", 200), 40)
-        self.assertEqual(compute_effective_task_limit("mmlu_pro", 200), 200)
+        self.assertEqual(compute_effective_task_limit("mmlu_pro", 200), 15)
         self.assertEqual(compute_effective_task_limit("leaderboard_mmlu_pro", 200), 200)
+        self.assertEqual(
+            resolve_lm_eval_task_specs("mmlu_pro", num_fewshot=5, limit=200),
+            (["mmlu_pro"], "mmlu_pro", 15),
+        )
 
         tasks_armmlu, primary_armmlu, eff_armmlu = resolve_lm_eval_task_specs(
             "arabicmmlu", num_fewshot=0, limit=200
@@ -673,7 +685,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
-        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["num_fewshot"], 0)
+        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval_instruct")
         self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge_chat")
 

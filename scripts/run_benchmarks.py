@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v20_mmlu0_humaneval_body"
+EVAL_CACHE_VERSION = "v21_official_mmlu_pro_cot"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -56,6 +56,7 @@ GROUP_SUBTASK_COUNTS: Dict[str, int] = {
     "arabicmmlu": 40,
     "arabic_leaderboard_alghafa_light": 9,
     "arabic_leaderboard_acva_light": len(ACVA_CORE_SUBTASKS),
+    "mmlu_pro": 14,
 }
 
 # Native LightEval task definitions for OALL v2 Arabic benchmarks
@@ -436,8 +437,10 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
     patterns = (
         # Explicit answer phrase + required separator (is / : / =) + optional markdown bold/parens + UPPERCASE letter
         rf"(?:(?i:final\s+answer|best\s+answer|the\s+answer|correct\s+answer|correct\s+option|answer)|الإجابة)[\*\s]*(?:(?i:is)|:|=)[\*\s\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
-        # Fallback where 'Final Answer' is followed directly by bold/parenthesized uppercase letter
-        rf"(?i:final\s+answer|best\s+answer|correct\s+option)[\*\s:]+[\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
+        # Fallback where 'Final Answer' or 'The answer is' is followed by bold/parenthesized uppercase letter
+        rf"(?i:final\s+answer|best\s+answer|the\s+answer\s+is|answer\s+is|correct\s+option)[\*\s:]+[\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
+        # 'Option C is correct' / 'choice (C) is correct'
+        rf"(?i:option|choice)[\*\s\(\[\{{]*([{upper_letters}])[\*\s\)\]\}}]+(?i:is\s+correct|is\s+the\s+correct)",
         # Parenthesized letter e.g. (A) or **(A)**
         rf"\(([{upper_letters}{lower_letters}])\)",
         # Standalone bold uppercase letter e.g. **C** or **C.**
@@ -567,16 +570,27 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
         return cleaned_dedented + "\n"
 
     # Otherwise `cleaned` is the function body continuation after `prompt`:
+    _python_line_start_re = re.compile(
+        r"^(?:return\b|for\b|while\b|if\b|elif\b|else\s*:|try\s*:|except\b|with\b|def\b|class\b|import\b|from\b|pass\b|raise\b|yield\b|assert\b|[A-Za-z_]\w*\s*(?:=|\+=|-=|\*=|/=|\[|\())"
+    )
     lines = cleaned.splitlines()
     non_empty = [ln for ln in lines if ln.strip()]
     if non_empty:
         first_indented = non_empty[0].startswith((" ", "\t"))
         rest_indented = any(ln.startswith((" ", "\t")) for ln in non_empty[1:])
         if not first_indented and rest_indented:
-            for idx, ln in enumerate(lines):
-                if ln.strip():
-                    lines[idx] = "    " + ln
-                    break
+            # Find the first actually indented line; if leading unindented lines are thinking prose, drop them
+            first_ind_idx = next(
+                (i for i, ln in enumerate(lines) if ln.strip() and ln.startswith((" ", "\t"))),
+                0,
+            )
+            leading_unindented = [ln.strip() for ln in lines[:first_ind_idx] if ln.strip()]
+            if leading_unindented and all(_python_line_start_re.match(u) for u in leading_unindented):
+                for idx in range(first_ind_idx):
+                    if lines[idx].strip():
+                        lines[idx] = "    " + lines[idx]
+            else:
+                lines = lines[first_ind_idx:]
         elif not first_indented and not rest_indented:
             lines = [("    " + ln if ln.strip() else "") for ln in lines]
 
@@ -863,7 +877,7 @@ def resolve_lm_eval_task_specs(
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
 
-    if clean_name.lower() in ("mgsm_ar", "mmlu_pro", "arc_challenge_chat", "humaneval_instruct"):
+    if clean_name.lower() in ("mgsm_ar", "arc_challenge_chat", "humaneval_instruct"):
         custom_dict = build_custom_lm_eval_task_dict(clean_name, num_fewshot=num_fewshot)
         return ([custom_dict], str(custom_dict["task"]), eff_limit)
 
