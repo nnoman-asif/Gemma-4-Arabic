@@ -175,9 +175,14 @@ def scale_and_trim_peft_lora_weights(
     modified_count = 0
     for name, param in model.named_parameters():
         if "lora_B" in name:
-            if sft_adapter_state is not None and name in sft_adapter_state:
+            sft_key = (
+                name
+                if (sft_adapter_state is not None and name in sft_adapter_state)
+                else name.replace(".default.", ".")
+            )
+            if sft_adapter_state is not None and sft_key in sft_adapter_state:
                 merged_b = ties_merge_deltas(
-                    deltas=[sft_adapter_state[name].to(param.device), param.data],
+                    deltas=[sft_adapter_state[sft_key].to(param.device), param.data],
                     weights=[0.35, 0.65],
                     density=density,
                 )

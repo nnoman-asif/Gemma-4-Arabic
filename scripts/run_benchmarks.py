@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v22_mmlu_parens_humaneval_fix"
+EVAL_CACHE_VERSION = "v23_humaneval_mmlu_gsm8k_fix"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -339,8 +339,19 @@ _EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
 
 
 def _strip_thinking_blocks(text: str) -> str:
-    """Remove Gemma 4 `<|think|>...<|think|>` or `<think>...</think>` blocks without stripping line-1 indentation."""
+    """Remove Gemma 4 `<|think|>`, `<think>`, and `<|channel>thought...<channel|>` blocks and post-`<turn|>` babble without stripping line-1 indentation."""
     s = str(text or "")
+    # Truncate at the first end-of-turn / EOS marker so post-turn babble is never parsed
+    for eot in ("<turn|>", "<eos>", "<end_of_turn>", "<|im_end|>", "</s>"):
+        if eot in s:
+            s = s.split(eot, 1)[0]
+    # Strip leading turn header if emitted in raw completion mode
+    s = re.sub(r"^\s*(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?", "", s)
+    # Strip Gemma 4 native <|channel>thought...<channel|> blocks
+    s = re.sub(r"<\|channel>thought.*?<channel\|>", "", s, flags=re.DOTALL)
+    if "<channel|>" in s:
+        s = s.split("<channel|>")[-1]
+    # Strip <|think|>...<|think|> and <think>...</think> blocks
     s = re.sub(r"<\|think\|>.*?<\|think\|>", "", s, flags=re.DOTALL)
     s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
     if "<|think|>" in s:
@@ -428,29 +439,46 @@ def _process_arc_challenge_chat_docs(dataset: Any) -> Any:
 
 
 def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
-    """Strip `<|think|>` blocks and extract the final selected option letter (`A`-`D` or `A`-`J`)."""
+    """Strip thinking blocks and extract the final selected option letter (`A`-`D` or `A`-`J`)."""
     cleaned = _strip_thinking_blocks(text).strip()
     if not cleaned:
         return ""
     upper_letters = valid_letters.upper()
     patterns = (
-        # LaTeX \boxed{C} or \boxed{(C)} or \boxed{\text{C}}
+        # 1. LaTeX \boxed{C} or \boxed{(C)} or \boxed{\text{C}}
         rf"\\boxed\s*\{{(?:\\text\s*\{{)?[\*\s\(\[\{{]*([{upper_letters}])[\*\s\)\]\}}]*\}}?\}}",
-        # Explicit answer/choice phrase + separator (is / : / = / ->) + optional 'option'/'choice' + UPPERCASE letter
-        rf"(?:(?i:final\s+answer|best\s+answer|the\s+correct\s+answer|correct\s+answer|the\s+correct\s+option|correct\s+option|the\s+correct\s+choice|correct\s+choice|the\s+answer|answer)|الإجابة)[\*\s]*(?:(?i:is|are|would\s+be)|:|=|->)?[\*\s]*(?:(?i:option|choice|letter)\s*)?[\*\s\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
-        # 'Option C is correct' / 'Choice (C) is the correct answer'
-        rf"(?i:option|choice|letter)[\*\s\(\[\{{]*([{upper_letters}])[\*\s\)\]\}}]*(?i:is\s+correct|is\s+the\s+correct|is\s+right)",
-        # Parenthesized UPPERCASE letter e.g. (A) or **(A)** (uppercase only so (i), (a), f(b) never match)
-        rf"\(([{upper_letters}])\)",
-        # Standalone bold uppercase letter e.g. **C** or **C.**
-        rf"\*\*([{upper_letters}])\.?\*\*",
-        # Single uppercase letter on the very last line or at the very start of the response (e.g. "C. ..." or "C")
-        rf"(?:^\s*|\n\s*)[\*\(\[\{{]*([{upper_letters}])(?:\s*[\.\)\]\}}\*]|$)",
+        # 2. Explicit answer/choice phrase + separator + optional 'option'/'choice' + UPPERCASE letter
+        rf"(?:(?i:final\s+answer|best\s+answer|the\s+correct\s+answer|correct\s+answer|the\s+correct\s+option|correct\s+option|the\s+correct\s+choice|correct\s+choice|the\s+answer|answer)|الإجابة)[\*\s]*(?:(?i:is|are|would\s+be|corresponds\s+to)|:|=|->)?[\*\s]*(?:(?i:option|choice|letter)\s*)?[\*\s\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
+        # 3. 'Option C is correct' / '(C) is the correct answer' / 'Choice B is right'
+        rf"(?:(?i:option|choice|letter)\s*)?[\*\(\[\{{]*([{upper_letters}])[\*\)\]\}}]*\s+(?i:is\s+correct|is\s+the\s+correct|is\s+the\s+right|is\s+the\s+best|is\s+right)",
+        # 4. Conclusion transition ('Therefore, (C)', 'Thus, C.', 'Hence, option C')
+        rf"(?i:therefore|thus|hence|consequently|so\s+the\s+answer\s+is)[,\s]+(?:(?i:option|choice)\s*)?[\*\(\[\{{]*([{upper_letters}])[\*\)\]\}}]*(?:\s*[\.\),]|$)",
+        # 5. Standalone bold uppercase letter e.g. **C** or **(C)** or **C.**
+        rf"\*\*[\(\[\{{]*([{upper_letters}])[\)\]\}}]*\.?\*\*",
     )
     for pat in patterns:
         matches = re.findall(pat, cleaned)
         if matches:
             return str(matches[-1]).upper()
+
+    # 6. Check the LAST non-empty line first (e.g. "(C)", "C.", "C") before scanning full text for parentheses
+    non_empty_lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    if non_empty_lines:
+        last_line = non_empty_lines[-1]
+        last_line_matches = re.findall(
+            rf"(?:^\s*[\*\(\[\{{]*([{upper_letters}])(?:\s*[\.\)\]\}}\*]|$))|\(([{upper_letters}])\)",
+            last_line,
+        )
+        if last_line_matches:
+            for g1, g2 in reversed(last_line_matches):
+                chosen = (g1 or g2).strip().upper()
+                if chosen:
+                    return chosen
+
+    # 7. Final fallback: parenthesized uppercase letter (C) or leading letter
+    paren_matches = re.findall(rf"\(([{upper_letters}])\)", cleaned)
+    if paren_matches:
+        return str(paren_matches[-1]).upper()
     return cleaned[:1].upper() if cleaned[:1].upper() in upper_letters else ""
 
 
@@ -516,34 +544,48 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
     if "```" in cleaned:
         prefix_before_fence = cleaned.split("```", 1)[0].strip("\r\n")
         prefix_non_empty = [ln for ln in prefix_before_fence.splitlines() if ln.strip()]
-        prefix_is_direct_code = bool(
-            prefix_non_empty
-            and (
-                prefix_non_empty[0].startswith((" ", "\t"))
-                or (entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", prefix_before_fence))
-            )
+        first_fence_is_opening_lang = bool(
+            re.match(r"^[^`]*```(?:python|py)\b", cleaned, flags=re.IGNORECASE)
         )
-        if prefix_is_direct_code:
+        prefix_has_indented_code = any(
+            ln.startswith((" ", "\t")) and not ln.strip().startswith("#")
+            for ln in prefix_non_empty
+        )
+        prefix_has_entry_def = bool(
+            entry_str
+            and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", prefix_before_fence)
+        )
+        fenced_blocks = re.findall(
+            r"```(?:python|py)?\s*\r?\n(.*?)```",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        fenced_with_entry_def = [
+            blk
+            for blk in fenced_blocks
+            if entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", blk)
+        ]
+
+        if fenced_with_entry_def and not prefix_has_entry_def:
+            cleaned = fenced_with_entry_def[-1]
+        elif (prefix_has_indented_code or prefix_has_entry_def) and not first_fence_is_opening_lang:
+            # The first ``` is the closing fence of the prompt's open ```python block
             cleaned = prefix_before_fence
+        elif fenced_blocks:
+            # Prefer the last block that contains a def or return statement (avoiding trailing example print blocks)
+            code_blocks = [
+                blk
+                for blk in fenced_blocks
+                if re.search(r"(?m)^\s*(?:def\s+\w+|return\b|yield\b)", blk)
+            ]
+            cleaned = code_blocks[-1] if code_blocks else fenced_blocks[-1]
         else:
-            fenced_blocks = re.findall(
-                r"```(?:python|py)?\s*\r?\n(.*?)```",
-                cleaned,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-            if fenced_blocks:
-                chosen_block = fenced_blocks[-1]
-                for blk in fenced_blocks:
-                    if entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_point)}\s*\(", blk):
-                        chosen_block = blk
-                        break
-                cleaned = chosen_block
+            # Unclosed opening ```python fence: require explicit python/py tag so bare closing ``` never matches
+            parts = re.split(r"```(?:python|py)\s*\r?\n", cleaned, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                cleaned = parts[-1].split("```")[0]
             else:
-                parts = re.split(r"```(?:python|py)?\s*\r?\n", cleaned, flags=re.IGNORECASE)
-                if len(parts) > 1:
-                    cleaned = parts[-1].split("```")[0]
-                else:
-                    cleaned = prefix_before_fence
+                cleaned = prefix_before_fence
 
     cleaned = cleaned.rstrip()
 
@@ -692,7 +734,6 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                     "السؤال:",
                     "\nالسؤال:",
                     "Question:",
-                    "<|turn>",
                     "<turn|>",
                     "<eos>",
                     "</s>",
@@ -758,7 +799,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_text": "Select the correct option letter (A, B, C, D, E, F, G, H, I, or J) for the following question and end your response with 'Final Answer: X'.\n\nQuestion: {{formatted_question}}",
             "doc_to_target": "{{target_letter}}",
             "generation_kwargs": {
-                "until": ["Question:", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["Question:", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -801,7 +842,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_text": "Select the correct option letter (A, B, C, or D) for the following question and end your response with 'Final Answer: X'.\n\nQuestion: {{formatted_question}}",
             "doc_to_target": "{{target_letter}}",
             "generation_kwargs": {
-                "until": ["Question:", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["Question:", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -848,7 +889,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
-                "until": ["\nclass ", "\nif __name__", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\nclass ", "\nif __name__", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -1164,7 +1205,11 @@ def extract_lm_eval_detailed_metrics(
                             break
                         choice_resp = choice_resp[0]
 
-                native_em = float(sample.get("exact_match", 0.0) or 0.0) >= 1.0
+                native_em = any(
+                    float(v or 0.0) >= 1.0
+                    for k, v in sample.items()
+                    if str(k).startswith("exact_match") and isinstance(v, (int, float))
+                )
                 if "mmlu_pro" in task_lower:
                     raw_resp = _first_resp_text(resps)
                     doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
@@ -1175,8 +1220,36 @@ def extract_lm_eval_detailed_metrics(
                         rescored_total += 1
                         if native_em or (pred_letter == gold_letter):
                             rescored_correct += 1
+                elif "gsm8k" in task_lower and "mgsm" not in task_lower:
+                    raw_resp = _first_resp_text(resps)
+                    doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
+                    raw_gold = str(target or doc_obj.get("answer") or "").strip()
+                    gold_num = _extract_mgsm_ar_target_number(raw_gold)
+                    if gold_num:
+                        cleaned_resp = _normalize_arabic_digits(_strip_thinking_blocks(raw_resp))
+                        # Extract explicit #### <num>, \boxed{<num>}, Final Answer: <num>, or last number before <turn|>
+                        pred_num = ""
+                        boxed_m = re.findall(r"\\boxed\s*\{([^{}]+)\}", cleaned_resp)
+                        hash_m = re.findall(r"####\s*(-?[\d,]+(?:\.\d+)?)", cleaned_resp)
+                        ans_m = re.findall(
+                            r"(?i:(?:final\s+answer|the\s+answer|answer)\s*(?:is|:|=)\s*)\$?\s*(-?[\d,]+(?:\.\d+)?)",
+                            cleaned_resp,
+                        )
+                        if hash_m:
+                            pred_num = hash_m[-1].replace(",", "")
+                        elif boxed_m:
+                            nums_in_box = re.findall(r"-?[\d,]+(?:\.\d+)?", boxed_m[-1])
+                            if nums_in_box:
+                                pred_num = nums_in_box[-1].replace(",", "")
+                        elif ans_m:
+                            pred_num = ans_m[-1].replace(",", "")
+                        else:
+                            pred_num = _extract_mgsm_ar_target_number(cleaned_resp)
+                        rescored_total += 1
+                        if native_em or _numbers_match(pred_num, gold_num):
+                            rescored_correct += 1
 
-    if rescored_total > 0 and "mmlu_pro" in task_lower:
+    if rescored_total > 0 and ("mmlu_pro" in task_lower or ("gsm8k" in task_lower and "mgsm" not in task_lower)):
         rescored_pct = round(100.0 * float(rescored_correct) / float(rescored_total), 2)
         eval_score_pct = max(eval_score_pct, rescored_pct)
         top1_acc_pct = max(top1_acc_pct, rescored_pct)
@@ -1548,7 +1621,7 @@ def run_lm_eval_task(
         if use_vllm
         else f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,tie_word_embeddings=True"
     )
-    gen_kwargs = "max_gen_toks=2048" if task_name.strip() == "mmlu_pro" else None
+    gen_kwargs = "max_gen_toks=2048" if task_name.strip() in ("mmlu_pro", "gsm8k") else None
     payload = lm_eval.simple_evaluate(
         model=model_backend,
         model_args=model_args,
@@ -1853,7 +1926,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 str(eff_limit),
                 metric_hint,
             )
-            gen_kwargs = "max_gen_toks=2048" if task_name.strip() == "mmlu_pro" else None
+            gen_kwargs = "max_gen_toks=2048" if task_name.strip() in ("mmlu_pro", "gsm8k") else None
             payload = lm_eval.simple_evaluate(
                 model=lm_obj,
                 tasks=tasks_arg,

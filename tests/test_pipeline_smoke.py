@@ -546,7 +546,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         mgsm_spec = build_custom_lm_eval_task_dict("mgsm_ar", num_fewshot=5)
         self.assertEqual(mgsm_spec["doc_to_target"], "{{target_number}}")
         self.assertEqual(mgsm_spec["generation_kwargs"]["max_gen_toks"], 2048)
-        self.assertIn("<|turn>", mgsm_spec["generation_kwargs"]["until"])
+        self.assertIn("<turn|>", mgsm_spec["generation_kwargs"]["until"])
+        self.assertNotIn("<|turn>", mgsm_spec["generation_kwargs"]["until"])
         self.assertEqual(
             mgsm_spec["metric_list"][0]["regexes_to_ignore"],
             [",", "\\$", "\\.$"],
@@ -578,6 +579,22 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             _extract_arc_mcq_letter("Therefore, \\boxed{G}.", "ABCDEFGHIJ"),
             "G",
         )
+        cot_mcq = "Let's evaluate: (A) is 10, (B) is 20, which matches, whereas (C) and (D) are wrong. Therefore, **B**."
+        self.assertEqual(_extract_arc_mcq_letter(cot_mcq, "ABCD"), "B")
+        raw_he = (
+            "We need to check if any two numbers are closer than threshold.\n"
+            "    for idx, elem in enumerate(numbers):\n"
+            "        if idx > 0:\n"
+            "            return True\n"
+            "    return False\n"
+            "```\n"
+            "Example usage:\n```python\nprint(foo([1, 2], 0.5))\n```"
+        )
+        extracted_he = _extract_humaneval_code(raw_he, "def foo(numbers, threshold):\n", "foo")
+        self.assertIn("for idx, elem in enumerate(numbers):", extracted_he)
+        self.assertIn("return False", extracted_he)
+        self.assertNotIn("We need to check", extracted_he)
+        self.assertNotIn("print(foo", extracted_he)
         self.assertEqual(
             _extract_humaneval_code("    x = 1\n    return x\n```", "def foo():\n", "foo"),
             "def foo():\n    x = 1\n    return x\n",
@@ -766,6 +783,22 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             mmlu_pro_mock_payload, task_name="mmlu_pro", metric_hint="exact_match,custom-extract"
         )
         self.assertAlmostEqual(mmlu_pro_detailed["eval_score_pct"], 100.0, places=2)
+        mmlu_pro_native_em_payload = {
+            "results": {"mmlu_pro": {"exact_match,custom-extract": 0.0}},
+            "samples": {
+                "mmlu_pro_biology": [
+                    {
+                        "target": "(C)",
+                        "exact_match,custom-extract": 1.0,
+                        "resps": [["unparsed response"]],
+                    }
+                ]
+            },
+        }
+        mmlu_pro_native_em_detailed = extract_lm_eval_detailed_metrics(
+            mmlu_pro_native_em_payload, task_name="mmlu_pro", metric_hint="exact_match,custom-extract"
+        )
+        self.assertAlmostEqual(mmlu_pro_native_em_detailed["eval_score_pct"], 100.0, places=2)
         le_payload_colon = {
             "results": {
                 "madinah_qa:_average:0": {"acc_norm": 0.742},
