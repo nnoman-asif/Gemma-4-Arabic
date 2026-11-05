@@ -600,6 +600,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(compute_effective_task_limit("arabicmmlu", 200), 5)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_alghafa_light", 180), 20)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_acva_light", 200), 40)
+        self.assertEqual(compute_effective_task_limit("mmlu_pro", 200), 15)
         self.assertEqual(compute_effective_task_limit("leaderboard_mmlu_pro", 200), 200)
 
         tasks_armmlu, primary_armmlu, eff_armmlu = resolve_lm_eval_task_specs(
@@ -609,16 +610,36 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(primary_armmlu, "arabicmmlu")
         self.assertEqual(eff_armmlu, 5)
 
-        self.assertEqual(eval_cfg["arabic_benchmarks"]["ArabicMMLU"]["runner"], "lm_eval")
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["ArabicMMLU"]["runner"], "lighteval")
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["AlGhafa"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["MadinahQA"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["num_fewshot"], 5)
+        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
+        self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval_instruct")
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge_chat")
 
         le_payload = {
             "results": {
+                "community:arabic_mmlu:All:0": {
+                    "acc:logprob_normalization=LogProbCharNorm(name='norm', ignore_first_space=False)": 0.678,
+                    "acc:logprob_normalization=LogProbCharNorm(name='norm', ignore_first_space=False)_stderr": 0.014,
+                },
+                "community:alghafa:_average:0": {"acc_norm": 0.612},
                 "madinah_qa:_average|0": {"acc_norm": 0.725},
                 "aratrust:_average|0": {"acc_norm": 0.815},
             }
         }
+        self.assertAlmostEqual(
+            parse_lighteval_results_json(le_payload, "ArabicMMLU")["eval_score_pct"],
+            67.80,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            parse_lighteval_results_json(le_payload, "AlGhafa")["eval_score_pct"],
+            61.20,
+            places=2,
+        )
         self.assertAlmostEqual(
             parse_lighteval_results_json(le_payload, "MadinahQA")["eval_score_pct"],
             72.50,

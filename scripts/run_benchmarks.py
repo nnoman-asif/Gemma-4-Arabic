@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v15_lm_eval_lighteval_vllm"
+EVAL_CACHE_VERSION = "v16_instruct_oall_v2"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -56,13 +56,28 @@ GROUP_SUBTASK_COUNTS: Dict[str, int] = {
     "arabicmmlu": 40,
     "arabic_leaderboard_alghafa_light": 9,
     "arabic_leaderboard_acva_light": len(ACVA_CORE_SUBTASKS),
+    "mmlu_pro": 14,
 }
 
-# Native LightEval task definitions for MadinahQA (2 subsets) and AraTrust (8 subsets)
+# Native LightEval task definitions for OALL v2 Arabic benchmarks
 LIGHTEVAL_SUITE_TASK_MAP: Dict[str, Tuple[str, ...]] = {
+    "ArabicMMLU": (
+        "community|arabic_mmlu:All|0",
+    ),
     "MadinahQA": (
         "community|madinah_qa:Arabic Language (General)|0",
         "community|madinah_qa:Arabic Language (Grammar)|0",
+    ),
+    "AlGhafa": (
+        "community|alghafa:mcq_exams_test_ar|0",
+        "community|alghafa:meta_ar_dialects|0",
+        "community|alghafa:meta_ar_msa|0",
+        "community|alghafa:multiple_choice_facts_truefalse_balanced_task|0",
+        "community|alghafa:multiple_choice_grounded_statement_soqal_task|0",
+        "community|alghafa:multiple_choice_grounded_statement_xglue_mlqa_task|0",
+        "community|alghafa:multiple_choice_rating_sentiment_no_neutral_task|0",
+        "community|alghafa:multiple_choice_rating_sentiment_task|0",
+        "community|alghafa:multiple_choice_sentiment_task|0",
     ),
     "AraTrust": (
         "community|aratrust:Trustfulness|0",
@@ -623,6 +638,8 @@ def parse_lm_eval_results_json(
         metric_hint,
         "acc_norm,none",
         "acc,none",
+        "exact_match,custom-extract",
+        "exact_match,remove_whitespace",
         "exact_match,flexible-extract",
         "exact_match,strict-match",
         "exact_match,none",
@@ -733,12 +750,20 @@ def parse_lighteval_results_json(
     lighteval_payload: Dict[str, Any],
     suite_name: str,
 ) -> Dict[str, Any]:
-    """Extract percentage score (`0.0` to `100.0`) for `MadinahQA` or `AraTrust` from `lighteval` results."""
+    """Extract percentage score (`0.0` to `100.0`) for OALL v2 Arabic benchmarks from `lighteval` results."""
     results_block = lighteval_payload.get("results", {})
     if not isinstance(results_block, dict) or not results_block:
         raise ValueError(f"LightEval payload has no 'results' entries for '{suite_name}'.")
 
-    prefix = "madinah_qa" if suite_name.lower() == "madinahqa" else "aratrust"
+    prefix_map = {
+        "arabicmmlu": "arabic_mmlu",
+        "madinahqa": "madinah_qa",
+        "alghafa": "alghafa",
+        "acva": "acva",
+        "exams-ar": "arabic_exams",
+        "aratrust": "aratrust",
+    }
+    prefix = prefix_map.get(suite_name.strip().lower(), suite_name.strip().lower())
     avg_candidates = (
         f"community|{prefix}:_average|0",
         f"community:{prefix}:_average:0",
@@ -746,7 +771,10 @@ def parse_lighteval_results_json(
         f"lighteval:{prefix}:_average:0",
         f"{prefix}:_average|0",
         f"{prefix}:_average:0",
-        "madinah_qa:_average:0" if prefix == "madinah_qa" else "aratrust:_average:0",
+        f"community|{prefix}:All|0",
+        f"community:{prefix}:All:0",
+        f"{prefix}:All|0",
+        f"{prefix}:All:0",
         f"community|{prefix}|0",
         f"community:{prefix}:0",
         f"{prefix}|0",
@@ -775,12 +803,25 @@ def parse_lighteval_results_json(
 
     scores: List[float] = []
     for mdict in matched_metrics:
+        found = False
         for mkey in ("acc_norm", "loglikelihood_acc_norm", "acc", "loglikelihood_acc", "accuracy"):
             if mkey in mdict and isinstance(mdict[mkey], (int, float)):
                 val = float(mdict[mkey])
                 scores.append(val * 100.0 if val <= 1.0 else val)
+                found = True
                 break
-        else:
+        if not found:
+            for mkey, mval in mdict.items():
+                if (
+                    str(mkey).startswith("acc")
+                    and not str(mkey).endswith("_stderr")
+                    and isinstance(mval, (int, float))
+                ):
+                    val = float(mval)
+                    scores.append(val * 100.0 if val <= 1.0 else val)
+                    found = True
+                    break
+        if not found:
             for mkey, mval in mdict.items():
                 if "stderr" not in str(mkey) and isinstance(mval, (int, float)):
                     val = float(mval)
@@ -1040,6 +1081,7 @@ def run_lm_eval_task(
         if use_vllm
         else f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,tie_word_embeddings=True"
     )
+    gen_kwargs = "max_gen_toks=512" if task_name.strip() == "mmlu_pro" else None
     payload = lm_eval.simple_evaluate(
         model=model_backend,
         model_args=model_args,
@@ -1048,6 +1090,7 @@ def run_lm_eval_task(
         batch_size="auto" if use_vllm else batch_size,
         device=device,
         limit=eff_limit,
+        gen_kwargs=gen_kwargs,
         random_seed=42,
         numpy_random_seed=42,
         torch_random_seed=42,
@@ -1342,12 +1385,14 @@ def _evaluate_checkpoint_with_lm_eval(
                 str(eff_limit),
                 metric_hint,
             )
+            gen_kwargs = "max_gen_toks=512" if task_name.strip() == "mmlu_pro" else None
             payload = lm_eval.simple_evaluate(
                 model=lm_obj,
                 tasks=tasks_arg,
                 num_fewshot=num_fewshot,
                 batch_size="auto" if effective_use_vllm else batch_size,
                 limit=eff_limit,
+                gen_kwargs=gen_kwargs,
                 random_seed=42,
                 numpy_random_seed=42,
                 torch_random_seed=42,

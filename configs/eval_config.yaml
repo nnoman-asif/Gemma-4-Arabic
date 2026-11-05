@@ -51,12 +51,12 @@ retention_gate:
 
 arabic_benchmarks:
   ArabicMMLU:
-    runner: "lm_eval"
+    runner: "lighteval"
     lm_eval_task: "arabicmmlu"
-    lighteval_task: "community|arabic_mmlu:_average|0"
+    lighteval_task: "community|arabic_mmlu:All|0"
     helm_task: "arabic_mmlu"
     qimma_task: "MBZUAI/ArabicMMLU"
-    metric: "acc"
+    metric: "acc_norm"
     num_fewshot: 0
     description: "Native 40-subject curriculum across KSA, Jordan, Egypt, and UAE (STEM, Islamic Studies, Arab Law, History, Civics)"
 
@@ -71,7 +71,7 @@ arabic_benchmarks:
     description: "Classical and MSA Arabic language and grammar (Nahw, Sarf, Irab, Balagha)"
 
   AlGhafa:
-    runner: "lm_eval"
+    runner: "lighteval"
     lm_eval_task: "arabic_leaderboard_alghafa_light"
     lighteval_task: "community|alghafa:_average|0"
     helm_task: "alghafa"
@@ -87,7 +87,7 @@ arabic_benchmarks:
     helm_task: "acva"
     qimma_task: "OALL/ACVA"
     metric: "acc_norm"
-    num_fewshot: 0
+    num_fewshot: 5
     description: "Arabic and Islamic cultural values alignment across 58 native subtasks"
 
   EXAMS-AR:
@@ -124,8 +124,8 @@ retention_anchors:
   MMLU-Pro:
     runner: "lm_eval"
     domain: "english_reasoning"
-    lm_eval_task: "leaderboard_mmlu_pro"
-    metric: "acc"
+    lm_eval_task: "mmlu_pro"
+    metric: "exact_match,custom-extract"
     num_fewshot: 5
     max_regression_pct: 1.50
     min_acceptable_score: 60.0
@@ -142,7 +142,7 @@ retention_anchors:
   HumanEval:
     runner: "lm_eval"
     domain: "code_generation"
-    lm_eval_task: "humaneval"
+    lm_eval_task: "humaneval_instruct"
     metric: "pass@1,create_test"
     num_fewshot: 0
     max_regression_pct: 1.50
@@ -151,8 +151,8 @@ retention_anchors:
   ARC-Challenge:
     runner: "lm_eval"
     domain: "english_science_anchor"
-    lm_eval_task: "arc_challenge"
-    metric: "acc_norm"
+    lm_eval_task: "arc_challenge_chat"
+    metric: "exact_match,remove_whitespace"
     num_fewshot: 0
     max_regression_pct: 1.50
     min_acceptable_score: 65.0

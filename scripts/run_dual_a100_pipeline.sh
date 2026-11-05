@@ -126,14 +126,14 @@ if ! "${PYTHON_BIN}" -c "import lighteval, inspect_ai" >/dev/null 2>&1; then
 fi
 
 if ! "${PYTHON_BIN}" -c "import vllm" >/dev/null 2>&1; then
-  echo "[Setup] Installing vLLM (>=0.30.0) while preserving transformers>=5.5.3..."
-  "${PYTHON_BIN}" -m pip install -q "vllm>=0.30.0" "transformers>=5.5.3" || "${PYTHON_BIN}" -m pip install -q vllm "transformers>=5.5.3"
+  echo "[Setup] Installing vLLM (>=0.30.0) while preserving transformers==5.17.0..."
+  "${PYTHON_BIN}" -m pip install -q "vllm>=0.30.0" "transformers==5.17.0" || "${PYTHON_BIN}" -m pip install -q vllm "transformers==5.17.0"
 fi
 
-# Guarantee transformers>=5.5.3 was not downgraded by any package install
-if ! "${PYTHON_BIN}" -c "import transformers; from packaging.version import Version; assert Version(transformers.__version__) >= Version('5.5.0')" >/dev/null 2>&1; then
-  echo "[Setup] Restoring transformers>=5.5.3 for Gemma4ForConditionalGeneration..."
-  "${PYTHON_BIN}" -m pip install -q -U "transformers>=5.5.3"
+# Guarantee transformers>=5.5.0 (pinned at 5.17.0 for vLLM + Unsloth compatibility)
+if ! "${PYTHON_BIN}" -c "import transformers; from packaging.version import Version; assert Version('5.5.0') <= Version(transformers.__version__) <= Version('5.17.0')" >/dev/null 2>&1; then
+  echo "[Setup] Pinning transformers==5.17.0 for Gemma4ForConditionalGeneration + vLLM + Unsloth..."
+  "${PYTHON_BIN}" -m pip install -q "transformers==5.17.0"
 fi
 
 "${PYTHON_BIN}" scripts/run_benchmarks.py \
