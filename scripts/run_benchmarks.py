@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v17_thinking_aware_full"
+EVAL_CACHE_VERSION = "v18_ctx8192_thinking_aware"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -1166,7 +1166,7 @@ def run_lighteval_tasks_subprocess(
     suite_names: List[str],
     device: str = "cuda:0",
     limit: Optional[int] = None,
-    max_seq_len: int = 4096,
+    max_seq_len: int = 8192,
     batch_size: int = 16,
     use_vllm: bool = True,
     tag: str = "",
@@ -1349,7 +1349,7 @@ def run_lm_eval_task(
     model_backend = "vllm" if use_vllm else "hf"
     model_args = (
         f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,"
-        f"gpu_memory_utilization=0.85,max_model_len=4096"
+        f"gpu_memory_utilization=0.85,max_model_len=8192"
         if use_vllm
         else f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,tie_word_embeddings=True"
     )
@@ -1462,7 +1462,7 @@ def _evaluate_checkpoint_with_lm_eval(
     model_specific_cfg = cfg.get("models", {}).get(model_key_prefix, {})
     default_bs = 8 if model_key_prefix == "26b_a4b" else int(eval_cfg.get("batch_size", 32))
     batch_size = int(model_specific_cfg.get("batch_size", default_bs))
-    max_seq_len = int(eval_cfg.get("max_seq_length", 4096))
+    max_seq_len = int(eval_cfg.get("max_seq_length", 8192))
 
     lighteval_suites: List[str] = [
         sname
