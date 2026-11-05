@@ -550,6 +550,18 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             _extract_arc_mcq_letter("<|think|>\nThinking...\n<|think|>\nFinal Answer: (D)", "ABCDEFGHIJ"),
             "D",
         )
+        self.assertEqual(
+            _extract_arc_mcq_letter("Let's see what the answer is. The answer is **C**.", "ABCDEFGHIJ"),
+            "C",
+        )
+        self.assertEqual(
+            _extract_arc_mcq_letter("The answer is based on Hooke's law. Final Answer: **D**", "ABCDEFGHIJ"),
+            "D",
+        )
+        self.assertEqual(
+            _extract_humaneval_code("    x = 1\n    return x\n```", "def foo():\n", "foo"),
+            "def foo():\n    x = 1\n    return x\n",
+        )
         he_code = _extract_humaneval_code(
             "<|think|>\n<|think|>\n```python\ndef add(a, b):\n    return a + b\n```",
             "def add(a, b):\n",

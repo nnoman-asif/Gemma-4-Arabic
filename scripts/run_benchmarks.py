@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v18_ctx8192_thinking_aware"
+EVAL_CACHE_VERSION = "v18_retention_extract_fixed"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -339,7 +339,7 @@ _EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
 
 
 def _strip_thinking_blocks(text: str) -> str:
-    """Remove Gemma 4 `<|think|>...<|think|>` or `<think>...</think>` blocks from model output."""
+    """Remove Gemma 4 `<|think|>...<|think|>` or `<think>...</think>` blocks without stripping line-1 indentation."""
     s = str(text or "")
     s = re.sub(r"<\|think\|>.*?<\|think\|>", "", s, flags=re.DOTALL)
     s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
@@ -347,7 +347,7 @@ def _strip_thinking_blocks(text: str) -> str:
         s = s.split("<|think|>")[-1]
     if "<think>" in s:
         s = s.split("<think>")[-1]
-    return s.strip()
+    return s.strip("\r\n")
 
 
 def _normalize_arabic_digits(text: str) -> str:
@@ -429,13 +429,22 @@ def _process_arc_challenge_chat_docs(dataset: Any) -> Any:
 
 def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
     """Strip `<|think|>` blocks and extract the final selected option letter (`A`-`D` or `A`-`J`)."""
-    cleaned = _strip_thinking_blocks(text)
+    cleaned = _strip_thinking_blocks(text).strip()
     if not cleaned:
         return ""
+    upper_letters = valid_letters.upper()
+    lower_letters = valid_letters.lower()
     patterns = (
-        rf"(?i)(?:final\s+answer|best\s+answer|the\s+answer|answer|correct\s+option|الإجابة)\s*(?:is|:)?\s*\(?([{valid_letters}])\)?",
-        rf"\(([{valid_letters}])\)",
-        rf"\b([{valid_letters}])\b",
+        # Explicit answer phrase + required separator (is / : / =) + optional markdown bold/parens + UPPERCASE letter
+        rf"(?:(?i:final\s+answer|best\s+answer|the\s+answer|correct\s+answer|correct\s+option|answer)|الإجابة)[\*\s]*(?:(?i:is)|:|=)[\*\s\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
+        # Fallback where 'Final Answer' is followed directly by bold/parenthesized uppercase letter
+        rf"(?i:final\s+answer|best\s+answer|correct\s+option)[\*\s:]+[\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
+        # Parenthesized letter e.g. (A) or **(A)**
+        rf"\(([{upper_letters}{lower_letters}])\)",
+        # Standalone bold uppercase letter e.g. **C** or **C.**
+        rf"\*\*([{upper_letters}])\.?\*\*",
+        # Standalone uppercase letter at word boundary
+        rf"\b([{upper_letters}])\b",
     )
     for pat in patterns:
         matches = re.findall(pat, cleaned)
@@ -461,32 +470,63 @@ def _extract_arc_mcq_filter(
 
 def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str:
     """Strip `<|think|>` blocks and markdown fences from `humaneval_instruct` generations and assemble runnable Python."""
+    import textwrap
+
     cleaned = _strip_thinking_blocks(raw_resp)
     if "```" in cleaned:
-        m = re.search(r"```(?:python)?\s*\n(.*?)```", cleaned, flags=re.DOTALL | re.IGNORECASE)
-        if m:
-            cleaned = m.group(1)
+        # Case 1: Model opened a fenced code block (```python ... ```)
+        fenced_blocks = re.findall(
+            r"```(?:python|py)?\s*\r?\n(.*?)```",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if fenced_blocks:
+            # Prefer the block that defines `entry_point` or the last code block
+            chosen_block = fenced_blocks[-1]
+            for blk in fenced_blocks:
+                if entry_point and re.search(rf"(?m)^\s*def\s+{re.escape(entry_point)}\s*\(", blk):
+                    chosen_block = blk
+                    break
+            cleaned = chosen_block
+        elif re.match(r"^\s*```(?:python|py)?\s*\r?\n", cleaned, flags=re.IGNORECASE):
+            cleaned = re.sub(r"^\s*```(?:python|py)?\s*\r?\n", "", cleaned, count=1, flags=re.IGNORECASE)
+            cleaned = cleaned.split("```")[0]
         else:
-            parts = re.split(r"```(?:python)?\s*\n", cleaned, maxsplit=1, flags=re.IGNORECASE)
-            if len(parts) > 1:
-                cleaned = parts[1].split("```")[0]
-    cleaned = cleaned.replace("```", "").rstrip()
+            # Case 2: Model continued code directly after prompt and closed with ```
+            cleaned = cleaned.split("```")[0]
 
+    cleaned = cleaned.rstrip()
     prompt_str = str(prompt or "")
     entry_str = str(entry_point or "").strip()
-    if entry_str and re.search(rf"(?m)^def\s+{re.escape(entry_str)}\s*\(", cleaned):
+
+    # If model emitted the full `def <entry_point>(...)` function definition:
+    if entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", cleaned):
+        cleaned_dedented = textwrap.dedent(cleaned).strip("\r\n")
         prefix_match = re.split(rf"(?m)^def\s+{re.escape(entry_str)}\s*\(", prompt_str, maxsplit=1)
         preamble = prefix_match[0] if len(prefix_match) > 1 else ""
-        if preamble.strip() and preamble.strip() not in cleaned:
-            return preamble.rstrip() + "\n\n" + cleaned + "\n"
-        return cleaned + "\n"
+        if preamble.strip() and preamble.strip() not in cleaned_dedented:
+            return preamble.rstrip() + "\n\n" + cleaned_dedented + "\n"
+        return cleaned_dedented + "\n"
 
+    # Otherwise `cleaned` is the function body continuation after `prompt`:
     lines = cleaned.splitlines()
     non_empty = [ln for ln in lines if ln.strip()]
-    if non_empty and not non_empty[0].startswith((" ", "\t")):
-        cleaned = "\n".join(("    " + ln if ln.strip() else "") for ln in lines)
+    if non_empty:
+        first_indented = non_empty[0].startswith((" ", "\t"))
+        rest_indented = any(ln.startswith((" ", "\t")) for ln in non_empty[1:])
+        if not first_indented and rest_indented:
+            # Only the first line lost its 4-space indent
+            for idx, ln in enumerate(lines):
+                if ln.strip():
+                    lines[idx] = "    " + ln
+                    break
+            cleaned = "\n".join(lines)
+        elif not first_indented and not rest_indented:
+            # Entire body block is unindented
+            cleaned = "\n".join(("    " + ln if ln.strip() else "") for ln in lines)
+
     sep = "" if prompt_str.endswith("\n") else "\n"
-    return prompt_str + sep + cleaned + "\n"
+    return prompt_str + sep + cleaned.strip("\r\n") + "\n"
 
 
 def _build_humaneval_instruct_predictions(
@@ -640,11 +680,11 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "test_split": "test",
             "num_fewshot": 0,
             "output_type": "generate_until",
-            "doc_to_text": "Write a Python solution to the following problem and make sure that it passes the tests:\n```python\n{{prompt}}\n```\n",
+            "doc_to_text": "Write a Python solution to the following problem and make sure that it passes the tests:\n```python\n{{prompt}}",
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
-                "until": ["<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\n```", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -960,6 +1000,7 @@ def extract_lm_eval_detailed_metrics(
                             break
                         choice_resp = choice_resp[0]
 
+                native_em = float(sample.get("exact_match", 0.0) or 0.0) >= 1.0
                 if "mmlu_pro" in task_lower:
                     raw_resp = _first_resp_text(resps)
                     doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
@@ -967,7 +1008,7 @@ def extract_lm_eval_detailed_metrics(
                     if gold_letter:
                         pred_letter = _extract_arc_mcq_letter(raw_resp, valid_letters="ABCDEFGHIJ")
                         rescored_total += 1
-                        if pred_letter == gold_letter:
+                        if native_em or (pred_letter == gold_letter):
                             rescored_correct += 1
                 elif "gsm8k" in task_lower:
                     raw_resp = _first_resp_text(resps)
@@ -978,7 +1019,7 @@ def extract_lm_eval_detailed_metrics(
                         cleaned_resp = _strip_thinking_blocks(raw_resp)
                         pred_num = _extract_mgsm_ar_target_number(cleaned_resp)
                         rescored_total += 1
-                        if _numbers_match(pred_num, gold_num):
+                        if native_em or _numbers_match(pred_num, gold_num):
                             rescored_correct += 1
 
     if rescored_total > 0 and ("mmlu_pro" in task_lower or "gsm8k" in task_lower):
@@ -1353,7 +1394,7 @@ def run_lm_eval_task(
         if use_vllm
         else f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,tie_word_embeddings=True"
     )
-    gen_kwargs = "max_gen_toks=2048" if task_name.strip() in ("mmlu_pro", "gsm8k") else None
+    gen_kwargs = "max_gen_toks=2048" if task_name.strip() == "mmlu_pro" else None
     payload = lm_eval.simple_evaluate(
         model=model_backend,
         model_args=model_args,
@@ -1658,7 +1699,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 str(eff_limit),
                 metric_hint,
             )
-            gen_kwargs = "max_gen_toks=2048" if task_name.strip() in ("mmlu_pro", "gsm8k") else None
+            gen_kwargs = "max_gen_toks=2048" if task_name.strip() == "mmlu_pro" else None
             payload = lm_eval.simple_evaluate(
                 model=lm_obj,
                 tasks=tasks_arg,
