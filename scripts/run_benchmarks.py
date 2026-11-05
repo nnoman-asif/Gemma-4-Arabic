@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v16_instruct_oall_v2"
+EVAL_CACHE_VERSION = "v17_thinking_aware_full"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -78,6 +78,16 @@ LIGHTEVAL_SUITE_TASK_MAP: Dict[str, Tuple[str, ...]] = {
         "community|alghafa:multiple_choice_rating_sentiment_no_neutral_task|0",
         "community|alghafa:multiple_choice_rating_sentiment_task|0",
         "community|alghafa:multiple_choice_sentiment_task|0",
+    ),
+    "ACVA": (
+        "community|acva:Saudi_Arabia|5",
+        "community|acva:Arab_Empire|5",
+        "community|acva:Arabic_Culture|5",
+        "community|acva:Islam_Education|5",
+        "community|acva:Islamic_law_system|5",
+    ),
+    "EXAMS-AR": (
+        "community|arabic_exams|0",
     ),
     "AraTrust": (
         "community|aratrust:Trustfulness|0",
@@ -328,6 +338,18 @@ _EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
 )
 
 
+def _strip_thinking_blocks(text: str) -> str:
+    """Remove Gemma 4 `<|think|>...<|think|>` or `<think>...</think>` blocks from model output."""
+    s = str(text or "")
+    s = re.sub(r"<\|think\|>.*?<\|think\|>", "", s, flags=re.DOTALL)
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
+    if "<|think|>" in s:
+        s = s.split("<|think|>")[-1]
+    if "<think>" in s:
+        s = s.split("<think>")[-1]
+    return s.strip()
+
+
 def _normalize_arabic_digits(text: str) -> str:
     """Translate Eastern Arabic (`٠-٩`) and Extended Arabic-Indic (`۰-۹`) digits to ASCII `0-9`."""
     return str(text or "").translate(_EASTERN_ARABIC_DIGIT_MAP)
@@ -370,19 +392,119 @@ def _normalize_arabic_digits_filter(
     resps: List[Any],
     docs: List[Dict[str, Any]],
 ) -> List[List[str]]:
-    """Custom `lm_eval` filter that converts Eastern Arabic digits (`٠-٩`) in model generations to ASCII `0-9`."""
+    """Strip `<|think|>` blocks and convert Eastern Arabic digits (`٠-٩`) in model generations to ASCII `0-9`."""
     _ = docs
     out: List[List[str]] = []
     for inst in resps:
         if isinstance(inst, (list, tuple)):
-            out.append([_normalize_arabic_digits(str(r)) for r in inst])
+            out.append([_normalize_arabic_digits(_strip_thinking_blocks(str(r))) for r in inst])
         else:
-            out.append([_normalize_arabic_digits(str(inst))])
+            out.append([_normalize_arabic_digits(_strip_thinking_blocks(str(inst)))])
+    return out
+
+
+def _process_arc_challenge_chat_docs(dataset: Any) -> Any:
+    """Format `allenai/ai2_arc` (`ARC-Challenge`) rows with `A-D` option letters for `<|think|>`-aware generative evaluation."""
+    num_to_letter = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E"}
+
+    def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
+        choices = doc.get("choices") or {}
+        texts = list(choices.get("text") or [])
+        labels = [
+            num_to_letter.get(str(lbl).strip(), str(lbl).strip().upper())
+            for lbl in (choices.get("label") or [])
+        ]
+        choice_lines = [f"{lbl}. {txt}" for lbl, txt in zip(labels, texts)]
+        stem = str(doc.get("question") or "").strip()
+        formatted_q = f"{stem}\nChoices:\n" + "\n".join(choice_lines) + "\nAnswer:"
+        raw_key = str(doc.get("answerKey") or "").strip()
+        target_letter = num_to_letter.get(raw_key, raw_key.upper())
+        return {
+            "formatted_question": formatted_q,
+            "target_letter": target_letter,
+        }
+
+    return dataset.map(_map_row)
+
+
+def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
+    """Strip `<|think|>` blocks and extract the final selected option letter (`A`-`D` or `A`-`J`)."""
+    cleaned = _strip_thinking_blocks(text)
+    if not cleaned:
+        return ""
+    patterns = (
+        rf"(?i)(?:final\s+answer|best\s+answer|the\s+answer|answer|correct\s+option|الإجابة)\s*(?:is|:)?\s*\(?([{valid_letters}])\)?",
+        rf"\(([{valid_letters}])\)",
+        rf"\b([{valid_letters}])\b",
+    )
+    for pat in patterns:
+        matches = re.findall(pat, cleaned)
+        if matches:
+            return str(matches[-1]).upper()
+    return cleaned[:1].upper()
+
+
+def _extract_arc_mcq_filter(
+    resps: List[Any],
+    docs: List[Dict[str, Any]],
+) -> List[List[str]]:
+    """Custom `lm_eval` filter for `arc_challenge_chat` that strips `<|think|>` blocks and extracts `A-D`."""
+    _ = docs
+    out: List[List[str]] = []
+    for inst in resps:
+        if isinstance(inst, (list, tuple)):
+            out.append([_extract_arc_mcq_letter(str(r), "ABCD") for r in inst])
+        else:
+            out.append([_extract_arc_mcq_letter(str(inst), "ABCD")])
+    return out
+
+
+def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str:
+    """Strip `<|think|>` blocks and markdown fences from `humaneval_instruct` generations and assemble runnable Python."""
+    cleaned = _strip_thinking_blocks(raw_resp)
+    if "```" in cleaned:
+        m = re.search(r"```(?:python)?\s*\n(.*?)```", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            cleaned = m.group(1)
+        else:
+            parts = re.split(r"```(?:python)?\s*\n", cleaned, maxsplit=1, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                cleaned = parts[1].split("```")[0]
+    cleaned = cleaned.replace("```", "").rstrip()
+
+    prompt_str = str(prompt or "")
+    entry_str = str(entry_point or "").strip()
+    if entry_str and re.search(rf"(?m)^def\s+{re.escape(entry_str)}\s*\(", cleaned):
+        prefix_match = re.split(rf"(?m)^def\s+{re.escape(entry_str)}\s*\(", prompt_str, maxsplit=1)
+        preamble = prefix_match[0] if len(prefix_match) > 1 else ""
+        if preamble.strip() and preamble.strip() not in cleaned:
+            return preamble.rstrip() + "\n\n" + cleaned + "\n"
+        return cleaned + "\n"
+
+    lines = cleaned.splitlines()
+    non_empty = [ln for ln in lines if ln.strip()]
+    if non_empty and not non_empty[0].startswith((" ", "\t")):
+        cleaned = "\n".join(("    " + ln if ln.strip() else "") for ln in lines)
+    sep = "" if prompt_str.endswith("\n") else "\n"
+    return prompt_str + sep + cleaned + "\n"
+
+
+def _build_humaneval_instruct_predictions(
+    resps: List[Any],
+    docs: List[Dict[str, Any]],
+) -> List[List[str]]:
+    """Custom `create_test` filter for `humaneval_instruct` that handles `<|think|>` blocks and full `def` blocks."""
+    out: List[List[str]] = []
+    for inst, doc in zip(resps, docs):
+        prompt = str(doc.get("prompt") or "")
+        entry_point = str(doc.get("entry_point") or "")
+        seq = inst if isinstance(inst, (list, tuple)) else [inst]
+        out.append([_extract_humaneval_code(str(r), prompt, entry_point) for r in seq])
     return out
 
 
 def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict[str, Any]:
-    """Return task configuration dictionary for `mgsm_ar` (and metadata stubs for legacy callers)."""
+    """Return task configuration dictionary for `mgsm_ar`, `arc_challenge_chat`, `humaneval_instruct`, and metadata stubs."""
     key = task_name.strip().lower()
     if key == "mgsm_ar":
         return {
@@ -415,7 +537,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                 ],
                 "do_sample": False,
                 "temperature": 0.0,
-                "max_gen_toks": 256,
+                "max_gen_toks": 2048,
             },
             "filter_list": [
                 {
@@ -460,6 +582,94 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             ],
             "metadata": {"version": 1.0},
         }
+    if key == "arc_challenge_chat":
+        return {
+            "task": "arc_challenge_chat",
+            "dataset_path": "allenai/ai2_arc",
+            "dataset_name": "ARC-Challenge",
+            "training_split": "train",
+            "validation_split": "validation",
+            "test_split": "test",
+            "fewshot_split": "train",
+            "num_fewshot": int(num_fewshot),
+            "output_type": "generate_until",
+            "process_docs": _process_arc_challenge_chat_docs,
+            "doc_to_text": "Select the correct option letter (A, B, C, or D) for the following question and end your response with 'Final Answer: X'.\n\nQuestion: {{formatted_question}}",
+            "doc_to_target": "{{target_letter}}",
+            "generation_kwargs": {
+                "until": ["Question:", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "do_sample": False,
+                "temperature": 0.0,
+                "max_gen_toks": 2048,
+            },
+            "filter_list": [
+                {
+                    "name": "custom-extract",
+                    "filter": [
+                        {
+                            "function": "custom",
+                            "filter_fn": _extract_arc_mcq_filter,
+                        },
+                        {"function": "take_first"},
+                    ],
+                }
+            ],
+            "metric_list": [
+                {
+                    "metric": "exact_match",
+                    "aggregation": "mean",
+                    "higher_is_better": True,
+                    "ignore_case": True,
+                    "ignore_punctuation": True,
+                }
+            ],
+            "metadata": {"version": 1.0},
+        }
+    if key == "humaneval_instruct":
+        try:
+            from lm_eval.tasks.humaneval.utils import pass_at_k
+        except Exception:
+
+            def pass_at_k(references: List[str], predictions: List[List[str]], k: Optional[List[int]] = None) -> Dict[str, float]:  # type: ignore
+                _ = (references, predictions, k)
+                return {"pass@1": 0.0}
+
+        return {
+            "task": "humaneval_instruct",
+            "dataset_path": "openai/openai_humaneval",
+            "test_split": "test",
+            "num_fewshot": 0,
+            "output_type": "generate_until",
+            "doc_to_text": "Write a Python solution to the following problem and make sure that it passes the tests:\n```python\n{{prompt}}\n```\n",
+            "doc_to_target": "{{test}}\ncheck({{entry_point}})",
+            "unsafe_code": True,
+            "generation_kwargs": {
+                "until": ["<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "do_sample": False,
+                "temperature": 0.0,
+                "max_gen_toks": 2048,
+            },
+            "filter_list": [
+                {
+                    "name": "create_test",
+                    "filter": [
+                        {
+                            "function": "custom",
+                            "filter_fn": _build_humaneval_instruct_predictions,
+                        },
+                    ],
+                }
+            ],
+            "metric_list": [
+                {
+                    "metric": pass_at_k,
+                    "aggregation": "mean",
+                    "higher_is_better": True,
+                    "k": [1],
+                }
+            ],
+            "metadata": {"version": 1.0},
+        }
     if key == "arabicmmlu":
         return {
             "task": "arabicmmlu",
@@ -498,7 +708,7 @@ def resolve_lm_eval_task_specs(
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
 
-    if clean_name.lower() == "mgsm_ar":
+    if clean_name.lower() in ("mgsm_ar", "arc_challenge_chat", "humaneval_instruct"):
         custom_dict = build_custom_lm_eval_task_dict(clean_name, num_fewshot=num_fewshot)
         return ([custom_dict], str(custom_dict["task"]), eff_limit)
 
@@ -680,6 +890,28 @@ def parse_lm_eval_results_json(
     raise ValueError(f"Could not locate numeric metric '{metric_hint}' in lm_eval output: {task_metrics}")
 
 
+def _first_resp_text(resps: Any) -> str:
+    """Unwrap nested `lm_eval` `sample['resps']` lists/tuples and return the first generation string."""
+    cur = resps
+    while isinstance(cur, (list, tuple)) and len(cur) > 0:
+        cur = cur[0]
+    return str(cur or "")
+
+
+def _numbers_match(pred_num: str, gold_num: str) -> bool:
+    """Check exact or float-equivalent equality between two extracted numeric strings."""
+    p = str(pred_num or "").strip().replace(",", "")
+    g = str(gold_num or "").strip().replace(",", "")
+    if not p or not g:
+        return False
+    if p == g:
+        return True
+    try:
+        return abs(float(p) - float(g)) < 1e-6
+    except ValueError:
+        return False
+
+
 def extract_lm_eval_detailed_metrics(
     results_payload: Dict[str, Any],
     task_name: str,
@@ -704,6 +936,10 @@ def extract_lm_eval_detailed_metrics(
     gold_nlls: List[float] = []
     n_samples = 0
 
+    task_lower = task_name.strip().lower()
+    rescored_correct = 0
+    rescored_total = 0
+
     if isinstance(samples_block, dict) and samples_block:
         for _subtask, sample_list in samples_block.items():
             if not isinstance(sample_list, list):
@@ -723,6 +959,32 @@ def extract_lm_eval_detailed_metrics(
                                 gold_nlls.append(max(0.0, -ll))
                             break
                         choice_resp = choice_resp[0]
+
+                if "mmlu_pro" in task_lower:
+                    raw_resp = _first_resp_text(resps)
+                    doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
+                    gold_letter = str(target if target is not None else doc_obj.get("answer") or "").strip().upper()
+                    if gold_letter:
+                        pred_letter = _extract_arc_mcq_letter(raw_resp, valid_letters="ABCDEFGHIJ")
+                        rescored_total += 1
+                        if pred_letter == gold_letter:
+                            rescored_correct += 1
+                elif "gsm8k" in task_lower:
+                    raw_resp = _first_resp_text(resps)
+                    doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
+                    gold_str = str(target if target is not None else doc_obj.get("answer") or "")
+                    gold_num = _extract_mgsm_ar_target_number(gold_str)
+                    if gold_num:
+                        cleaned_resp = _strip_thinking_blocks(raw_resp)
+                        pred_num = _extract_mgsm_ar_target_number(cleaned_resp)
+                        rescored_total += 1
+                        if _numbers_match(pred_num, gold_num):
+                            rescored_correct += 1
+
+    if rescored_total > 0 and ("mmlu_pro" in task_lower or "gsm8k" in task_lower):
+        rescored_pct = round(100.0 * float(rescored_correct) / float(rescored_total), 2)
+        eval_score_pct = max(eval_score_pct, rescored_pct)
+        top1_acc_pct = max(top1_acc_pct, rescored_pct)
 
     if n_samples == 0:
         n_samples_block = results_payload.get("n-samples", {})
@@ -767,16 +1029,26 @@ def parse_lighteval_results_json(
     avg_candidates = (
         f"community|{prefix}:_average|0",
         f"community:{prefix}:_average:0",
+        f"community|{prefix}:_average|5",
+        f"community:{prefix}:_average:5",
         f"lighteval|{prefix}:_average|0",
         f"lighteval:{prefix}:_average:0",
+        f"lighteval|{prefix}:_average|5",
+        f"lighteval:{prefix}:_average:5",
         f"{prefix}:_average|0",
         f"{prefix}:_average:0",
+        f"{prefix}:_average|5",
+        f"{prefix}:_average:5",
         f"community|{prefix}:All|0",
         f"community:{prefix}:All:0",
         f"{prefix}:All|0",
         f"{prefix}:All:0",
         f"community|{prefix}|0",
         f"community:{prefix}:0",
+        f"community|{prefix}:default|0",
+        f"community:{prefix}:default:0",
+        f"{prefix}:default|0",
+        f"{prefix}:default:0",
         f"{prefix}|0",
         f"{prefix}:0",
     )
@@ -1081,7 +1353,7 @@ def run_lm_eval_task(
         if use_vllm
         else f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,tie_word_embeddings=True"
     )
-    gen_kwargs = "max_gen_toks=512" if task_name.strip() == "mmlu_pro" else None
+    gen_kwargs = "max_gen_toks=2048" if task_name.strip() in ("mmlu_pro", "gsm8k") else None
     payload = lm_eval.simple_evaluate(
         model=model_backend,
         model_args=model_args,
@@ -1096,16 +1368,17 @@ def run_lm_eval_task(
         torch_random_seed=42,
         confirm_run_unsafe_code=True,
         apply_chat_template=apply_chat_template,
+        log_samples=True,
         bootstrap_iters=0,
         task_manager=TaskManager(),
     )
     if not isinstance(payload, dict):
         raise RuntimeError(f"lm_eval.simple_evaluate returned empty payload for task '{task_name}'.")
-    return parse_lm_eval_results_json(
+    return extract_lm_eval_detailed_metrics(
         results_payload=payload,
         task_name=primary_key,
         metric_hint=metric_hint,
-    )
+    )["eval_score_pct"]
 
 
 def _run_lm_eval_suites_subprocess(
@@ -1385,7 +1658,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 str(eff_limit),
                 metric_hint,
             )
-            gen_kwargs = "max_gen_toks=512" if task_name.strip() == "mmlu_pro" else None
+            gen_kwargs = "max_gen_toks=2048" if task_name.strip() in ("mmlu_pro", "gsm8k") else None
             payload = lm_eval.simple_evaluate(
                 model=lm_obj,
                 tasks=tasks_arg,

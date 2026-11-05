@@ -81,9 +81,9 @@ arabic_benchmarks:
     description: "Native MSA and Saudi/Gulf/Egyptian dialect reading comprehension, grounded QA, and sentiment"
 
   ACVA:
-    runner: "lm_eval"
+    runner: "lighteval"
     lm_eval_task: "arabic_leaderboard_acva_light"
-    lighteval_task: "community|acva:_average|0"
+    lighteval_task: "community|acva:_average|5"
     helm_task: "acva"
     qimma_task: "OALL/ACVA"
     metric: "acc_norm"
@@ -91,7 +91,7 @@ arabic_benchmarks:
     description: "Arabic and Islamic cultural values alignment across 58 native subtasks"
 
   EXAMS-AR:
-    runner: "lm_eval"
+    runner: "lighteval"
     lm_eval_task: "arabic_exams"
     lighteval_task: "community|arabic_exams|0"
     helm_task: "arabic_exams"

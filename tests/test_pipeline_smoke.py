@@ -39,9 +39,12 @@ from scripts.benchmark_vllm_concurrency import (
 from scripts.run_benchmarks import (
     _build_child_eval_cmd,
     _ensure_gemma4_tied_lm_head,
+    _extract_arc_mcq_letter,
+    _extract_humaneval_code,
     _extract_mgsm_ar_target_number,
     _normalize_arabic_digits_filter,
     _patch_gemma4_config_for_lm_eval,
+    _strip_thinking_blocks,
     build_custom_lm_eval_task_dict,
     compute_effective_task_limit,
     evaluate_retention_gate,
@@ -518,7 +521,14 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(getattr(mock_cfg, "vocab_size", None), 262144)
 
         # Verify custom lm_eval task specs and subtask limit scaling
-        for custom_key in ("arabicmmlu", "madinahqa", "aratrust", "mgsm_ar"):
+        for custom_key in (
+            "arabicmmlu",
+            "madinahqa",
+            "aratrust",
+            "mgsm_ar",
+            "arc_challenge_chat",
+            "humaneval_instruct",
+        ):
             spec_dict = build_custom_lm_eval_task_dict(custom_key, num_fewshot=0)
             self.assertIn("task", spec_dict)
             self.assertIn("dataset_path", spec_dict)
@@ -526,18 +536,34 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
 
         mgsm_spec = build_custom_lm_eval_task_dict("mgsm_ar", num_fewshot=5)
         self.assertEqual(mgsm_spec["doc_to_target"], "{{target_number}}")
-        self.assertEqual(mgsm_spec["generation_kwargs"]["max_gen_toks"], 256)
+        self.assertEqual(mgsm_spec["generation_kwargs"]["max_gen_toks"], 2048)
         self.assertIn("<|turn>", mgsm_spec["generation_kwargs"]["until"])
         self.assertEqual(
             mgsm_spec["metric_list"][0]["regexes_to_ignore"],
             [",", "\\$", "\\.$"],
         )
+        self.assertEqual(
+            _strip_thinking_blocks("<|think|>\nstep 1\n<|think|>\nFinal Answer: (C)"),
+            "Final Answer: (C)",
+        )
+        self.assertEqual(
+            _extract_arc_mcq_letter("<|think|>\nThinking...\n<|think|>\nFinal Answer: (D)", "ABCDEFGHIJ"),
+            "D",
+        )
+        he_code = _extract_humaneval_code(
+            "<|think|>\n<|think|>\n```python\ndef add(a, b):\n    return a + b\n```",
+            "def add(a, b):\n",
+            "add",
+        )
+        self.assertIn("def add(a, b):", he_code)
+        self.assertIn("return a + b", he_code)
+        self.assertNotIn("```", he_code)
         self.assertEqual(_extract_mgsm_ar_target_number("خطوات الحل...\n### 70000"), "70000")
         self.assertEqual(_extract_mgsm_ar_target_number("خطوات الحل...\n##### 57,500"), "57500")
         self.assertEqual(_extract_mgsm_ar_target_number("المجموع هو 126+240 = 366"), "366")
         self.assertEqual(_extract_mgsm_ar_target_number("الناتج النهائي #### ٧٠٠٠٠"), "70000")
         self.assertEqual(
-            _normalize_arabic_digits_filter([["الإجابة هي ٥٧٥٠٠"]], [{}]),
+            _normalize_arabic_digits_filter([["<|think|>\n١٢٣\n<|think|>\nالإجابة هي ٥٧٥٠٠"]], [{}]),
             [["الإجابة هي 57500"]],
         )
 
@@ -613,6 +639,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ArabicMMLU"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AlGhafa"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["MadinahQA"]["runner"], "lighteval")
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["runner"], "lighteval")
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["EXAMS-AR"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
@@ -626,6 +654,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                     "acc:logprob_normalization=LogProbCharNorm(name='norm', ignore_first_space=False)_stderr": 0.014,
                 },
                 "community:alghafa:_average:0": {"acc_norm": 0.612},
+                "community:acva:_average:5": {"acc_norm": 0.784},
+                "community:arabic_exams:default:0": {"acc_norm": 0.565},
                 "madinah_qa:_average|0": {"acc_norm": 0.725},
                 "aratrust:_average|0": {"acc_norm": 0.815},
             }
@@ -641,6 +671,16 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             places=2,
         )
         self.assertAlmostEqual(
+            parse_lighteval_results_json(le_payload, "ACVA")["eval_score_pct"],
+            78.40,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            parse_lighteval_results_json(le_payload, "EXAMS-AR")["eval_score_pct"],
+            56.50,
+            places=2,
+        )
+        self.assertAlmostEqual(
             parse_lighteval_results_json(le_payload, "MadinahQA")["eval_score_pct"],
             72.50,
             places=2,
@@ -650,6 +690,21 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             81.50,
             places=2,
         )
+        mmlu_pro_mock_payload = {
+            "results": {"mmlu_pro": {"exact_match,custom-extract": 0.0}},
+            "samples": {
+                "mmlu_pro_biology": [
+                    {
+                        "target": "C",
+                        "resps": [["<|think|>\nWait, option A is wrong.\n<|think|>\nFinal Answer: C"]],
+                    }
+                ]
+            },
+        }
+        mmlu_pro_detailed = extract_lm_eval_detailed_metrics(
+            mmlu_pro_mock_payload, task_name="mmlu_pro", metric_hint="exact_match,custom-extract"
+        )
+        self.assertAlmostEqual(mmlu_pro_detailed["eval_score_pct"], 100.0, places=2)
         le_payload_colon = {
             "results": {
                 "madinah_qa:_average:0": {"acc_norm": 0.742},
