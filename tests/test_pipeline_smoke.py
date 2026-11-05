@@ -526,6 +526,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             "madinahqa",
             "aratrust",
             "mgsm_ar",
+            "mmlu_pro",
             "arc_challenge_chat",
             "humaneval_instruct",
         ):
@@ -533,6 +534,14 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             self.assertIn("task", spec_dict)
             self.assertIn("dataset_path", spec_dict)
             self.assertIn("output_type", spec_dict)
+
+        mmlu_pro_spec = build_custom_lm_eval_task_dict("mmlu_pro", num_fewshot=5)
+        self.assertEqual(mmlu_pro_spec["dataset_path"], "TIGER-Lab/MMLU-Pro")
+        self.assertEqual(mmlu_pro_spec["doc_to_target"], "{{target_letter}}")
+        he_spec = build_custom_lm_eval_task_dict("humaneval_instruct", num_fewshot=0)
+        self.assertTrue(
+            he_spec["doc_to_text"].endswith("Here is the completed function:\n```python\n{{prompt}}")
+        )
 
         mgsm_spec = build_custom_lm_eval_task_dict("mgsm_ar", num_fewshot=5)
         self.assertEqual(mgsm_spec["doc_to_target"], "{{target_number}}")
@@ -638,7 +647,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(compute_effective_task_limit("arabicmmlu", 200), 5)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_alghafa_light", 180), 20)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_acva_light", 200), 40)
-        self.assertEqual(compute_effective_task_limit("mmlu_pro", 200), 15)
+        self.assertEqual(compute_effective_task_limit("mmlu_pro", 200), 200)
         self.assertEqual(compute_effective_task_limit("leaderboard_mmlu_pro", 200), 200)
 
         tasks_armmlu, primary_armmlu, eff_armmlu = resolve_lm_eval_task_specs(

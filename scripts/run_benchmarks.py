@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v18_retention_extract_fixed"
+EVAL_CACHE_VERSION = "v19_final_clean_full"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -56,7 +56,6 @@ GROUP_SUBTASK_COUNTS: Dict[str, int] = {
     "arabicmmlu": 40,
     "arabic_leaderboard_alghafa_light": 9,
     "arabic_leaderboard_acva_light": len(ACVA_CORE_SUBTASKS),
-    "mmlu_pro": 14,
 }
 
 # Native LightEval task definitions for OALL v2 Arabic benchmarks
@@ -468,6 +467,42 @@ def _extract_arc_mcq_filter(
     return out
 
 
+def _process_mmlu_pro_docs(dataset: Any) -> Any:
+    """Format `TIGER-Lab/MMLU-Pro` rows with `A-J` option letters for `<|think|>`-aware generative evaluation."""
+    letters = "ABCDEFGHIJ"
+
+    def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
+        options = list(doc.get("options") or [])
+        choice_lines = [
+            f"{letters[i]}. {opt}"
+            for i, opt in enumerate(options[: len(letters)])
+        ]
+        stem = str(doc.get("question") or "").strip()
+        formatted_q = f"{stem}\nChoices:\n" + "\n".join(choice_lines) + "\nAnswer:"
+        target_letter = str(doc.get("answer") or "").strip().upper()
+        return {
+            "formatted_question": formatted_q,
+            "target_letter": target_letter,
+        }
+
+    return dataset.map(_map_row)
+
+
+def _extract_mmlu_pro_mcq_filter(
+    resps: List[Any],
+    docs: List[Dict[str, Any]],
+) -> List[List[str]]:
+    """Custom `lm_eval` filter for `mmlu_pro` that strips `<|think|>` blocks and extracts `A-J`."""
+    _ = docs
+    out: List[List[str]] = []
+    for inst in resps:
+        if isinstance(inst, (list, tuple)):
+            out.append([_extract_arc_mcq_letter(str(r), "ABCDEFGHIJ") for r in inst])
+        else:
+            out.append([_extract_arc_mcq_letter(str(inst), "ABCDEFGHIJ")])
+    return out
+
+
 def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str:
     """Strip `<|think|>` blocks and markdown fences from `humaneval_instruct` generations and assemble runnable Python."""
     import textwrap
@@ -622,6 +657,47 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             ],
             "metadata": {"version": 1.0},
         }
+    if key == "mmlu_pro":
+        return {
+            "task": "mmlu_pro",
+            "dataset_path": "TIGER-Lab/MMLU-Pro",
+            "test_split": "test",
+            "validation_split": "validation",
+            "fewshot_split": "validation",
+            "num_fewshot": 0,
+            "output_type": "generate_until",
+            "process_docs": _process_mmlu_pro_docs,
+            "doc_to_text": "Select the correct option letter (A, B, C, D, E, F, G, H, I, or J) for the following question and end your response with 'Final Answer: X'.\n\nQuestion: {{formatted_question}}",
+            "doc_to_target": "{{target_letter}}",
+            "generation_kwargs": {
+                "until": ["Question:", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "do_sample": False,
+                "temperature": 0.0,
+                "max_gen_toks": 2048,
+            },
+            "filter_list": [
+                {
+                    "name": "custom-extract",
+                    "filter": [
+                        {
+                            "function": "custom",
+                            "filter_fn": _extract_mmlu_pro_mcq_filter,
+                        },
+                        {"function": "take_first"},
+                    ],
+                }
+            ],
+            "metric_list": [
+                {
+                    "metric": "exact_match",
+                    "aggregation": "mean",
+                    "higher_is_better": True,
+                    "ignore_case": True,
+                    "ignore_punctuation": True,
+                }
+            ],
+            "metadata": {"version": 1.0},
+        }
     if key == "arc_challenge_chat":
         return {
             "task": "arc_challenge_chat",
@@ -680,14 +756,14 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "test_split": "test",
             "num_fewshot": 0,
             "output_type": "generate_until",
-            "doc_to_text": "Write a Python solution to the following problem and make sure that it passes the tests:\n```python\n{{prompt}}",
+            "doc_to_text": "Write a solution to the following problem and make sure that it passes the tests:\n```python\n{{prompt}}\n```\nHere is the completed function:\n```python\n{{prompt}}",
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
-                "until": ["\n```", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\n```", "\nclass ", "\nif __name__", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
-                "max_gen_toks": 2048,
+                "max_gen_toks": 1024,
             },
             "filter_list": [
                 {
@@ -748,7 +824,7 @@ def resolve_lm_eval_task_specs(
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
 
-    if clean_name.lower() in ("mgsm_ar", "arc_challenge_chat", "humaneval_instruct"):
+    if clean_name.lower() in ("mgsm_ar", "mmlu_pro", "arc_challenge_chat", "humaneval_instruct"):
         custom_dict = build_custom_lm_eval_task_dict(clean_name, num_fewshot=num_fewshot)
         return ([custom_dict], str(custom_dict["task"]), eff_limit)
 
