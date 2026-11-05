@@ -16,6 +16,8 @@ export DATASETS_VERBOSITY=warning
 export PYTHONWARNINGS="ignore::SyntaxWarning,ignore::FutureWarning"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export UNSLOTH_BLOCK_COMPILE="0"
+export HF_ALLOW_CODE_EVAL="1"
+export VLLM_WORKER_MULTIPROC_METHOD="spawn"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -116,11 +118,30 @@ if ! "${PYTHON_BIN}" -c "import lm_eval, evaluate, sqlitedict, pytablewriter, sa
   echo "[Setup] Installing lm-eval and evaluation dependencies..."
   "${PYTHON_BIN}" -m pip install -q "lm-eval>=0.4.8" "evaluate>=0.4.3" "sqlitedict>=2.1.0" "pytablewriter>=1.2.0" "sacrebleu>=2.4.0" "rouge-score>=0.1.2"
 fi
+
+if ! "${PYTHON_BIN}" -c "import lighteval, inspect_ai" >/dev/null 2>&1; then
+  echo "[Setup] Installing lighteval (main branch) and helper dependencies..."
+  "${PYTHON_BIN}" -m pip install -q "inspect-ai" "aenum==3.1.15" "termcolor==2.3.0" "colorlog" "pycountry" "langcodes" "latex2sympy2_extended==1.0.6" "more_itertools" "nltk" "scikit-learn" "GitPython>=3.1.41" "typer>=0.12.0"
+  "${PYTHON_BIN}" -m pip install -q --no-deps "git+https://github.com/huggingface/lighteval.git@main"
+fi
+
+if ! "${PYTHON_BIN}" -c "import vllm" >/dev/null 2>&1; then
+  echo "[Setup] Installing vLLM (>=0.30.0) while preserving transformers>=5.5.3..."
+  "${PYTHON_BIN}" -m pip install -q "vllm>=0.30.0" "transformers>=5.5.3" || "${PYTHON_BIN}" -m pip install -q vllm "transformers>=5.5.3"
+fi
+
+# Guarantee transformers>=5.5.3 was not downgraded by any package install
+if ! "${PYTHON_BIN}" -c "import transformers; from packaging.version import Version; assert Version(transformers.__version__) >= Version('5.5.0')" >/dev/null 2>&1; then
+  echo "[Setup] Restoring transformers>=5.5.3 for Gemma4ForConditionalGeneration..."
+  "${PYTHON_BIN}" -m pip install -q -U "transformers>=5.5.3"
+fi
+
 "${PYTHON_BIN}" scripts/run_benchmarks.py \
   --config configs/eval_config.yaml \
   --model-key both \
   --eval-base \
   --limit 200 \
+  --use-vllm \
   --no-reference-fallback
 
 echo "======================================================================"

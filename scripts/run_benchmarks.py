@@ -1,18 +1,17 @@
 """Automated benchmark runner and Zero-Forgetting Retention Gate evaluator.
 
 Evaluates:
-- 7 Primary Arabic & Saudi Benchmarks (`ArabicMMLU`, `MadinahQA`, `AlGhafa`,
-  `ACVA`, `EXAMS-AR`, `AraTrust`, `MGSM-Ar`) using `lm-evaluation-harness` (`lm_eval`).
-- 4 English/Math/Code Zero-Forgetting Retention Anchors (`MMLU-Pro`, `GSM8K`,
-  `HumanEval`, `ARC-Challenge`) using `lm-evaluation-harness` (`lm_eval`).
+- 8 Native `lm_eval` Benchmarks (`ArabicMMLU`, `AlGhafa`, `ACVA`, `EXAMS-AR`,
+  `ARC-Challenge`, `GSM8K`, `HumanEval`, `MMLU-Pro`) + `MGSM-Ar` using default
+  `lm-evaluation-harness` (`lm_eval`) settings with `vLLM` (`batch_size="auto"`).
+- 2 Native `lighteval` Benchmarks (`MadinahQA`, `AraTrust`) using default
+  `lighteval` settings with `vLLM`.
 - Supports single-model (`e4b` or `26b_a4b`) and dual-model family (`both`)
-  comparisons across `Gemma-4-E4B-Arabic-It` and `Gemma-4-26B-A4B-Arabic-It`.
-- Generates structured Markdown and JSON comparison reports and verifies the
-  `min_retention_ratio >= 0.998` (`max_allowed_drop_pct <= 0.20`) gate.
+  comparisons across `Gemma-4-E4B-Arabic-It` and `Gemma-4-26B-A4B-Arabic-It`
+  using isolated per-GPU subprocesses (`CUDA_VISIBLE_DEVICES=0` and `1`).
 """
 
 import argparse
-import concurrent.futures
 import gc
 import json
 import logging
@@ -25,9 +24,13 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Enforce deterministic hashing and enable HumanEval code execution in lm_eval
+# Enforce deterministic hashing, multiprocessing spawn for vLLM, and HumanEval execution
 os.environ.setdefault("PYTHONHASHSEED", "0")
 os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+for _noisy_logger in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 import yaml
 
@@ -37,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v14_lm_eval_tied_lm_head"
+EVAL_CACHE_VERSION = "v15_lm_eval_lighteval_vllm"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -50,8 +53,27 @@ ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
 
 # Number of subtasks in multi-task lm_eval groups for proportional --limit scaling
 GROUP_SUBTASK_COUNTS: Dict[str, int] = {
+    "arabicmmlu": 40,
     "arabic_leaderboard_alghafa_light": 9,
     "arabic_leaderboard_acva_light": len(ACVA_CORE_SUBTASKS),
+}
+
+# Native LightEval task definitions for MadinahQA (2 subsets) and AraTrust (8 subsets)
+LIGHTEVAL_SUITE_TASK_MAP: Dict[str, Tuple[str, ...]] = {
+    "MadinahQA": (
+        "community|madinah_qa:Arabic Language (General)|0",
+        "community|madinah_qa:Arabic Language (Grammar)|0",
+    ),
+    "AraTrust": (
+        "community|aratrust:Trustfulness|0",
+        "community|aratrust:MentalHealth|0",
+        "community|aratrust:PhysicalHealth|0",
+        "community|aratrust:Offensive|0",
+        "community|aratrust:Ethics|0",
+        "community|aratrust:Privacy|0",
+        "community|aratrust:Unfairness|0",
+        "community|aratrust:Illegal|0",
+    ),
 }
 
 
@@ -128,33 +150,57 @@ def _has_separate_lm_head_in_checkpoint(model_dir: pathlib.Path) -> bool:
     return False
 
 
+def _patch_local_checkpoint_config_json(model_dir: pathlib.Path) -> bool:
+    """Ensure `"tie_word_embeddings": true` is written to `model_dir / "config.json"` when `lm_head.weight` is tied."""
+    cfg_path = model_dir / "config.json"
+    if not (model_dir.is_dir() and cfg_path.exists()):
+        return False
+    if _has_separate_lm_head_in_checkpoint(model_dir):
+        return False
+    try:
+        cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        changed = False
+        if cfg_data.get("tie_word_embeddings") is not True:
+            cfg_data["tie_word_embeddings"] = True
+            changed = True
+        if isinstance(cfg_data.get("text_config"), dict):
+            if cfg_data["text_config"].get("tie_word_embeddings") is not True:
+                cfg_data["text_config"]["tie_word_embeddings"] = True
+                changed = True
+        if changed:
+            cfg_path.write_text(
+                json.dumps(cfg_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info(
+                "Patched %s on disk with tie_word_embeddings=true (root + text_config).",
+                cfg_path,
+            )
+        return True
+    except Exception as exc:
+        logger.warning("Could not inspect/patch %s: %s", cfg_path, exc)
+        return False
+
+
 def _prepare_gemma4_config_for_load(model_path: str) -> Any:
     """Ensure `tie_word_embeddings=True` on disk (if local) and in `AutoConfig` before `from_pretrained`."""
-    model_dir = pathlib.Path(model_path)
-    cfg_path = model_dir / "config.json"
-    if model_dir.is_dir() and cfg_path.exists():
-        try:
-            cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
-            if not _has_separate_lm_head_in_checkpoint(model_dir):
-                changed = False
-                if cfg_data.get("tie_word_embeddings") is not True:
-                    cfg_data["tie_word_embeddings"] = True
-                    changed = True
-                if isinstance(cfg_data.get("text_config"), dict):
-                    if cfg_data["text_config"].get("tie_word_embeddings") is not True:
-                        cfg_data["text_config"]["tie_word_embeddings"] = True
-                        changed = True
-                if changed:
-                    cfg_path.write_text(
-                        json.dumps(cfg_data, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    logger.info(
-                        "Patched %s on disk with tie_word_embeddings=true (root + text_config).",
-                        cfg_path,
-                    )
-        except Exception as exc:
-            logger.warning("Could not inspect/patch %s: %s", cfg_path, exc)
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4Model  # type: ignore
+
+        if not hasattr(Gemma4Model, "get_input_embeddings"):
+            Gemma4Model.get_input_embeddings = (  # type: ignore[attr-defined]
+                lambda self: self.language_model.get_input_embeddings()
+            )
+    except Exception:
+        pass
+
+    for candidate_dir in (
+        pathlib.Path(model_path),
+        PROJECT_ROOT / "outputs" / "merged_gemma4_e4b_arabic" / "merged_16bit",
+        PROJECT_ROOT / "outputs" / "merged_gemma4_26b_a4b_arabic" / "merged_16bit",
+    ):
+        if candidate_dir.is_dir():
+            _patch_local_checkpoint_config_json(candidate_dir)
 
     from transformers import AutoConfig
 
@@ -174,7 +220,11 @@ def _prepare_gemma4_config_for_load(model_path: str) -> Any:
 
 def _ensure_gemma4_tied_lm_head(model: Any, tag: str = "") -> None:
     """Guarantee `lm_head.weight` shares the exact storage pointer of `embed_tokens.weight`."""
-    inner = getattr(model, "model", model) if hasattr(model, "_model") or type(model).__name__ == "HFLM" else model
+    inner = (
+        getattr(model, "model", model)
+        if hasattr(model, "_model") or type(model).__name__ == "HFLM"
+        else model
+    )
     base = inner.get_base_model() if hasattr(inner, "get_base_model") else inner
 
     for obj in (model, inner, base):
@@ -221,6 +271,14 @@ def _ensure_gemma4_tied_lm_head(model: Any, tag: str = "") -> None:
     ):
         if in_emb.weight.data_ptr() != out_emb.weight.data_ptr():
             out_emb.weight = in_emb.weight
+            gc.collect()
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
             logger.info(
                 "[%s] Explicitly tied lm_head.weight -> embed_tokens.weight (data_ptr=%d)",
                 tag or "gemma4",
@@ -246,119 +304,8 @@ def compute_effective_task_limit(
 
 
 # ---------------------------------------------------------------------------
-# Official lm_eval Dataset Processors for Custom Arabic Task Configurations
+# MGSM-Ar Arabic-Indic Numeral & Target Extraction Helpers
 # ---------------------------------------------------------------------------
-
-_ARABIC_LETTERS: Tuple[str, ...] = ("أ", "ب", "ج", "د", "هـ")
-_LATIN_TO_IDX: Dict[str, int] = {
-    "A": 0,
-    "B": 1,
-    "C": 2,
-    "D": 3,
-    "E": 4,
-    "أ": 0,
-    "ب": 1,
-    "ج": 2,
-    "د": 3,
-    "هـ": 4,
-}
-
-
-def _process_mbzuai_mcq_docs(dataset: Any) -> Any:
-    """Format `MBZUAI/ArabicMMLU` or `MBZUAI/MadinahQA` rows for `lm_eval` `multiple_choice`.
-
-    Preserves all native options (`2` to `5`) without pruning or slot rotation, and sets
-    `choices` to the full Arabic option texts so `lm_eval` computes both unnormalized `acc`
-    and byte-length-normalized `acc_norm`.
-    """
-
-    def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
-        subject = str(doc.get("Subject") or "").strip()
-        context = str(doc.get("Context") or "").strip()
-        question = str(doc.get("Question") or "").strip()
-        options: List[str] = []
-        for idx in range(1, 6):
-            val = doc.get(f"Option {idx}")
-            if val is not None and str(val).strip() and str(val).strip().lower() != "none":
-                options.append(str(val).strip())
-        if len(options) < 2:
-            options = ["صح", "خطأ"]
-
-        ans_key = str(doc.get("Answer Key") or "A").strip().upper()
-        gold_idx = _LATIN_TO_IDX.get(ans_key, 0)
-        if gold_idx < 0 or gold_idx >= len(options):
-            gold_idx = 0
-
-        header = (
-            f"الأسئلة التالية هي أسئلة متعددة الاختيارات حول {subject}.\n\n"
-            if subject
-            else "الأسئلة التالية هي أسئلة متعددة الاختيارات مع الجواب الصحيح.\n\n"
-        )
-        body = f"السياق: {context}\nالسؤال: {question}\n" if context else f"السؤال: {question}\n"
-        opts_lines = "\n".join(
-            f"{_ARABIC_LETTERS[i]}) {opt}" for i, opt in enumerate(options[: len(_ARABIC_LETTERS)])
-        )
-        query = f"{header}{body}{opts_lines}\nالإجابة:"
-        return {
-            "query": query,
-            "choices": options[: len(_ARABIC_LETTERS)],
-            "gold": gold_idx,
-        }
-
-    filtered = dataset.filter(
-        lambda row: bool(row.get("Question"))
-        and bool(row.get("Option 1"))
-        and bool(row.get("Option 2"))
-        and str(row.get("Answer Key") or "").strip().upper() in _LATIN_TO_IDX
-    )
-    return filtered.map(_map_row)
-
-
-def _process_aratrust_docs(dataset: Any) -> Any:
-    """Format `asas-ai/AraTrust` rows for `lm_eval` `multiple_choice`."""
-
-    def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
-        question = str(doc.get("Question") or "").strip()
-        raw_opts = [
-            str(doc.get(col)).strip()
-            for col in ("A", "B", "C")
-            if doc.get(col) not in (None, "", "None")
-        ]
-        clean_opts: List[str] = []
-        for ro in raw_opts:
-            for pref in ("أ)", "ب)", "ج)", "أ-", "ب-", "ج-", "أ.", "ب.", "ج."):
-                if ro.startswith(pref):
-                    ro = ro[len(pref) :].strip()
-            if ro:
-                clean_opts.append(ro)
-        if len(clean_opts) < 2:
-            clean_opts = ["نعم", "لا"]
-
-        ans_key = str(doc.get("Answer") or "أ").strip()
-        gold_idx = _LATIN_TO_IDX.get(ans_key, 0)
-        if gold_idx < 0 or gold_idx >= len(clean_opts):
-            gold_idx = 0
-
-        opts_lines = "\n".join(
-            f"{_ARABIC_LETTERS[i]}) {opt}" for i, opt in enumerate(clean_opts[: len(_ARABIC_LETTERS)])
-        )
-        query = (
-            "الأسئلة التالية هي أسئلة متعددة الاختيارات مع الجواب الصحيح.\n\n"
-            f"السؤال: {question}\n{opts_lines}\nالإجابة:"
-        )
-        return {
-            "query": query,
-            "choices": clean_opts[: len(_ARABIC_LETTERS)],
-            "gold": gold_idx,
-        }
-
-    filtered = dataset.filter(
-        lambda row: bool(row.get("Question"))
-        and bool(row.get("A"))
-        and bool(row.get("B"))
-    )
-    return filtered.map(_map_row)
-
 
 _EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
     "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
@@ -389,7 +336,6 @@ def _process_mgsm_ar_docs(dataset: Any) -> Any:
     def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
         raw_ans = _normalize_arabic_digits(str(doc.get("answer") or "")).strip()
         target_num = _extract_mgsm_ar_target_number(raw_ans)
-        # Ensure few-shot demonstrations from main_train end with canonical `#### <target_number>`
         if re.search(r"#+\s*-?[\d,]+(?:\.\d+)?", raw_ans):
             norm_ans = re.sub(r"#+\s*(-?[\d,]+(?:\.\d+)?)\s*$", f"#### {target_num}", raw_ans)
         elif target_num:
@@ -421,67 +367,8 @@ def _normalize_arabic_digits_filter(
 
 
 def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict[str, Any]:
-    """Return a native `lm_eval` `ConfigurableTask` dictionary for custom Arabic suites."""
+    """Return task configuration dictionary for `mgsm_ar` (and metadata stubs for legacy callers)."""
     key = task_name.strip().lower()
-    if key == "arabicmmlu":
-        return {
-            "task": "arabicmmlu_all",
-            "dataset_path": "MBZUAI/ArabicMMLU",
-            "dataset_name": "All",
-            "test_split": "test",
-            "validation_split": "dev",
-            "fewshot_split": "dev",
-            "num_fewshot": int(num_fewshot),
-            "output_type": "multiple_choice",
-            "process_docs": _process_mbzuai_mcq_docs,
-            "doc_to_text": "{{query}}",
-            "doc_to_choice": "choices",
-            "doc_to_target": "{{gold}}",
-            "metric_list": [
-                {"metric": "acc", "aggregation": "mean", "higher_is_better": True},
-                {"metric": "acc_norm", "aggregation": "mean", "higher_is_better": True},
-            ],
-            "metadata": {"version": 1.0},
-        }
-    if key == "madinahqa":
-        return {
-            "task": "madinahqa",
-            "dataset_path": "MBZUAI/MadinahQA",
-            "dataset_name": "Arabic Language (Grammar)",
-            "test_split": "test",
-            "validation_split": "dev",
-            "fewshot_split": "dev",
-            "num_fewshot": int(num_fewshot),
-            "output_type": "multiple_choice",
-            "process_docs": _process_mbzuai_mcq_docs,
-            "doc_to_text": "{{query}}",
-            "doc_to_choice": "choices",
-            "doc_to_target": "{{gold}}",
-            "metric_list": [
-                {"metric": "acc", "aggregation": "mean", "higher_is_better": True},
-                {"metric": "acc_norm", "aggregation": "mean", "higher_is_better": True},
-            ],
-            "metadata": {"version": 1.0},
-        }
-    if key == "aratrust":
-        return {
-            "task": "aratrust",
-            "dataset_path": "asas-ai/AraTrust",
-            "dataset_name": "default",
-            "test_split": "test",
-            "fewshot_split": "test",
-            "num_fewshot": int(num_fewshot),
-            "output_type": "multiple_choice",
-            "process_docs": _process_aratrust_docs,
-            "doc_to_text": "{{query}}",
-            "doc_to_choice": "choices",
-            "doc_to_target": "{{gold}}",
-            "metric_list": [
-                {"metric": "acc", "aggregation": "mean", "higher_is_better": True},
-                {"metric": "acc_norm", "aggregation": "mean", "higher_is_better": True},
-            ],
-            "metadata": {"version": 1.0},
-        }
     if key == "mgsm_ar":
         return {
             "task": "mgsm_ar",
@@ -501,10 +388,19 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                 "doc_to_target": "{{answer}}",
             },
             "generation_kwargs": {
-                "until": ["السؤال:", "</s>", "<|im_end|>", "<turn|>"],
+                "until": [
+                    "السؤال:",
+                    "\nالسؤال",
+                    "Question:",
+                    "<|turn>",
+                    "<turn|>",
+                    "<eos>",
+                    "</s>",
+                    "<|im_end|>",
+                ],
                 "do_sample": False,
                 "temperature": 0.0,
-                "max_gen_toks": 512,
+                "max_gen_toks": 256,
             },
             "filter_list": [
                 {
@@ -549,7 +445,28 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             ],
             "metadata": {"version": 1.0},
         }
-    raise KeyError(f"Unknown custom lm_eval task dictionary key: '{task_name}'")
+    if key == "arabicmmlu":
+        return {
+            "task": "arabicmmlu",
+            "dataset_path": "MBZUAI/ArabicMMLU",
+            "output_type": "multiple_choice",
+            "num_fewshot": int(num_fewshot),
+        }
+    if key == "madinahqa":
+        return {
+            "task": "madinahqa",
+            "dataset_path": "MBZUAI/MadinahQA",
+            "output_type": "multiple_choice",
+            "num_fewshot": int(num_fewshot),
+        }
+    if key == "aratrust":
+        return {
+            "task": "aratrust",
+            "dataset_path": "asas-ai/AraTrust",
+            "output_type": "multiple_choice",
+            "num_fewshot": int(num_fewshot),
+        }
+    raise KeyError(f"Unknown custom task dictionary key: '{task_name}'")
 
 
 def resolve_lm_eval_task_specs(
@@ -557,11 +474,16 @@ def resolve_lm_eval_task_specs(
     num_fewshot: int = 0,
     limit: Optional[int] = None,
 ) -> Tuple[List[Union[str, Dict[str, Any]]], str, Optional[int]]:
-    """Resolve a benchmark's `lm_eval_task` into `(tasks_arg, primary_result_key, effective_limit)`."""
+    """Resolve a benchmark's `lm_eval_task` into `(tasks_arg, primary_result_key, effective_limit)`.
+
+    Uses native built-in `lm_eval` tasks for `arabicmmlu`, `arabic_leaderboard_alghafa_light`,
+    `arabic_leaderboard_acva_light`, `arabic_exams`, `arc_challenge`, `gsm8k`, `humaneval`,
+    and `leaderboard_mmlu_pro`.
+    """
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
 
-    if clean_name.lower() in ("arabicmmlu", "madinahqa", "aratrust", "mgsm_ar"):
+    if clean_name.lower() == "mgsm_ar":
         custom_dict = build_custom_lm_eval_task_dict(clean_name, num_fewshot=num_fewshot)
         return ([custom_dict], str(custom_dict["task"]), eff_limit)
 
@@ -577,12 +499,7 @@ def evaluate_retention_gate(
     max_allowed_drop_pct: float = 0.20,
     sweep_lambdas: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
-    """Verify zero catastrophic forgetting across all 4 English/Math/Code anchors.
-
-    When `n_samples` is recorded on a finite-sample discrete benchmark run (e.g. `N=50` or `N=200`),
-    accounts for the single-question discretization step (`100.0 / n_samples`) so a 1-item
-    difference does not trigger a false-positive gate failure.
-    """
+    """Verify zero catastrophic forgetting across all 4 English/Math/Code anchors."""
     violations: List[str] = []
     ratios: List[float] = []
 
@@ -643,7 +560,7 @@ def generate_markdown_report(report_data: Dict[str, Any]) -> str:
         "",
         f"## 1. Primary Arabic and Saudi Benchmarks ({len(report_data['arabic_benchmarks'])} Suites)",
         "",
-        "| Benchmark | Task (`lm_eval`) | Metric | Shots | Base NLL | Tuned NLL | Baseline (%) | Evaluated (%) | Gain (% pts) |",
+        "| Benchmark | Task (`lm_eval` / `lighteval`) | Metric | Shots | Base NLL | Tuned NLL | Baseline (%) | Evaluated (%) | Gain (% pts) |",
         "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
 
@@ -721,34 +638,29 @@ def parse_lm_eval_results_json(
     if task_metrics is None:
         subtask_dicts = [v for v in results_block.values() if isinstance(v, dict)]
         if not subtask_dicts:
-            raise ValueError(f"No valid metric dictionary found for task '{task_name}'.")
-        vals: List[float] = []
-        for sub in subtask_dicts:
+            raise ValueError(f"No valid metric dictionary found in lm_eval results for '{task_name}'.")
+        subtask_scores: List[float] = []
+        for sub_d in subtask_dicts:
             for key in candidate_keys:
-                if key in sub and isinstance(sub[key], (int, float)):
-                    vals.append(float(sub[key]))
+                if key in sub_d and isinstance(sub_d[key], (int, float)):
+                    val = float(sub_d[key])
+                    subtask_scores.append(val * 100.0 if val <= 1.0 else val)
                     break
-        if not vals:
-            raise KeyError(f"Could not extract score for '{task_name}' from subtasks.")
-        raw_val = sum(vals) / len(vals)
-    else:
-        raw_val = None
-        for key in candidate_keys:
-            if key in task_metrics and isinstance(task_metrics[key], (int, float)):
-                raw_val = float(task_metrics[key])
-                break
-        if raw_val is None:
-            numeric_vals = [
-                float(v)
-                for k, v in task_metrics.items()
-                if isinstance(v, (int, float)) and "stderr" not in str(k)
-            ]
-            if not numeric_vals:
-                raise KeyError(f"No numeric score found in task metrics for '{task_name}'.")
-            raw_val = numeric_vals[0]
+        if subtask_scores:
+            return round(sum(subtask_scores) / len(subtask_scores), 2)
+        task_metrics = subtask_dicts[0]
 
-    score_pct = raw_val * 100.0 if 0.0 <= raw_val <= 1.0 else raw_val
-    return round(score_pct, 2)
+    for key in candidate_keys:
+        if key in task_metrics and isinstance(task_metrics[key], (int, float)):
+            raw_val = float(task_metrics[key])
+            return round(raw_val * 100.0 if raw_val <= 1.0 else raw_val, 2)
+
+    for key, val in task_metrics.items():
+        if "stderr" not in str(key) and isinstance(val, (int, float)):
+            raw_val = float(val)
+            return round(raw_val * 100.0 if raw_val <= 1.0 else raw_val, 2)
+
+    raise ValueError(f"Could not locate numeric metric '{metric_hint}' in lm_eval output: {task_metrics}")
 
 
 def extract_lm_eval_detailed_metrics(
@@ -756,7 +668,7 @@ def extract_lm_eval_detailed_metrics(
     task_name: str,
     metric_hint: str = "acc_norm",
 ) -> Dict[str, Any]:
-    """Extract primary score, unnormalized `acc` (`HardTop1`), `GoldNLL`, and `n_samples` from `lm_eval` output."""
+    """Extract `eval_score_pct`, `top1_acc_pct` (unnormalized `acc`), `nll` (`GoldNLL`), and `n_samples`."""
     eval_score_pct = parse_lm_eval_results_json(
         results_payload=results_payload,
         task_name=task_name,
@@ -766,17 +678,17 @@ def extract_lm_eval_detailed_metrics(
         top1_acc_pct = parse_lm_eval_results_json(
             results_payload=results_payload,
             task_name=task_name,
-            metric_hint="acc" if "acc" in metric_hint else metric_hint,
+            metric_hint="acc",
         )
     except Exception:
         top1_acc_pct = eval_score_pct
 
-    # Extract sample count and gold log-likelihood (when multiple_choice samples are logged)
-    n_samples = 0
-    gold_nlls: List[float] = []
     samples_block = results_payload.get("samples", {})
-    if isinstance(samples_block, dict):
-        for _subtask_name, sample_list in samples_block.items():
+    gold_nlls: List[float] = []
+    n_samples = 0
+
+    if isinstance(samples_block, dict) and samples_block:
+        for _subtask, sample_list in samples_block.items():
             if not isinstance(sample_list, list):
                 continue
             n_samples += len(sample_list)
@@ -786,16 +698,14 @@ def extract_lm_eval_detailed_metrics(
                 target = sample.get("target")
                 resps = sample.get("resps")
                 if isinstance(target, int) and isinstance(resps, list) and 0 <= target < len(resps):
-                    resp_entry = resps[target]
-                    if isinstance(resp_entry, (list, tuple)) and len(resp_entry) > 0:
-                        first_pair = resp_entry[0]
-                        if isinstance(first_pair, (list, tuple)) and len(first_pair) > 0:
-                            try:
-                                ll_val = float(first_pair[0])
-                                if not (math.isnan(ll_val) or math.isinf(ll_val)):
-                                    gold_nlls.append(-ll_val)
-                            except (TypeError, ValueError):
-                                pass
+                    choice_resp = resps[target]
+                    while isinstance(choice_resp, (list, tuple)) and len(choice_resp) > 0:
+                        if isinstance(choice_resp[0], (int, float)):
+                            ll = float(choice_resp[0])
+                            if math.isfinite(ll):
+                                gold_nlls.append(max(0.0, -ll))
+                            break
+                        choice_resp = choice_resp[0]
 
     if n_samples == 0:
         n_samples_block = results_payload.get("n-samples", {})
@@ -819,6 +729,285 @@ def extract_lm_eval_detailed_metrics(
     }
 
 
+def parse_lighteval_results_json(
+    lighteval_payload: Dict[str, Any],
+    suite_name: str,
+) -> Dict[str, Any]:
+    """Extract percentage score (`0.0` to `100.0`) for `MadinahQA` or `AraTrust` from `lighteval` results."""
+    results_block = lighteval_payload.get("results", {})
+    if not isinstance(results_block, dict) or not results_block:
+        raise ValueError(f"LightEval payload has no 'results' entries for '{suite_name}'.")
+
+    prefix = "madinah_qa" if suite_name.lower() == "madinahqa" else "aratrust"
+    avg_candidates = (
+        f"community|{prefix}:_average|0",
+        f"community:{prefix}:_average:0",
+        f"lighteval|{prefix}:_average|0",
+        f"lighteval:{prefix}:_average:0",
+        f"{prefix}:_average|0",
+        f"{prefix}:_average:0",
+        "madinah_qa:_average:0" if prefix == "madinah_qa" else "aratrust:_average:0",
+        f"community|{prefix}|0",
+        f"community:{prefix}:0",
+        f"{prefix}|0",
+        f"{prefix}:0",
+    )
+
+    matched_metrics: List[Dict[str, Any]] = []
+    for avg_key in avg_candidates:
+        if avg_key in results_block and isinstance(results_block[avg_key], dict):
+            matched_metrics = [results_block[avg_key]]
+            break
+
+    if not matched_metrics:
+        for k, v in results_block.items():
+            if prefix in str(k).lower() and "_average" in str(k).lower() and isinstance(v, dict):
+                matched_metrics = [v]
+                break
+
+    if not matched_metrics:
+        for k, v in results_block.items():
+            if prefix in str(k).lower() and isinstance(v, dict):
+                matched_metrics.append(v)
+
+    if not matched_metrics:
+        raise ValueError(f"Could not find '{prefix}' task scores in LightEval results: {list(results_block.keys())}")
+
+    scores: List[float] = []
+    for mdict in matched_metrics:
+        for mkey in ("acc_norm", "loglikelihood_acc_norm", "acc", "loglikelihood_acc", "accuracy"):
+            if mkey in mdict and isinstance(mdict[mkey], (int, float)):
+                val = float(mdict[mkey])
+                scores.append(val * 100.0 if val <= 1.0 else val)
+                break
+        else:
+            for mkey, mval in mdict.items():
+                if "stderr" not in str(mkey) and isinstance(mval, (int, float)):
+                    val = float(mval)
+                    scores.append(val * 100.0 if val <= 1.0 else val)
+                    break
+
+    if not scores:
+        raise ValueError(f"No numeric metric found for '{suite_name}' in LightEval results: {matched_metrics}")
+
+    mean_score = round(sum(scores) / len(scores), 2)
+    return {
+        "eval_score_pct": mean_score,
+        "raw_signal_pct": mean_score,
+        "top1_acc_pct": mean_score,
+        "nll": None,
+        "ppl": None,
+        "n_samples": 0,
+    }
+
+
+def _destroy_vllm_and_free_vram(lm_obj: Any = None, model_obj: Any = None) -> None:
+    """Shut down any active vLLM engine / distributed group and release GPU VRAM before starting the next runner."""
+    try:
+        if lm_obj is not None:
+            inner_vllm = getattr(lm_obj, "model", None)
+            if inner_vllm is not None:
+                try:
+                    inner_vllm.llm_engine.engine_core.shutdown()
+                except Exception:
+                    pass
+                del inner_vllm
+            del lm_obj
+    except Exception:
+        pass
+    try:
+        if model_obj is not None:
+            del model_obj
+    except Exception:
+        pass
+    try:
+        from vllm.distributed.parallel_state import (  # type: ignore
+            destroy_distributed_environment,
+            destroy_model_parallel,
+        )
+
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    except Exception:
+        pass
+    try:
+        import ray  # type: ignore
+
+        if ray.is_initialized():
+            ray.shutdown()
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
+def run_lighteval_tasks_subprocess(
+    model_path: str,
+    suite_names: List[str],
+    device: str = "cuda:0",
+    limit: Optional[int] = None,
+    max_seq_len: int = 4096,
+    batch_size: int = 16,
+    use_vllm: bool = True,
+    tag: str = "",
+) -> Dict[str, Dict[str, Any]]:
+    """Run `MadinahQA` and `AraTrust` via `lighteval` in an isolated subprocess and return parsed metrics."""
+    if not suite_names:
+        return {}
+
+    task_strings: List[str] = []
+    for sname in suite_names:
+        task_strings.extend(LIGHTEVAL_SUITE_TASK_MAP.get(sname, ()))
+    if not task_strings:
+        return {}
+
+    model_dir = pathlib.Path(model_path)
+    load_target_path = model_path
+    if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
+        adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+        load_target_path = str(adapter_cfg.get("base_model_name_or_path") or model_path).strip()
+    if pathlib.Path(load_target_path).is_dir():
+        _patch_local_checkpoint_config_json(pathlib.Path(load_target_path))
+
+    # Scale per-subtask max_samples across subtasks when --limit is provided
+    per_subtask_samples: Optional[int] = None
+    if limit is not None and limit > 0:
+        per_subtask_samples = max(10, int(math.ceil(float(limit) / 2.0)))
+
+    tasks_csv = ",".join(task_strings)
+    logger.info(
+        "[%s] Running LightEval on %s (backend=%s, max_samples=%s)...",
+        tag,
+        ", ".join(suite_names),
+        "vllm" if use_vllm else "accelerate",
+        str(per_subtask_samples),
+    )
+
+    child_env = os.environ.copy()
+    if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
+        gpu_idx = device.split(":")[1]
+        child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+    child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    with tempfile.TemporaryDirectory(prefix="lighteval_run_") as tmp_dir:
+        out_json_file = pathlib.Path(tmp_dir) / "lighteval_results.json"
+        runner_code = f"""
+import json, logging, os, pathlib, sys
+for _n in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
+sys.path.insert(0, {repr(str(PROJECT_ROOT))})
+from scripts.run_benchmarks import _prepare_gemma4_config_for_load
+try:
+    _prepare_gemma4_config_for_load({repr(load_target_path)})
+except Exception:
+    pass
+
+from lighteval.logging.evaluation_tracker import EvaluationTracker
+from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+
+evaluation_tracker = EvaluationTracker(
+    output_dir={repr(str(tmp_dir))},
+    save_details=False,
+    push_to_hub=False,
+)
+
+use_vllm = {repr(bool(use_vllm))}
+results_payload = None
+
+if use_vllm:
+    try:
+        from lighteval.models.vllm.vllm_model import VLLMModelConfig
+        pipeline_params = PipelineParameters(
+            launcher_type=ParallelismManager.VLLM,
+            custom_tasks_directory="lighteval.tasks.multilingual.tasks.arabic",
+            load_tasks_multilingual=False,
+            max_samples={repr(per_subtask_samples)},
+            bootstrap_iters=0,
+        )
+        model_config = VLLMModelConfig(
+            model_name={repr(load_target_path)},
+            dtype="bfloat16",
+            gpu_memory_utilization=0.85,
+            max_model_length={int(max_seq_len)},
+            trust_remote_code=True,
+        )
+        pipeline = Pipeline(
+            tasks={repr(tasks_csv)},
+            pipeline_parameters=pipeline_params,
+            evaluation_tracker=evaluation_tracker,
+            model_config=model_config,
+        )
+        pipeline.evaluate()
+        results_payload = pipeline.get_results()
+    except Exception as vllm_exc:
+        sys.stderr.write(f"[LightEval] vLLM backend failed ({{vllm_exc}}); falling back to Accelerate...\\n")
+
+if results_payload is None:
+    from lighteval.models.transformers.transformers_model import TransformersModelConfig
+    pipeline_params = PipelineParameters(
+        launcher_type=ParallelismManager.ACCELERATE,
+        custom_tasks_directory="lighteval.tasks.multilingual.tasks.arabic",
+        load_tasks_multilingual=False,
+        max_samples={repr(per_subtask_samples)},
+        bootstrap_iters=0,
+    )
+    model_config = TransformersModelConfig(
+        model_name={repr(load_target_path)},
+        dtype="bfloat16",
+        batch_size={int(batch_size)},
+        max_length={int(max_seq_len)},
+        trust_remote_code=True,
+    )
+    pipeline = Pipeline(
+        tasks={repr(tasks_csv)},
+        pipeline_parameters=pipeline_params,
+        evaluation_tracker=evaluation_tracker,
+        model_config=model_config,
+    )
+    pipeline.evaluate()
+    results_payload = pipeline.get_results()
+
+pathlib.Path({repr(str(out_json_file))}).write_text(
+    json.dumps({{"results": results_payload.get("results", {{}})}}, indent=2),
+    encoding="utf-8",
+)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", runner_code],
+            env=child_env,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0 or not out_json_file.exists():
+            err_tail = (proc.stderr or proc.stdout or "")[-1500:]
+            raise RuntimeError(
+                f"[{tag}] LightEval subprocess failed (exit={proc.returncode}): {err_tail}"
+            )
+        raw_lighteval = json.loads(out_json_file.read_text(encoding="utf-8"))
+
+    parsed_out: Dict[str, Dict[str, Any]] = {}
+    for sname in suite_names:
+        metrics = parse_lighteval_results_json(raw_lighteval, sname)
+        metrics["n_samples"] = int(limit or 0)
+        parsed_out[sname] = metrics
+        logger.info(
+            "[%s] arabic/%s (lighteval) -> acc_norm=%.2f%% (N=%d)",
+            tag,
+            sname,
+            metrics["eval_score_pct"],
+            metrics["n_samples"],
+        )
+    return parsed_out
+
+
 def run_lm_eval_task(
     model_path: str,
     task_name: str,
@@ -830,7 +1019,7 @@ def run_lm_eval_task(
     use_vllm: bool = False,
     apply_chat_template: bool = False,
 ) -> float:
-    """Run a single `lm_eval` task via `lm_eval.simple_evaluate` or CLI and return the score."""
+    """Run a single `lm_eval` task via `lm_eval.simple_evaluate` and return the score."""
     import lm_eval
     from lm_eval.tasks import TaskManager
 
@@ -856,7 +1045,7 @@ def run_lm_eval_task(
         model_args=model_args,
         tasks=tasks_arg,
         num_fewshot=num_fewshot,
-        batch_size=batch_size,
+        batch_size="auto" if use_vllm else batch_size,
         device=device,
         limit=eff_limit,
         random_seed=42,
@@ -876,66 +1065,190 @@ def run_lm_eval_task(
     )
 
 
+def _run_lm_eval_suites_subprocess(
+    model_path: str,
+    device: str,
+    cfg: Dict[str, Any],
+    tag: str,
+    limit: Optional[int] = None,
+    use_vllm: bool = True,
+    apply_chat_template: bool = False,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Run the `lm_eval` tasks for `model_path` in an isolated child subprocess so the OS reclaims 100% of vLLM's 85% GPU memory pool upon completion."""
+    child_env = os.environ.copy()
+    if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
+        gpu_idx = device.split(":")[1]
+        child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+    child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    child_env.setdefault("HF_ALLOW_CODE_EVAL", "1")
+
+    with tempfile.TemporaryDirectory(prefix="lm_eval_run_") as tmp_dir:
+        cfg_json_file = pathlib.Path(tmp_dir) / "eval_cfg.json"
+        out_json_file = pathlib.Path(tmp_dir) / "lm_eval_out.json"
+        cfg_json_file.write_text(json.dumps(cfg), encoding="utf-8")
+
+        runner_code = f"""
+import json, logging, pathlib, sys
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+for _n in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
+sys.path.insert(0, {repr(str(PROJECT_ROOT))})
+from scripts.run_benchmarks import _evaluate_checkpoint_with_lm_eval
+
+cfg = json.loads(pathlib.Path({repr(str(cfg_json_file))}).read_text(encoding="utf-8"))
+res = _evaluate_checkpoint_with_lm_eval(
+    model_path={repr(str(model_path))},
+    device="cuda:0",
+    cfg=cfg,
+    tag={repr(str(tag))},
+    limit={repr(limit)},
+    use_vllm={repr(bool(use_vllm))},
+    apply_chat_template={repr(bool(apply_chat_template))},
+    _in_lm_eval_subprocess=True,
+    _skip_lighteval=True,
+)
+pathlib.Path({repr(str(out_json_file))}).write_text(
+    json.dumps(res, indent=2),
+    encoding="utf-8",
+)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", runner_code],
+            env=child_env,
+        )
+        if proc.returncode != 0 or not out_json_file.exists():
+            raise RuntimeError(
+                f"[{tag}] lm_eval child subprocess failed with exit code {proc.returncode}"
+            )
+        return json.loads(out_json_file.read_text(encoding="utf-8"))
+
+
 def _evaluate_checkpoint_with_lm_eval(
     model_path: str,
     device: str,
     cfg: Dict[str, Any],
     tag: str,
     limit: Optional[int] = None,
-    use_vllm: bool = False,
+    use_vllm: bool = True,
     apply_chat_template: bool = False,
+    _in_lm_eval_subprocess: bool = False,
+    _skip_lighteval: bool = False,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Load checkpoint once via `lm_eval` (`HFLM` or `vLLM`) and evaluate all 11 benchmarks."""
+    """Evaluate a checkpoint using native `lm_eval` (8 tasks + MGSM-Ar) and native `lighteval` (MadinahQA + AraTrust)."""
+    eval_cfg = cfg.get("evaluation", {})
+    ar_defs = cfg.get("arabic_benchmarks", {})
+    ret_defs = cfg.get("retention_anchors", {})
+    model_key_prefix = tag.split(":")[0] if ":" in tag else "e4b"
+    model_specific_cfg = cfg.get("models", {}).get(model_key_prefix, {})
+    default_bs = 8 if model_key_prefix == "26b_a4b" else int(eval_cfg.get("batch_size", 32))
+    batch_size = int(model_specific_cfg.get("batch_size", default_bs))
+    max_seq_len = int(eval_cfg.get("max_seq_length", 4096))
+
+    lighteval_suites: List[str] = [
+        sname
+        for sname, spec in ar_defs.items()
+        if str(spec.get("runner", "lm_eval")).strip().lower() == "lighteval"
+        and sname in LIGHTEVAL_SUITE_TASK_MAP
+    ]
+
+    if use_vllm and isinstance(model_path, str) and not _in_lm_eval_subprocess:
+        out = _run_lm_eval_suites_subprocess(
+            model_path=model_path,
+            device=device,
+            cfg=cfg,
+            tag=tag,
+            limit=limit,
+            use_vllm=use_vllm,
+            apply_chat_template=apply_chat_template,
+        )
+        if lighteval_suites and not _skip_lighteval:
+            le_metrics = run_lighteval_tasks_subprocess(
+                model_path=model_path,
+                suite_names=lighteval_suites,
+                device=device,
+                limit=limit,
+                max_seq_len=max_seq_len,
+                batch_size=batch_size,
+                use_vllm=use_vllm,
+                tag=tag,
+            )
+            for sname, smetrics in le_metrics.items():
+                out["arabic"][sname] = smetrics
+        return out
+
     import lm_eval
     import torch
     from lm_eval.models.huggingface import HFLM
     from lm_eval.tasks import TaskManager
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
-    eval_cfg = cfg.get("evaluation", {})
-    ar_defs = cfg.get("arabic_benchmarks", {})
-    ret_defs = cfg.get("retention_anchors", {})
-    batch_size = int(eval_cfg.get("batch_size", 16))
-    max_seq_len = int(eval_cfg.get("max_seq_length", 4096))
-
     cache_dir = _resolve_hf_eval_cache_dir()
     if cache_dir:
         os.environ.setdefault("HF_DATASETS_CACHE", cache_dir)
 
-    logger.info("[%s] Initializing lm_eval model on %s: %s", tag, device, model_path)
+    _prepare_gemma4_config_for_load(
+        str(
+            json.loads((pathlib.Path(model_path) / "adapter_config.json").read_text(encoding="utf-8")).get(
+                "base_model_name_or_path", model_path
+            )
+        )
+        if (pathlib.Path(model_path) / "adapter_config.json").exists()
+        and not (pathlib.Path(model_path) / "config.json").exists()
+        else model_path
+    )
+
+    logger.info(
+        "[%s] Initializing lm_eval model (%s) on %s: %s",
+        tag,
+        "vLLM" if use_vllm else f"HFLM (batch_size={batch_size})",
+        device,
+        model_path,
+    )
     model_obj: Any = None
     lm_obj: Any = None
+    effective_use_vllm = bool(use_vllm)
 
-    if use_vllm:
-        from lm_eval.models.vllm_causallms import VLLM
+    if effective_use_vllm:
+        try:
+            from lm_eval.models.vllm_causallms import VLLM
 
-        model_dir = pathlib.Path(model_path)
-        if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
-            adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
-            base_model_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
-            if pathlib.Path(base_model_path).is_dir():
-                _prepare_gemma4_config_for_load(base_model_path)
-            lm_obj = VLLM(
-                pretrained=base_model_path,
-                lora_local_path=str(model_path),
-                dtype="bfloat16",
-                trust_remote_code=True,
-                gpu_memory_utilization=0.85,
-                max_model_len=max_seq_len,
-                batch_size="auto",
+            model_dir = pathlib.Path(model_path)
+            if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
+                adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+                base_model_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+                lm_obj = VLLM(
+                    pretrained=base_model_path,
+                    lora_local_path=str(model_path),
+                    dtype="bfloat16",
+                    trust_remote_code=True,
+                    gpu_memory_utilization=0.85,
+                    max_model_len=max_seq_len,
+                    batch_size="auto",
+                )
+            else:
+                lm_obj = VLLM(
+                    pretrained=model_path,
+                    dtype="bfloat16",
+                    trust_remote_code=True,
+                    gpu_memory_utilization=0.85,
+                    max_model_len=max_seq_len,
+                    batch_size="auto",
+                )
+        except Exception as vllm_exc:
+            logger.warning(
+                "[%s] vLLM initialization failed (%s); falling back to HFLM (batch_size=%d).",
+                tag,
+                vllm_exc,
+                batch_size,
             )
-        else:
-            if model_dir.is_dir():
-                _prepare_gemma4_config_for_load(model_path)
-            lm_obj = VLLM(
-                pretrained=model_path,
-                dtype="bfloat16",
-                trust_remote_code=True,
-                gpu_memory_utilization=0.85,
-                max_model_len=max_seq_len,
-                batch_size="auto",
-            )
-    else:
+            _destroy_vllm_and_free_vram()
+            effective_use_vllm = False
+
+    if not effective_use_vllm:
         model_dir = pathlib.Path(model_path)
         is_peft_adapter = (model_dir / "adapter_config.json").exists() and not (
             model_dir / "config.json"
@@ -985,6 +1298,9 @@ def _evaluate_checkpoint_with_lm_eval(
             _ensure_gemma4_tied_lm_head(model_obj, tag=f"{tag}:peft")
         _patch_gemma4_config_for_lm_eval(model_obj)
         model_obj.eval()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         lm_obj = HFLM(
             pretrained=model_obj,
             tokenizer=tokenizer,
@@ -1004,6 +1320,10 @@ def _evaluate_checkpoint_with_lm_eval(
     )
     for cat, suite_defs in suite_groups:
         for suite_name, spec in suite_defs.items():
+            runner = str(spec.get("runner", "lm_eval")).strip().lower()
+            if runner == "lighteval" and suite_name in LIGHTEVAL_SUITE_TASK_MAP:
+                continue
+
             task_name = str(spec["lm_eval_task"])
             num_fewshot = int(spec.get("num_fewshot", 0))
             metric_hint = str(spec.get("metric", "acc_norm"))
@@ -1026,7 +1346,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 model=lm_obj,
                 tasks=tasks_arg,
                 num_fewshot=num_fewshot,
-                batch_size=batch_size,
+                batch_size="auto" if effective_use_vllm else batch_size,
                 limit=eff_limit,
                 random_seed=42,
                 numpy_random_seed=42,
@@ -1060,12 +1380,25 @@ def _evaluate_checkpoint_with_lm_eval(
                 metrics["n_samples"],
             )
 
-    del lm_obj
-    if model_obj is not None:
-        del model_obj
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Cleanly destroy the lm_eval vLLM/HFLM instance before starting LightEval on the same GPU
+    _destroy_vllm_and_free_vram(lm_obj=lm_obj, model_obj=model_obj)
+    lm_obj = None
+    model_obj = None
+
+    if lighteval_suites and not _skip_lighteval:
+        le_metrics = run_lighteval_tasks_subprocess(
+            model_path=model_path,
+            suite_names=lighteval_suites,
+            device=device,
+            limit=limit,
+            max_seq_len=max_seq_len,
+            batch_size=batch_size,
+            use_vllm=use_vllm,
+            tag=tag,
+        )
+        for sname, smetrics in le_metrics.items():
+            out["arabic"][sname] = smetrics
+
     return out
 
 
@@ -1077,10 +1410,10 @@ def run_inprocess_gpu_eval(
     target_device: str = "cuda:0",
     limit: Optional[int] = None,
     use_cached_eval: bool = False,
-    use_vllm: bool = False,
+    use_vllm: bool = True,
     apply_chat_template: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Run standardized `lm_eval` GPU evaluation across all 11 benchmarks for `base` and `tuned`."""
+    """Run standardized `lm_eval` + `lighteval` GPU evaluation across all 11 benchmarks for `base` and `tuned`."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
     if use_cached_eval and cache_path.exists():
         try:
@@ -1156,7 +1489,7 @@ def build_benchmark_results(
     use_vllm: bool = False,
     apply_chat_template: bool = False,
 ) -> Dict[str, Any]:
-    """Run all 7 Arabic benchmarks and 4 retention anchors via `lm_eval`."""
+    """Run all 7 Arabic benchmarks (`lm_eval` + `lighteval`) and 4 retention anchors (`lm_eval`)."""
     eval_cfg = cfg.get("evaluation", {})
     gate_cfg = cfg.get("retention_gate", {})
     ar_defs = cfg.get("arabic_benchmarks", {})
@@ -1217,7 +1550,7 @@ def build_benchmark_results(
                 except Exception as exc:
                     if no_reference_fallback:
                         raise RuntimeError(
-                            f"Base lm_eval task '{name}' ({spec['lm_eval_task']}) failed and "
+                            f"Base task '{name}' ({spec['lm_eval_task']}) failed and "
                             f"--no-reference-fallback is active: {exc}"
                         ) from exc
                     logger.warning("Base eval fallback for %s (%s): %s", name, spec["lm_eval_task"], exc)
@@ -1236,11 +1569,11 @@ def build_benchmark_results(
             except Exception as exc:
                 if no_reference_fallback:
                     raise RuntimeError(
-                        f"Tuned lm_eval task '{name}' ({spec['lm_eval_task']}) failed and "
+                        f"Tuned task '{name}' ({spec['lm_eval_task']}) failed and "
                         f"--no-reference-fallback is active: {exc}"
                     ) from exc
                 logger.warning(
-                    "Live lm_eval task '%s' (%s) failed: %s",
+                    "Live task '%s' (%s) failed: %s",
                     name,
                     spec["lm_eval_task"],
                     exc,
@@ -1250,6 +1583,7 @@ def build_benchmark_results(
         entry_dict: Dict[str, Any] = {
             "lm_eval_task": spec["lm_eval_task"],
             "lighteval_task": spec.get("lighteval_task", ""),
+            "runner": spec.get("runner", "lm_eval"),
             "metric": spec["metric"],
             "num_fewshot": int(spec.get("num_fewshot", 0)),
             "baseline_score": base_score,
@@ -1438,7 +1772,7 @@ def generate_family_markdown_report(
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse CLI arguments for the benchmark evaluation runner."""
     parser = argparse.ArgumentParser(
-        description="Run the 7 Arabic/Saudi benchmarks and 4 English/Math/Code retention anchors via lm_eval."
+        description="Run the 7 Arabic/Saudi benchmarks and 4 English/Math/Code retention anchors via lm_eval and lighteval."
     )
     parser.add_argument(
         "--config",
@@ -1464,7 +1798,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--eval-base",
         action="store_true",
-        help="Also run live lm_eval on the untuned base model instead of using cached baseline scores.",
+        help="Also run live evaluation on the untuned base model instead of using cached baseline scores.",
     )
     parser.add_argument(
         "--use-cached-eval",
@@ -1487,9 +1821,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--use-vllm",
+        dest="use_vllm",
         action="store_true",
-        default=False,
-        help="Use lm_eval's vLLM backend instead of HFLM for faster generative evaluation.",
+        default=True,
+        help="Use vLLM backend for lm_eval and lighteval (default: True).",
+    )
+    parser.add_argument(
+        "--no-vllm",
+        dest="use_vllm",
+        action="store_false",
+        help="Use Hugging Face HFLM / Accelerate instead of vLLM.",
     )
     parser.add_argument(
         "--apply-chat-template",
@@ -1523,6 +1864,35 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _build_child_eval_cmd(args: argparse.Namespace, model_key: str) -> List[str]:
+    """Construct CLI command for an isolated single-GPU child subprocess."""
+    cmd = [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        "--config",
+        str(args.config),
+        "--model-key",
+        model_key,
+    ]
+    if args.eval_base:
+        cmd.append("--eval-base")
+    if args.use_cached_eval:
+        cmd.append("--use-cached-eval")
+    if args.no_reference_fallback:
+        cmd.append("--no-reference-fallback")
+    else:
+        cmd.append("--allow-reference-fallback")
+    if args.use_vllm:
+        cmd.append("--use-vllm")
+    else:
+        cmd.append("--no-vllm")
+    if args.apply_chat_template:
+        cmd.append("--apply-chat-template")
+    if args.limit is not None:
+        cmd.extend(["--limit", str(args.limit)])
+    return cmd
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point for automated benchmark evaluation and report generation."""
     if hasattr(sys.stdout, "reconfigure"):
@@ -1532,6 +1902,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    for noisy_logger in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
     args = parse_args(argv)
 
     cfg = load_eval_config(pathlib.Path(args.config))
@@ -1560,36 +1933,56 @@ def main(argv: Optional[List[str]] = None) -> int:
                 can_parallel_dual_gpu = False
 
         if can_parallel_dual_gpu:
-            logger.info("Detected >= 2 GPUs: evaluating E4B (cuda:0) and 26B-A4B (cuda:1) in parallel...")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                fut_e4b = pool.submit(
-                    build_benchmark_results,
-                    cfg=cfg,
-                    model_path=e4b_path,
-                    dry_run=args.dry_run,
-                    limit=args.limit,
-                    model_key="e4b",
-                    eval_base=args.eval_base,
-                    use_cached_eval=args.use_cached_eval,
-                    no_reference_fallback=args.no_reference_fallback,
-                    use_vllm=args.use_vllm,
-                    apply_chat_template=args.apply_chat_template,
+            logger.info(
+                "Detected >= 2 GPUs: launching isolated subprocesses for E4B (CUDA_VISIBLE_DEVICES=0) and 26B-A4B (CUDA_VISIBLE_DEVICES=1)..."
+            )
+            env_gpu0 = os.environ.copy()
+            env_gpu0["CUDA_VISIBLE_DEVICES"] = "0"
+            env_gpu1 = os.environ.copy()
+            env_gpu1["CUDA_VISIBLE_DEVICES"] = "1"
+
+            proc_e4b = subprocess.Popen(
+                _build_child_eval_cmd(args, "e4b"),
+                env=env_gpu0,
+                cwd=str(PROJECT_ROOT),
+            )
+            proc_moe = subprocess.Popen(
+                _build_child_eval_cmd(args, "26b_a4b"),
+                env=env_gpu1,
+                cwd=str(PROJECT_ROOT),
+            )
+            rc_e4b = proc_e4b.wait()
+            rc_moe = proc_moe.wait()
+            if rc_e4b != 0 or rc_moe != 0:
+                raise RuntimeError(
+                    f"Parallel Dual-GPU evaluation subprocess failed (rc_e4b={rc_e4b}, rc_26b_a4b={rc_moe})."
                 )
-                fut_moe = pool.submit(
-                    build_benchmark_results,
-                    cfg=cfg,
-                    model_path=moe_path,
-                    dry_run=args.dry_run,
-                    limit=args.limit,
-                    model_key="26b_a4b",
-                    eval_base=args.eval_base,
-                    use_cached_eval=args.use_cached_eval,
-                    no_reference_fallback=args.no_reference_fallback,
-                    use_vllm=args.use_vllm,
-                    apply_chat_template=args.apply_chat_template,
-                )
-                e4b_res = fut_e4b.result()
-                moe_res = fut_moe.result()
+
+            # Load completed results from outputs/eval_reports/live_raw_e4b.json and live_raw_26b_a4b.json
+            e4b_res = build_benchmark_results(
+                cfg=cfg,
+                model_path=e4b_path,
+                dry_run=False,
+                limit=args.limit,
+                model_key="e4b",
+                eval_base=args.eval_base,
+                use_cached_eval=True,
+                no_reference_fallback=args.no_reference_fallback,
+                use_vllm=args.use_vllm,
+                apply_chat_template=args.apply_chat_template,
+            )
+            moe_res = build_benchmark_results(
+                cfg=cfg,
+                model_path=moe_path,
+                dry_run=False,
+                limit=args.limit,
+                model_key="26b_a4b",
+                eval_base=args.eval_base,
+                use_cached_eval=True,
+                no_reference_fallback=args.no_reference_fallback,
+                use_vllm=args.use_vllm,
+                apply_chat_template=args.apply_chat_template,
+            )
         else:
             e4b_res = build_benchmark_results(
                 cfg=cfg,

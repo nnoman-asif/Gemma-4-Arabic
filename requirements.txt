@@ -1,6 +1,6 @@
 # Core Deep Learning and Unsloth 8.0 GB / A100 80 GB QLoRA Stack
 torch>=2.4.0
-transformers>=4.46.0
+transformers>=5.5.3
 datasets>=3.0.0
 accelerate>=1.0.0
 peft>=0.13.0
@@ -21,8 +21,18 @@ numpy>=1.26.0
 scipy>=1.11.0
 tqdm>=4.66.0
 
-# Evaluation, Plotting, and Testing
+# Evaluation (vLLM 0.30.0 + LM Eval + LightEval), Plotting, and Testing
+vllm>=0.30.0
 lm-eval>=0.4.8
+lighteval @ git+https://github.com/huggingface/lighteval.git@main
+inspect-ai
+aenum==3.1.15
+termcolor==2.3.0
+colorlog
+pycountry
+langcodes
+latex2sympy2_extended==1.0.6
+more_itertools
 evaluate>=0.4.3
 sqlitedict>=2.1.0
 pytablewriter>=1.2.0

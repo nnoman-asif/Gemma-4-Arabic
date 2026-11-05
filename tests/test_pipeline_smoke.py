@@ -37,6 +37,7 @@ from scripts.benchmark_vllm_concurrency import (
     render_vllm_markdown_report,
 )
 from scripts.run_benchmarks import (
+    _build_child_eval_cmd,
     _ensure_gemma4_tied_lm_head,
     _extract_mgsm_ar_target_number,
     _normalize_arabic_digits_filter,
@@ -47,6 +48,7 @@ from scripts.run_benchmarks import (
     extract_lm_eval_detailed_metrics,
     generate_markdown_report,
     parse_args as parse_bench_args,
+    parse_lighteval_results_json,
     parse_lm_eval_results_json,
     resolve_lm_eval_task_specs,
 )
@@ -524,6 +526,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
 
         mgsm_spec = build_custom_lm_eval_task_dict("mgsm_ar", num_fewshot=5)
         self.assertEqual(mgsm_spec["doc_to_target"], "{{target_number}}")
+        self.assertEqual(mgsm_spec["generation_kwargs"]["max_gen_toks"], 256)
+        self.assertIn("<|turn>", mgsm_spec["generation_kwargs"]["until"])
         self.assertEqual(
             mgsm_spec["metric_list"][0]["regexes_to_ignore"],
             [",", "\\$", "\\.$"],
@@ -593,9 +597,57 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             self.assertTrue(patched_cfg["tie_word_embeddings"])
             self.assertTrue(patched_cfg["text_config"]["tie_word_embeddings"])
 
+        self.assertEqual(compute_effective_task_limit("arabicmmlu", 200), 5)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_alghafa_light", 180), 20)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_acva_light", 200), 40)
         self.assertEqual(compute_effective_task_limit("leaderboard_mmlu_pro", 200), 200)
+
+        tasks_armmlu, primary_armmlu, eff_armmlu = resolve_lm_eval_task_specs(
+            "arabicmmlu", num_fewshot=0, limit=200
+        )
+        self.assertEqual(tasks_armmlu, ["arabicmmlu"])
+        self.assertEqual(primary_armmlu, "arabicmmlu")
+        self.assertEqual(eff_armmlu, 5)
+
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["ArabicMMLU"]["runner"], "lm_eval")
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["MadinahQA"]["runner"], "lighteval")
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
+
+        le_payload = {
+            "results": {
+                "madinah_qa:_average|0": {"acc_norm": 0.725},
+                "aratrust:_average|0": {"acc_norm": 0.815},
+            }
+        }
+        self.assertAlmostEqual(
+            parse_lighteval_results_json(le_payload, "MadinahQA")["eval_score_pct"],
+            72.50,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            parse_lighteval_results_json(le_payload, "AraTrust")["eval_score_pct"],
+            81.50,
+            places=2,
+        )
+        le_payload_colon = {
+            "results": {
+                "madinah_qa:_average:0": {"acc_norm": 0.742},
+                "aratrust:_average:0": {"acc_norm": 0.831},
+            }
+        }
+        self.assertAlmostEqual(
+            parse_lighteval_results_json(le_payload_colon, "MadinahQA")["eval_score_pct"],
+            74.20,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            parse_lighteval_results_json(le_payload_colon, "AraTrust")["eval_score_pct"],
+            83.10,
+            places=2,
+        )
+        child_cmd = _build_child_eval_cmd(parsed_cli, "26b_a4b")
+        self.assertIn("26b_a4b", child_cmd)
+        self.assertIn("--use-vllm", child_cmd)
 
         tasks_acva, primary_acva, eff_acva = resolve_lm_eval_task_specs(
             "arabic_leaderboard_acva_light", num_fewshot=0, limit=200
