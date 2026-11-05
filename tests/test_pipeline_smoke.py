@@ -571,6 +571,14 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             _extract_humaneval_code("    x = 1\n    return x\n```", "def foo():\n", "foo"),
             "def foo():\n    x = 1\n    return x\n",
         )
+        self.assertEqual(
+            _extract_humaneval_code(
+                "    x = a + b\n    return x\n\nExplanation: This adds a and b.\nprint(foo(1, 2))",
+                "def foo(a, b):\n",
+                "foo",
+            ),
+            "def foo(a, b):\n    x = a + b\n    return x\n",
+        )
         he_code = _extract_humaneval_code(
             "<|think|>\n<|think|>\n```python\ndef add(a, b):\n    return a + b\n```",
             "def add(a, b):\n",
@@ -665,6 +673,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
+        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["num_fewshot"], 0)
         self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval_instruct")
         self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge_chat")
 

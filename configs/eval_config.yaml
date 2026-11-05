@@ -126,7 +126,7 @@ retention_anchors:
     domain: "english_reasoning"
     lm_eval_task: "mmlu_pro"
     metric: "exact_match,custom-extract"
-    num_fewshot: 5
+    num_fewshot: 0
     max_regression_pct: 1.50
     min_acceptable_score: 60.0
 

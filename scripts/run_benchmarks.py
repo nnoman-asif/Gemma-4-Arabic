@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v19_final_clean_full"
+EVAL_CACHE_VERSION = "v20_mmlu0_humaneval_body"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -537,6 +537,29 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
     # If model emitted the full `def <entry_point>(...)` function definition:
     if entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", cleaned):
         cleaned_dedented = textwrap.dedent(cleaned).strip("\r\n")
+        def_lines = cleaned_dedented.splitlines()
+        kept_def_lines: List[str] = []
+        in_target_fn = False
+        seen_body_line = False
+        for ln in def_lines:
+            s_ln = ln.strip()
+            if not in_target_fn:
+                kept_def_lines.append(ln)
+                if re.match(rf"^def\s+{re.escape(entry_str)}\s*\(", s_ln):
+                    in_target_fn = True
+                continue
+            if not s_ln:
+                kept_def_lines.append("")
+                continue
+            if ln.startswith((" ", "\t")):
+                kept_def_lines.append(ln)
+                if not s_ln.startswith("#"):
+                    seen_body_line = True
+            else:
+                if seen_body_line:
+                    break
+                kept_def_lines.append(ln)
+        cleaned_dedented = "\n".join(kept_def_lines).rstrip()
         prefix_match = re.split(rf"(?m)^def\s+{re.escape(entry_str)}\s*\(", prompt_str, maxsplit=1)
         preamble = prefix_match[0] if len(prefix_match) > 1 else ""
         if preamble.strip() and preamble.strip() not in cleaned_dedented:
@@ -550,18 +573,34 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
         first_indented = non_empty[0].startswith((" ", "\t"))
         rest_indented = any(ln.startswith((" ", "\t")) for ln in non_empty[1:])
         if not first_indented and rest_indented:
-            # Only the first line lost its 4-space indent
             for idx, ln in enumerate(lines):
                 if ln.strip():
                     lines[idx] = "    " + ln
                     break
-            cleaned = "\n".join(lines)
         elif not first_indented and not rest_indented:
-            # Entire body block is unindented
-            cleaned = "\n".join(("    " + ln if ln.strip() else "") for ln in lines)
+            lines = [("    " + ln if ln.strip() else "") for ln in lines]
 
+    # Truncate at the first column-0 line after the indented body has started
+    body_lines: List[str] = []
+    seen_indented_code = False
+    for ln in lines:
+        s_ln = ln.strip()
+        if not s_ln:
+            body_lines.append("")
+            continue
+        if ln.startswith((" ", "\t")):
+            body_lines.append(ln)
+            if not s_ln.startswith("#"):
+                seen_indented_code = True
+        else:
+            if seen_indented_code:
+                break
+            body_lines.append("    " + ln)
+            seen_indented_code = True
+
+    cleaned = "\n".join(body_lines).strip("\r\n")
     sep = "" if prompt_str.endswith("\n") else "\n"
-    return prompt_str + sep + cleaned.strip("\r\n") + "\n"
+    return prompt_str + sep + cleaned + "\n"
 
 
 def _build_humaneval_instruct_predictions(
@@ -1086,19 +1125,8 @@ def extract_lm_eval_detailed_metrics(
                         rescored_total += 1
                         if native_em or (pred_letter == gold_letter):
                             rescored_correct += 1
-                elif "gsm8k" in task_lower:
-                    raw_resp = _first_resp_text(resps)
-                    doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
-                    gold_str = str(target if target is not None else doc_obj.get("answer") or "")
-                    gold_num = _extract_mgsm_ar_target_number(gold_str)
-                    if gold_num:
-                        cleaned_resp = _strip_thinking_blocks(raw_resp)
-                        pred_num = _extract_mgsm_ar_target_number(cleaned_resp)
-                        rescored_total += 1
-                        if native_em or _numbers_match(pred_num, gold_num):
-                            rescored_correct += 1
 
-    if rescored_total > 0 and ("mmlu_pro" in task_lower or "gsm8k" in task_lower):
+    if rescored_total > 0 and "mmlu_pro" in task_lower:
         rescored_pct = round(100.0 * float(rescored_correct) / float(rescored_total), 2)
         eval_score_pct = max(eval_score_pct, rescored_pct)
         top1_acc_pct = max(top1_acc_pct, rescored_pct)
