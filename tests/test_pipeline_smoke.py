@@ -568,8 +568,27 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             "D",
         )
         self.assertEqual(
+            _extract_arc_mcq_letter(
+                "Let's check (i) and f(a). The answer is option D. A great question, I agree.",
+                "ABCDEFGHIJ",
+            ),
+            "D",
+        )
+        self.assertEqual(
+            _extract_arc_mcq_letter("Therefore, \\boxed{G}.", "ABCDEFGHIJ"),
+            "G",
+        )
+        self.assertEqual(
             _extract_humaneval_code("    x = 1\n    return x\n```", "def foo():\n", "foo"),
             "def foo():\n    x = 1\n    return x\n",
+        )
+        self.assertEqual(
+            _extract_humaneval_code(
+                "Thinking about the problem...\n```python\ndef foo(a, b):\n    return a + b\n```",
+                "def foo(a, b):\n",
+                "foo",
+            ),
+            "def foo(a, b):\n    return a + b\n",
         )
         self.assertEqual(
             _extract_humaneval_code(
@@ -737,8 +756,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             "samples": {
                 "mmlu_pro_biology": [
                     {
-                        "target": "C",
-                        "resps": [["<|think|>\nWait, option A is wrong.\n<|think|>\nFinal Answer: C"]],
+                        "target": "(C)",
+                        "resps": [["<|think|>\nLet's solve.\n<|think|>\nFinal Answer: **C**"]],
                     }
                 ]
             },

@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v21_official_mmlu_pro_cot"
+EVAL_CACHE_VERSION = "v22_mmlu_parens_humaneval_fix"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -433,26 +433,25 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
     if not cleaned:
         return ""
     upper_letters = valid_letters.upper()
-    lower_letters = valid_letters.lower()
     patterns = (
-        # Explicit answer phrase + required separator (is / : / =) + optional markdown bold/parens + UPPERCASE letter
-        rf"(?:(?i:final\s+answer|best\s+answer|the\s+answer|correct\s+answer|correct\s+option|answer)|الإجابة)[\*\s]*(?:(?i:is)|:|=)[\*\s\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
-        # Fallback where 'Final Answer' or 'The answer is' is followed by bold/parenthesized uppercase letter
-        rf"(?i:final\s+answer|best\s+answer|the\s+answer\s+is|answer\s+is|correct\s+option)[\*\s:]+[\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
-        # 'Option C is correct' / 'choice (C) is correct'
-        rf"(?i:option|choice)[\*\s\(\[\{{]*([{upper_letters}])[\*\s\)\]\}}]+(?i:is\s+correct|is\s+the\s+correct)",
-        # Parenthesized letter e.g. (A) or **(A)**
-        rf"\(([{upper_letters}{lower_letters}])\)",
+        # LaTeX \boxed{C} or \boxed{(C)} or \boxed{\text{C}}
+        rf"\\boxed\s*\{{(?:\\text\s*\{{)?[\*\s\(\[\{{]*([{upper_letters}])[\*\s\)\]\}}]*\}}?\}}",
+        # Explicit answer/choice phrase + separator (is / : / = / ->) + optional 'option'/'choice' + UPPERCASE letter
+        rf"(?:(?i:final\s+answer|best\s+answer|the\s+correct\s+answer|correct\s+answer|the\s+correct\s+option|correct\s+option|the\s+correct\s+choice|correct\s+choice|the\s+answer|answer)|الإجابة)[\*\s]*(?:(?i:is|are|would\s+be)|:|=|->)?[\*\s]*(?:(?i:option|choice|letter)\s*)?[\*\s\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
+        # 'Option C is correct' / 'Choice (C) is the correct answer'
+        rf"(?i:option|choice|letter)[\*\s\(\[\{{]*([{upper_letters}])[\*\s\)\]\}}]*(?i:is\s+correct|is\s+the\s+correct|is\s+right)",
+        # Parenthesized UPPERCASE letter e.g. (A) or **(A)** (uppercase only so (i), (a), f(b) never match)
+        rf"\(([{upper_letters}])\)",
         # Standalone bold uppercase letter e.g. **C** or **C.**
         rf"\*\*([{upper_letters}])\.?\*\*",
-        # Standalone uppercase letter at word boundary
-        rf"\b([{upper_letters}])\b",
+        # Single uppercase letter on the very last line or at the very start of the response (e.g. "C. ..." or "C")
+        rf"(?:^\s*|\n\s*)[\*\(\[\{{]*([{upper_letters}])(?:\s*[\.\)\]\}}\*]|$)",
     )
     for pat in patterns:
         matches = re.findall(pat, cleaned)
         if matches:
             return str(matches[-1]).upper()
-    return cleaned[:1].upper()
+    return cleaned[:1].upper() if cleaned[:1].upper() in upper_letters else ""
 
 
 def _extract_arc_mcq_filter(
@@ -511,31 +510,42 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
     import textwrap
 
     cleaned = _strip_thinking_blocks(raw_resp)
-    if "```" in cleaned:
-        # Case 1: Model opened a fenced code block (```python ... ```)
-        fenced_blocks = re.findall(
-            r"```(?:python|py)?\s*\r?\n(.*?)```",
-            cleaned,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if fenced_blocks:
-            # Prefer the block that defines `entry_point` or the last code block
-            chosen_block = fenced_blocks[-1]
-            for blk in fenced_blocks:
-                if entry_point and re.search(rf"(?m)^\s*def\s+{re.escape(entry_point)}\s*\(", blk):
-                    chosen_block = blk
-                    break
-            cleaned = chosen_block
-        elif re.match(r"^\s*```(?:python|py)?\s*\r?\n", cleaned, flags=re.IGNORECASE):
-            cleaned = re.sub(r"^\s*```(?:python|py)?\s*\r?\n", "", cleaned, count=1, flags=re.IGNORECASE)
-            cleaned = cleaned.split("```")[0]
-        else:
-            # Case 2: Model continued code directly after prompt and closed with ```
-            cleaned = cleaned.split("```")[0]
-
-    cleaned = cleaned.rstrip()
     prompt_str = str(prompt or "")
     entry_str = str(entry_point or "").strip()
+
+    if "```" in cleaned:
+        prefix_before_fence = cleaned.split("```", 1)[0].strip("\r\n")
+        prefix_non_empty = [ln for ln in prefix_before_fence.splitlines() if ln.strip()]
+        prefix_is_direct_code = bool(
+            prefix_non_empty
+            and (
+                prefix_non_empty[0].startswith((" ", "\t"))
+                or (entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", prefix_before_fence))
+            )
+        )
+        if prefix_is_direct_code:
+            cleaned = prefix_before_fence
+        else:
+            fenced_blocks = re.findall(
+                r"```(?:python|py)?\s*\r?\n(.*?)```",
+                cleaned,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if fenced_blocks:
+                chosen_block = fenced_blocks[-1]
+                for blk in fenced_blocks:
+                    if entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_point)}\s*\(", blk):
+                        chosen_block = blk
+                        break
+                cleaned = chosen_block
+            else:
+                parts = re.split(r"```(?:python|py)?\s*\r?\n", cleaned, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    cleaned = parts[-1].split("```")[0]
+                else:
+                    cleaned = prefix_before_fence
+
+    cleaned = cleaned.rstrip()
 
     # If model emitted the full `def <entry_point>(...)` function definition:
     if entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", cleaned):
@@ -570,9 +580,29 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
         return cleaned_dedented + "\n"
 
     # Otherwise `cleaned` is the function body continuation after `prompt`:
-    _python_line_start_re = re.compile(
-        r"^(?:return\b|for\b|while\b|if\b|elif\b|else\s*:|try\s*:|except\b|with\b|def\b|class\b|import\b|from\b|pass\b|raise\b|yield\b|assert\b|[A-Za-z_]\w*\s*(?:=|\+=|-=|\*=|/=|\[|\())"
-    )
+    def _looks_like_unindented_python_line(line: str) -> bool:
+        s = line.strip()
+        if not s:
+            return False
+        if re.match(r"^(?:for|while|if|elif|else|try|except|with|def|class)\b", s):
+            return bool(re.search(r":\s*(?:#.*)?$", s))
+        if re.match(r"^(?:return|yield|raise|assert)\b", s):
+            return not bool(
+                re.match(
+                    r"^(?:return|yield|raise|assert)\s+(?:the|a|an|to|from|whether|if)\s+[a-z]+\s+[a-z]+",
+                    s,
+                    flags=re.IGNORECASE,
+                )
+            )
+        if re.match(r"^(?:pass|break|continue|import\s+\w+|from\s+\w+\s+import)\b", s):
+            return True
+        return bool(
+            re.match(
+                r"^[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*(?:=|\+=|-=|\*=|/=|//=|%=|\|=|&=|\^=|\[|\()",
+                s,
+            )
+        )
+
     lines = cleaned.splitlines()
     non_empty = [ln for ln in lines if ln.strip()]
     if non_empty:
@@ -585,14 +615,19 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
                 0,
             )
             leading_unindented = [ln.strip() for ln in lines[:first_ind_idx] if ln.strip()]
-            if leading_unindented and all(_python_line_start_re.match(u) for u in leading_unindented):
+            if leading_unindented and all(_looks_like_unindented_python_line(u) for u in leading_unindented):
                 for idx in range(first_ind_idx):
                     if lines[idx].strip():
                         lines[idx] = "    " + lines[idx]
             else:
                 lines = lines[first_ind_idx:]
         elif not first_indented and not rest_indented:
-            lines = [("    " + ln if ln.strip() else "") for ln in lines]
+            kept_unindented = [
+                ("    " + ln if ln.strip() else "")
+                for ln in lines
+                if not ln.strip() or _looks_like_unindented_python_line(ln)
+            ]
+            lines = kept_unindented
 
     # Truncate at the first column-0 line after the indented body has started
     body_lines: List[str] = []
@@ -655,7 +690,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "generation_kwargs": {
                 "until": [
                     "السؤال:",
-                    "\nالسؤال",
+                    "\nالسؤال:",
                     "Question:",
                     "<|turn>",
                     "<turn|>",
@@ -813,10 +848,10 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
-                "until": ["\n```", "\nclass ", "\nif __name__", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\nclass ", "\nif __name__", "<|turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
-                "max_gen_toks": 1024,
+                "max_gen_toks": 2048,
             },
             "filter_list": [
                 {
@@ -1133,7 +1168,8 @@ def extract_lm_eval_detailed_metrics(
                 if "mmlu_pro" in task_lower:
                     raw_resp = _first_resp_text(resps)
                     doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
-                    gold_letter = str(target if target is not None else doc_obj.get("answer") or "").strip().upper()
+                    raw_gold = str(doc_obj.get("answer") or target or "").strip()
+                    gold_letter = raw_gold.strip("()[]{}. \t\r\n*").upper()
                     if gold_letter:
                         pred_letter = _extract_arc_mcq_letter(raw_resp, valid_letters="ABCDEFGHIJ")
                         rescored_total += 1
