@@ -75,13 +75,13 @@ rm -rf unsloth_compiled_cache unsloth_compiled_cache_gpu0 unsloth_compiled_cache
       --output-dir outputs/dpo_e4b_a100
   fi
 
-  echo "[GPU 0] Running lossless 16-bit TIES-Merging (lambda=0.55, density=0.70, SFT+DPO 50/50) -> merged_16bit..."
+  echo "[GPU 0] Running lossless 16-bit TIES-Merging (lambda=0.35, density=0.70, SFT+DPO 65/35) -> merged_16bit..."
   "${PYTHON_BIN}" src/merge_and_export.py \
     --base-model unsloth/gemma-4-E4B-it \
     --sft-adapter-dir outputs/sft_e4b_a100 \
     --adapter-dir outputs/dpo_e4b_a100 \
     --output-dir outputs/merged_gemma4_e4b_arabic \
-    --lambda-scale 0.55 \
+    --lambda-scale 0.35 \
     --export-format merged_16bit \
     --force
 ) 2>&1 | tee -a logs/gpu0_e4b.log &

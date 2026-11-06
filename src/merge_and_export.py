@@ -201,7 +201,7 @@ def scale_and_trim_peft_lora_weights(
             if sft_adapter_state is not None and sft_key is not None:
                 merged_b = ties_merge_deltas(
                     deltas=[sft_adapter_state[sft_key].to(param.device), param.data],
-                    weights=[0.50, 0.50],
+                    weights=[0.65, 0.35],
                     density=density,
                 )
                 sft_merged_count += 1

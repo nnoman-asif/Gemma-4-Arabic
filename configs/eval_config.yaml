@@ -124,8 +124,8 @@ retention_anchors:
   MMLU-Pro:
     runner: "lm_eval"
     domain: "english_reasoning"
-    lm_eval_task: "leaderboard_mmlu_pro"
-    metric: "acc"
+    lm_eval_task: "mmlu_pro"
+    metric: "exact_match"
     num_fewshot: 5
     max_regression_pct: 1.50
     min_acceptable_score: 60.0
@@ -151,8 +151,8 @@ retention_anchors:
   ARC-Challenge:
     runner: "lm_eval"
     domain: "english_science_anchor"
-    lm_eval_task: "arc_challenge"
-    metric: "acc_norm"
+    lm_eval_task: "arc_challenge_chat"
+    metric: "exact_match"
     num_fewshot: 0
     max_regression_pct: 1.50
     min_acceptable_score: 65.0

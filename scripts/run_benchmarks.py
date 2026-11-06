@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v24_ast_humaneval_mc_anchors_16bit_merge"
+EVAL_CACHE_VERSION = "v25_final_cot_anchors_and_humaneval_until"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -459,26 +459,37 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
     patterns = (
         # 1. LaTeX \boxed{C} or \boxed{(C)} or \boxed{\text{C}}
         rf"\\boxed\s*\{{(?:\\text\s*\{{)?[\*\s\(\[\{{]*([{upper_letters}])[\*\s\)\]\}}]*\}}?\}}",
-        # 2. Explicit answer/choice phrase + separator + optional 'option'/'choice' + UPPERCASE letter
-        rf"(?:(?i:final\s+answer|best\s+answer|the\s+correct\s+answer|correct\s+answer|the\s+correct\s+option|correct\s+option|the\s+correct\s+choice|correct\s+choice|the\s+answer|answer)|الإجابة)[\*\s]*(?:(?i:is|are|would\s+be|corresponds\s+to)|:|=|->)?[\*\s]*(?:(?i:option|choice|letter)\s*)?[\*\s\(\[\{{]*([{upper_letters}])(?:\b|\)|\]|\}}|\*|\.|,|$)",
+        # 2. Explicit answer/choice phrase + optional separator (is / : / - / = / ->) + optional markdown bold + optional 'option'/'choice' + UPPERCASE letter
+        rf"(?:(?i:final\s+answer|best\s+answer|the\s+correct\s+(?:answer|option|choice)|correct\s+(?:answer|option|choice)|the\s+answer|answer)|الإجابة)[\*\s]*(?:(?i:is|are|would\s+be|corresponds\s+to)\s*)?[:=\-]*\s*(?:->)?\s*\*{{0,2}}\s*(?:(?i:option|choice|letter)\s+)?[\(\[\{{]*\*{{0,2}}([{upper_letters}])(?![a-zA-Z0-9])",
         # 3. 'Option C is correct' / '(C) is the correct answer' / 'Choice B is right'
         rf"(?:(?i:option|choice|letter)\s*)?[\*\(\[\{{]*([{upper_letters}])[\*\)\]\}}]*\s+(?i:is\s+correct|is\s+the\s+correct|is\s+the\s+right|is\s+the\s+best|is\s+right)",
         # 4. Conclusion transition ('Therefore, (C)', 'Thus, C.', 'Hence, option C')
         rf"(?i:therefore|thus|hence|consequently|so\s+the\s+answer\s+is)[,\s]+(?:(?i:option|choice)\s*)?[\*\(\[\{{]*([{upper_letters}])[\*\)\]\}}]*(?:\s*[\.\),]|$)",
-        # 5. Standalone bold uppercase letter e.g. **C** or **(C)** or **C.**
-        rf"\*\*[\(\[\{{]*([{upper_letters}])[\)\]\}}]*\.?\*\*",
+        # 5. Standalone bold uppercase letter e.g. **C** or **(C)** or **C.** or **B. The sun...**
+        rf"\*\*[\(\[\{{]*([{upper_letters}])[\)\]\}}]*(?:\.[^\*\n]+|\.?)\*\*",
     )
     for pat in patterns:
         matches = re.findall(pat, cleaned)
         if matches:
             return str(matches[-1]).upper()
 
-    # 6. Check the LAST non-empty line first (e.g. "(C)", "C.", "C") before scanning full text for parentheses
     non_empty_lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
     if non_empty_lines:
+        # 6. Check the FIRST non-empty line for a leading option marker (e.g. "Option B: ...", "B. ...", "(B) ...")
+        first_line = non_empty_lines[0]
+        first_line_m = re.match(
+            rf"^\s*\*{{0,2}}(?:(?i:option|choice)\s+)?(?:\(([{upper_letters}])\)|([{upper_letters}])[\.\)\:\-])(?:\s+|\*{{0,2}}\s+|$)",
+            first_line,
+        )
+        if first_line_m:
+            chosen_first = (first_line_m.group(1) or first_line_m.group(2) or "").strip().upper()
+            if chosen_first:
+                return chosen_first
+
+        # 7. Check the LAST non-empty line (e.g. "(C)", "C.", "C", "Option B: ...")
         last_line = non_empty_lines[-1]
         last_line_matches = re.findall(
-            rf"(?:^\s*[\*\(\[\{{]*([{upper_letters}])(?:\s*[\.\)\]\}}\*]|$))|\(([{upper_letters}])\)",
+            rf"(?:^\s*\*{{0,2}}(?:(?i:option|choice)\s+)?[\*\(\[\{{]*([{upper_letters}])(?:\s*[\.\)\]\}}\*\:\-]|$))|\(([{upper_letters}])\)",
             last_line,
         )
         if last_line_matches:
@@ -487,11 +498,64 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
                 if chosen:
                     return chosen
 
-    # 7. Final fallback: parenthesized uppercase letter (C) or leading letter
+    # 8. Final fallback: parenthesized uppercase letter (C) or single-character response
     paren_matches = re.findall(rf"\(([{upper_letters}])\)", cleaned)
     if paren_matches:
         return str(paren_matches[-1]).upper()
-    return cleaned[:1].upper() if cleaned[:1].upper() in upper_letters else ""
+    if len(cleaned) == 1 and cleaned.upper() in upper_letters:
+        return cleaned.upper()
+    return ""
+
+
+def _extract_mcq_letter_with_doc(
+    text: str,
+    doc: Any,
+    valid_letters: str = "ABCD",
+) -> str:
+    """Extract MCQ option letter via regex cues first, then fall back to matching option text from `doc`."""
+    letter = _extract_arc_mcq_letter(text, valid_letters=valid_letters)
+    if letter:
+        return letter
+    if not isinstance(doc, dict):
+        return ""
+    cleaned = _strip_thinking_blocks(text).strip()
+    if not cleaned:
+        return ""
+
+    option_texts: List[str] = []
+    choices_obj = doc.get("choices")
+    if isinstance(choices_obj, dict) and isinstance(choices_obj.get("text"), list):
+        option_texts = [str(x or "").strip() for x in choices_obj["text"]]
+    elif isinstance(doc.get("options"), list):
+        option_texts = [str(x or "").strip() for x in doc["options"]]
+
+    if not option_texts:
+        return ""
+
+    def _norm_txt(s: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", s.lower())).strip()
+
+    upper_letters = valid_letters.upper()
+    norm_cleaned = _norm_txt(cleaned)
+    non_empty_lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    first_line_norm = _norm_txt(non_empty_lines[0]) if non_empty_lines else ""
+
+    first_line_hits: List[int] = []
+    all_hits: List[int] = []
+    for idx, opt in enumerate(option_texts[: len(upper_letters)]):
+        n_opt = _norm_txt(opt)
+        if len(n_opt) < 2:
+            continue
+        if first_line_norm and (first_line_norm == n_opt or n_opt in first_line_norm):
+            first_line_hits.append(idx)
+        if n_opt in norm_cleaned:
+            all_hits.append(idx)
+
+    if len(first_line_hits) == 1:
+        return upper_letters[first_line_hits[0]]
+    if len(all_hits) == 1:
+        return upper_letters[all_hits[0]]
+    return ""
 
 
 def _extract_arc_mcq_filter(
@@ -499,13 +563,14 @@ def _extract_arc_mcq_filter(
     docs: List[Dict[str, Any]],
 ) -> List[List[str]]:
     """Custom `lm_eval` filter for `arc_challenge_chat` that strips `<|think|>` blocks and extracts `A-D`."""
-    _ = docs
     out: List[List[str]] = []
-    for inst in resps:
+    doc_list = list(docs) if isinstance(docs, (list, tuple)) else []
+    for idx, inst in enumerate(resps):
+        doc_item = doc_list[idx] if idx < len(doc_list) else None
         if isinstance(inst, (list, tuple)):
-            out.append([_extract_arc_mcq_letter(str(r), "ABCD") for r in inst])
+            out.append([_extract_mcq_letter_with_doc(str(r), doc_item, "ABCD") for r in inst])
         else:
-            out.append([_extract_arc_mcq_letter(str(inst), "ABCD")])
+            out.append([_extract_mcq_letter_with_doc(str(inst), doc_item, "ABCD")])
     return out
 
 
@@ -535,13 +600,14 @@ def _extract_mmlu_pro_mcq_filter(
     docs: List[Dict[str, Any]],
 ) -> List[List[str]]:
     """Custom `lm_eval` filter for `mmlu_pro` that strips `<|think|>` blocks and extracts `A-J`."""
-    _ = docs
     out: List[List[str]] = []
-    for inst in resps:
+    doc_list = list(docs) if isinstance(docs, (list, tuple)) else []
+    for idx, inst in enumerate(resps):
+        doc_item = doc_list[idx] if idx < len(doc_list) else None
         if isinstance(inst, (list, tuple)):
-            out.append([_extract_arc_mcq_letter(str(r), "ABCDEFGHIJ") for r in inst])
+            out.append([_extract_mcq_letter_with_doc(str(r), doc_item, "ABCDEFGHIJ") for r in inst])
         else:
-            out.append([_extract_arc_mcq_letter(str(inst), "ABCDEFGHIJ")])
+            out.append([_extract_mcq_letter_with_doc(str(inst), doc_item, "ABCDEFGHIJ")])
     return out
 
 
@@ -854,6 +920,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                     "السؤال:",
                     "\nالسؤال:",
                     "Question:",
+                    "<end_of_turn>",
                     "<turn|>",
                     "<eos>",
                     "</s>",
@@ -919,7 +986,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_text": "Select the correct option letter (A, B, C, D, E, F, G, H, I, or J) for the following question and end your response with 'Final Answer: X'.\n\nQuestion: {{formatted_question}}",
             "doc_to_target": "{{target_letter}}",
             "generation_kwargs": {
-                "until": ["Question:", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["Question:", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -962,7 +1029,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_text": "Select the correct option letter (A, B, C, or D) for the following question and end your response with 'Final Answer: X'.\n\nQuestion: {{formatted_question}}",
             "doc_to_target": "{{target_letter}}",
             "generation_kwargs": {
-                "until": ["Question:", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["Question:", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -1009,7 +1076,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
-                "until": ["\ndef ", "\nclass ", "\nif __name__", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\nif __name__", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -1339,13 +1406,15 @@ def extract_lm_eval_detailed_metrics(
                     for k, v in sample.items()
                     if str(k).startswith("exact_match") and isinstance(v, (int, float))
                 )
-                if "mmlu_pro" in task_lower:
+                if "mmlu_pro" in task_lower or "arc_challenge_chat" in task_lower:
                     raw_resp = _first_resp_text(resps)
                     doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
-                    raw_gold = str(doc_obj.get("answer") or target or "").strip()
+                    raw_gold = str(doc_obj.get("answer") or doc_obj.get("answerKey") or target or "").strip()
                     gold_letter = raw_gold.strip("()[]{}. \t\r\n*").upper()
+                    gold_letter = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E"}.get(gold_letter, gold_letter)
+                    valid_set = "ABCDEFGHIJ" if "mmlu_pro" in task_lower else "ABCDE"
                     if gold_letter:
-                        pred_letter = _extract_arc_mcq_letter(raw_resp, valid_letters="ABCDEFGHIJ")
+                        pred_letter = _extract_mcq_letter_with_doc(raw_resp, doc_obj, valid_letters=valid_set)
                         rescored_total += 1
                         if native_em or (pred_letter == gold_letter):
                             rescored_correct += 1
@@ -1378,7 +1447,12 @@ def extract_lm_eval_detailed_metrics(
                         if native_em or _numbers_match(pred_num, gold_num):
                             rescored_correct += 1
 
-    if rescored_total > 0 and ("mmlu_pro" in task_lower or "gsm8k" in task_lower or "mgsm" in task_lower):
+    if rescored_total > 0 and (
+        "mmlu_pro" in task_lower
+        or "arc_challenge_chat" in task_lower
+        or "gsm8k" in task_lower
+        or "mgsm" in task_lower
+    ):
         rescored_pct = round(100.0 * float(rescored_correct) / float(rescored_total), 2)
         eval_score_pct = max(eval_score_pct, rescored_pct)
         top1_acc_pct = max(top1_acc_pct, rescored_pct)

@@ -41,6 +41,7 @@ from scripts.run_benchmarks import (
     _ensure_gemma4_tied_lm_head,
     _extract_arc_mcq_letter,
     _extract_humaneval_code,
+    _extract_mcq_letter_with_doc,
     _extract_mgsm_ar_target_number,
     _normalize_arabic_digits_filter,
     _patch_gemma4_config_for_lm_eval,
@@ -581,6 +582,19 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         cot_mcq = "Let's evaluate: (A) is 10, (B) is 20, which matches, whereas (C) and (D) are wrong. Therefore, **B**."
         self.assertEqual(_extract_arc_mcq_letter(cot_mcq, "ABCD"), "B")
+        self.assertEqual(_extract_arc_mcq_letter("Option B: The sun heats the water.", "ABCD"), "B")
+        self.assertEqual(
+            _extract_arc_mcq_letter("The correct option is: **B. The sun heats the water.**", "ABCD"),
+            "B",
+        )
+        self.assertEqual(
+            _extract_mcq_letter_with_doc(
+                "The sun heats the water.",
+                {"choices": {"text": ["Wind", "The sun heats the water.", "Moon", "Stars"]}},
+                "ABCD",
+            ),
+            "B",
+        )
         raw_he = (
             "We need to check if any two numbers are closer than threshold.\n"
             "    for idx, elem in enumerate(numbers):\n"
@@ -737,10 +751,10 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eval_cfg["arabic_benchmarks"]["EXAMS-AR"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["num_fewshot"], 5)
-        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "leaderboard_mmlu_pro")
+        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval_instruct")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge")
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge_chat")
 
         le_payload = {
             "results": {
