@@ -43,9 +43,11 @@ from scripts.run_benchmarks import (
     _extract_humaneval_code,
     _extract_mcq_letter_with_doc,
     _extract_mgsm_ar_target_number,
+    _normalize_arabic_digits,
     _normalize_arabic_digits_filter,
     _patch_gemma4_config_for_lm_eval,
     _strip_thinking_blocks,
+    _truncate_math_continuation,
     build_custom_lm_eval_task_dict,
     compute_effective_task_limit,
     evaluate_retention_gate,
@@ -549,6 +551,16 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(mgsm_spec["generation_kwargs"]["max_gen_toks"], 2048)
         self.assertIn("<turn|>", mgsm_spec["generation_kwargs"]["until"])
         self.assertNotIn("<|turn>", mgsm_spec["generation_kwargs"]["until"])
+        self.assertIn("\nالسؤال:", mgsm_spec["generation_kwargs"]["until"])
+        self.assertIn("\nسؤال:", mgsm_spec["generation_kwargs"]["until"])
+        self.assertIn("\nQuestion:", mgsm_spec["generation_kwargs"]["until"])
+        self.assertNotIn("السؤال:", mgsm_spec["generation_kwargs"]["until"])
+        self.assertNotIn("Question:", mgsm_spec["generation_kwargs"]["until"])
+        self.assertIn("\nQuestion:", mmlu_pro_spec["generation_kwargs"]["until"])
+        self.assertNotIn("Question:", mmlu_pro_spec["generation_kwargs"]["until"])
+        arc_spec = build_custom_lm_eval_task_dict("arc_challenge_chat", num_fewshot=0)
+        self.assertIn("\nQuestion:", arc_spec["generation_kwargs"]["until"])
+        self.assertNotIn("Question:", arc_spec["generation_kwargs"]["until"])
         self.assertEqual(
             mgsm_spec["metric_list"][0]["regexes_to_ignore"],
             [",", "\\$", "\\.$"],
@@ -586,6 +598,39 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(
             _extract_arc_mcq_letter("The correct option is: **B. The sun heats the water.**", "ABCD"),
             "B",
+        )
+        self.assertEqual(
+            _extract_arc_mcq_letter(
+                "B\n\nExplanation: The sun heats the water, whereas (A) wind and (C) moon do not.",
+                "ABCD",
+            ),
+            "B",
+        )
+        self.assertEqual(
+            _extract_arc_mcq_letter("B\nBecause solar radiation warms the surface.", "ABCD"),
+            "B",
+        )
+        self.assertEqual(
+            _extract_arc_mcq_letter(
+                "The correct answer is C. Note that answer A is incorrect because wind is secondary.",
+                "ABCD",
+            ),
+            "C",
+        )
+        self.assertEqual(
+            _extract_arc_mcq_letter(
+                "Final Answer: B. Note that the answer D is wrong.",
+                "ABCD",
+            ),
+            "B",
+        )
+        self.assertEqual(
+            _strip_thinking_blocks("<turn|>\n<|turn>model\n<|channel>thought\nLet's think\n<channel|>    return a + b"),
+            "    return a + b",
+        )
+        self.assertEqual(
+            _strip_thinking_blocks("<|channel>thought\nUnclosed thought with The answer is (D)"),
+            "Unclosed thought with The answer is (D)",
         )
         self.assertEqual(
             _extract_mcq_letter_with_doc(
@@ -649,6 +694,36 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(_extract_mgsm_ar_target_number("خطوات الحل...\n##### 57,500"), "57500")
         self.assertEqual(_extract_mgsm_ar_target_number("المجموع هو 126+240 = 366"), "366")
         self.assertEqual(_extract_mgsm_ar_target_number("الناتج النهائي #### ٧٠٠٠٠"), "70000")
+        self.assertEqual(_normalize_arabic_digits("٥٧٬٥٠٠٫٢٥"), "57,500.25")
+        self.assertEqual(_extract_mgsm_ar_target_number("الإجابة هي ٥٧٬٥٠٠"), "57500")
+        self.assertEqual(
+            _truncate_math_continuation(
+                "المعطيات في السؤال: اشترى أحمد 5 كتب بسعر 10 ريال.\n5 * 10 = 50\n### 50\nالسؤال: سؤال آخر"
+            ),
+            "المعطيات في السؤال: اشترى أحمد 5 كتب بسعر 10 ريال.\n5 * 10 = 50\n### 50",
+        )
+        mgsm_rescored = extract_lm_eval_detailed_metrics(
+            {
+                "results": {"mgsm_ar": {"exact_match,flexible-extract": 0.0}},
+                "samples": {
+                    "mgsm_ar": [
+                        {
+                            "target": "57500",
+                            "resps": [["المعطيات في السؤال: ...\nالإجابة النهائية هي: ٥٧٬٥٠٠"]],
+                            "exact_match": 0.0,
+                        },
+                        {
+                            "target": "70000",
+                            "resps": [["خطوات الحل...\n### ٧٠٬٠٠٠"]],
+                            "exact_match": 0.0,
+                        },
+                    ]
+                },
+            },
+            task_name="mgsm_ar",
+            metric_hint="exact_match",
+        )
+        self.assertEqual(mgsm_rescored["eval_score_pct"], 100.0)
         self.assertEqual(
             _normalize_arabic_digits_filter([["<|think|>\n١٢٣\n<|think|>\nالإجابة هي ٥٧٥٠٠"]], [{}]),
             [["الإجابة هي 57500"]],
@@ -664,6 +739,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             "    return a + b\n\ndef foo(a, b):\n    return a + b\n",
             "Sure! Here is the function:\ndef foo(a, b):\n    return a + b\n",
             "    return a + b\n```\nHere is an example:\n```python\nprint(foo(1, 2))\n```",
+            "def foo(a, b):\n    return _helper(a, b)\n\ndef _helper(x, y):\n    return x + y\n",
         ):
             code_out = _extract_humaneval_code(raw_candidate, "def foo(a, b):\n", "foo")
             compile(code_out, "<humaneval>", "exec")
@@ -671,9 +747,52 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             exec(code_out, ns)
             self.assertEqual(ns["foo"](3, 4), 7)
 
+        double_code = _extract_humaneval_code(
+            "```python\nres = []\nfor x in numbers:\n    res.append(x * 2)\nreturn res\n```",
+            'def double_list(numbers):\n    """Double all numbers."""\n',
+            "double_list",
+        )
+        ns_double: Dict[str, Any] = {}
+        exec(double_code, ns_double)
+        self.assertEqual(ns_double["double_list"]([1, 2, 3]), [2, 4, 6])
+
+        sort_code = _extract_humaneval_code(
+            "numbers.sort()\nreturn numbers",
+            "def sort_nums(numbers):\n",
+            "sort_nums",
+        )
+        ns_sort: Dict[str, Any] = {}
+        exec(sort_code, ns_sort)
+        self.assertEqual(ns_sort["sort_nums"]([3, 1, 2]), [1, 2, 3])
+
+        indented_comment_col0_body = _extract_humaneval_code(
+            "    # Sort the list in ascending order\nnumbers.sort()\nreturn numbers",
+            "def sort_nums(numbers):\n",
+            "sort_nums",
+        )
+        ns_sort2: Dict[str, Any] = {}
+        exec(indented_comment_col0_body, ns_sort2)
+        self.assertEqual(ns_sort2["sort_nums"]([4, 1, 3]), [1, 3, 4])
+
+        col0_prefix_before_closing_fence = _extract_humaneval_code(
+            "res = a + b\nreturn res\n```\nExample:\n```python\nprint(foo(1, 2))\n```",
+            "def foo(a, b):\n",
+            "foo",
+        )
+        ns_col0_prefix: Dict[str, Any] = {}
+        exec(col0_prefix_before_closing_fence, ns_col0_prefix)
+        self.assertEqual(ns_col0_prefix["foo"](5, 6), 11)
+
         eval_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
         )
+        self.assertEqual(eval_cfg["retention_gate"]["min_retention_ratio"], 0.90)
+        self.assertEqual(eval_cfg["retention_gate"]["max_allowed_drop_pct"], 8.50)
+        for anchor_name in ("MMLU-Pro", "GSM8K", "HumanEval", "ARC-Challenge"):
+            self.assertEqual(
+                eval_cfg["retention_anchors"][anchor_name]["max_regression_pct"],
+                8.50,
+            )
         self.assertEqual(eval_cfg["arabic_benchmarks"]["MGSM-Ar"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["evaluation"]["base_model_id"], "unsloth/gemma-4-E4B-it")
         self.assertEqual(eval_cfg["evaluation"]["batch_size"], 32)

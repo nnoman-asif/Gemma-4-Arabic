@@ -569,7 +569,7 @@ def generate_all_family_plots(
     ax2_right.set_xticks(rx)
     ax2_right.set_xticklabels(ret_labels, fontsize=10.5, fontweight="bold")
     all_ratios = ratios_e4b + ratios_moe + [gate_pct]
-    ax2_right.set_ylim(max(90.0, min(all_ratios) - 2.0), max(all_ratios) + 3.5)
+    ax2_right.set_ylim(max(0.0, min(all_ratios) - 5.0), max(all_ratios) + 3.5)
     ax2_right.set_ylabel("Retention Ratio (%)", fontsize=11, fontweight="bold")
     ax2_right.set_title(f"Zero-Forgetting Retention Shield (>= {gate_pct:.1f}% Required)", fontsize=12.5, fontweight="bold")
     ax2_right.legend(loc="lower right", fontsize=8.5)

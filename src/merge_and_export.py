@@ -175,32 +175,82 @@ def scale_and_trim_peft_lora_weights(
     """
     modified_count = 0
     sft_merged_count = 0
+    handled_param_ids: set[int] = set()
+
+    def _find_sft_tensor(base_key: str) -> Optional[torch.Tensor]:
+        if sft_adapter_state is None:
+            return None
+        candidates = (
+            base_key,
+            base_key.replace(".default.", "."),
+            base_key.replace(".lora_A.weight", ".lora_A.default.weight"),
+            base_key.replace(".lora_B.weight", ".lora_B.default.weight"),
+        )
+        for cand in candidates:
+            if cand in sft_adapter_state:
+                return sft_adapter_state[cand]
+            if (
+                cand.startswith("base_model.model.")
+                and cand[len("base_model.model.") :] in sft_adapter_state
+            ):
+                return sft_adapter_state[cand[len("base_model.model.") :]]
+            prefixed = f"base_model.model.{cand}"
+            if prefixed in sft_adapter_state:
+                return sft_adapter_state[prefixed]
+        return None
+
+    if sft_adapter_state is not None:
+        for mod_name, mod in model.named_modules():
+            if (
+                hasattr(mod, "base_layer")
+                and hasattr(mod, "lora_A")
+                and hasattr(mod, "lora_B")
+                and isinstance(getattr(mod, "lora_A", None), (dict, nn.ModuleDict))
+                and isinstance(getattr(mod, "lora_B", None), (dict, nn.ModuleDict))
+                and "default" in mod.lora_A
+                and "default" in mod.lora_B
+                and hasattr(mod.base_layer, "weight")
+            ):
+                sft_A = _find_sft_tensor(f"{mod_name}.lora_A.default.weight")
+                sft_B = _find_sft_tensor(f"{mod_name}.lora_B.default.weight")
+                if sft_A is not None and sft_B is not None:
+                    base_w = mod.base_layer.weight
+                    dev = base_w.device
+                    scaling_attr = getattr(mod, "scaling", 1.0)
+                    scale = (
+                        float(scaling_attr.get("default", 1.0))
+                        if isinstance(scaling_attr, dict)
+                        else float(scaling_attr)
+                    )
+                    A_dpo = mod.lora_A["default"].weight.data.to(device=dev, dtype=torch.float32)
+                    B_dpo = mod.lora_B["default"].weight.data.to(device=dev, dtype=torch.float32)
+                    delta_w_sft = scale * (
+                        sft_B.to(device=dev, dtype=torch.float32)
+                        @ sft_A.to(device=dev, dtype=torch.float32)
+                    )
+                    delta_w_dpo = scale * (B_dpo @ A_dpo)
+                    merged_delta_w = ties_merge_deltas(
+                        deltas=[delta_w_sft, delta_w_dpo],
+                        weights=[0.65, 0.35],
+                        density=density,
+                    )
+                    base_w.data.copy_(
+                        (base_w.data.to(torch.float32) + float(lambda_scale) * merged_delta_w).to(
+                            base_w.dtype
+                        )
+                    )
+                    mod.lora_B["default"].weight.data.zero_()
+                    mod.lora_A["default"].weight.data.zero_()
+                    handled_param_ids.add(id(mod.lora_B["default"].weight))
+                    modified_count += 1
+                    sft_merged_count += 1
+
     for name, param in model.named_parameters():
-        if "lora_B" in name:
-            sft_key: Optional[str] = None
-            if sft_adapter_state is not None:
-                candidates = (
-                    name,
-                    name.replace(".default.", "."),
-                    name.replace(".lora_B.weight", ".lora_B.default.weight"),
-                )
-                for cand in candidates:
-                    if cand in sft_adapter_state:
-                        sft_key = cand
-                        break
-                    if (
-                        cand.startswith("base_model.model.")
-                        and cand[len("base_model.model.") :] in sft_adapter_state
-                    ):
-                        sft_key = cand[len("base_model.model.") :]
-                        break
-                    prefixed = f"base_model.model.{cand}"
-                    if prefixed in sft_adapter_state:
-                        sft_key = prefixed
-                        break
-            if sft_adapter_state is not None and sft_key is not None:
+        if "lora_B" in name and id(param) not in handled_param_ids:
+            sft_tensor = _find_sft_tensor(name)
+            if sft_tensor is not None:
                 merged_b = ties_merge_deltas(
-                    deltas=[sft_adapter_state[sft_key].to(param.device), param.data],
+                    deltas=[sft_tensor.to(param.device), param.data],
                     weights=[0.65, 0.35],
                     density=density,
                 )

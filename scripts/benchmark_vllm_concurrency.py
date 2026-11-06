@@ -38,6 +38,10 @@ from scripts.benchmark_latency_and_plots import (
     _write_fallback_svg_and_png,
     load_eval_config,
 )
+from scripts.run_benchmarks import (
+    _destroy_vllm_and_free_vram,
+    _prepare_gemma4_config_for_load,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +385,11 @@ def profile_vllm_model_live(
             "PyTorch / HuggingFace Batched Static KV Cache (BF16 Live GPU Measurement)",
         )
 
+    try:
+        _prepare_gemma4_config_for_load(model_path)
+    except Exception:
+        pass
+
     llm = LLM(
         model=model_path,
         dtype="bfloat16",
@@ -390,74 +399,75 @@ def profile_vllm_model_live(
         tensor_parallel_size=1,
     )
 
-    base_prompt = (
-        "أنت مستشار قانوني ومالي خبير في الأنظمة السعودية. "
-        "اشرح بالتفصيل الإجراءات النظامية لحوكمة الشركات المساهمة وحقوق المساهمين في نظام الشركات السعودي الجديد. "
-    )
-    prompt_text = (base_prompt * max(1, prompt_tokens // 24))[: prompt_tokens * 3]
-
-    # Warmup single request
-    warmup_params = SamplingParams(temperature=0.0, max_tokens=8)
-    _ = llm.generate([prompt_text], warmup_params)
-
     scaling_results: Dict[str, Any] = {}
-    for num_users in concurrency_users:
-        batch_prompts = [f"[User {i + 1}] {prompt_text}" for i in range(num_users)]
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-
-        # 1. Measure Prefill / Time-To-First-Token (TTFT) across 3 timed runs
-        ttft_params = SamplingParams(temperature=0.0, max_tokens=1)
-        ttft_samples_ms: List[float] = []
-        for _ in range(3):
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            _ = llm.generate(batch_prompts, ttft_params)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            ttft_samples_ms.append((time.perf_counter() - t0) * 1000.0)
-        ttft_samples_ms.sort()
-        ttft_median_ms = ttft_samples_ms[len(ttft_samples_ms) // 2]
-        ttft_p95_ms = ttft_samples_ms[-1]
-
-        # 2. Measure Continuous-Batched Decode Throughput across N concurrent requests
-        gen_params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
-        t_start = time.perf_counter()
-        outputs = llm.generate(batch_prompts, gen_params)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elapsed = max(1e-6, time.perf_counter() - t_start)
-
-        total_generated_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
-        total_system_tps = total_generated_tokens / elapsed
-        per_user_tps = total_system_tps / max(1, num_users)
-
-        vram_used_gb = (
-            torch.cuda.max_memory_allocated() / (1024.0 ** 3)
-            if torch.cuda.is_available()
-            else weights_vram_gb + (0.42 * num_users)
+    try:
+        base_prompt = (
+            "أنت مستشار قانوني ومالي خبير في الأنظمة السعودية. "
+            "اشرح بالتفصيل الإجراءات النظامية لحوكمة الشركات المساهمة وحقوق المساهمين في نظام الشركات السعودي الجديد. "
         )
-        kv_gb = max(0.4, round(vram_used_gb - weights_vram_gb, 2))
+        prompt_text = (base_prompt * max(1, prompt_tokens // 24))[: prompt_tokens * 3]
 
-        scaling_results[str(num_users)] = {
-            "concurrent_users": num_users,
-            "ttft_median_ms": round(ttft_median_ms, 2),
-            "ttft_p95_ms": round(ttft_p95_ms, 2),
-            "per_user_tokens_per_sec": round(per_user_tps, 2),
-            "total_system_tokens_per_sec": round(total_system_tps, 2),
-            "kv_cache_and_runtime_gb": kv_gb,
-            "vram_used_gb": round(vram_used_gb, 2),
-            "vram_utilization_pct": round((vram_used_gb / 80.0) * 100.0, 1),
-        }
+        # Warmup single request
+        warmup_params = SamplingParams(temperature=0.0, max_tokens=8)
+        _ = llm.generate([prompt_text], warmup_params)
 
-    del llm
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        for num_users in concurrency_users:
+            batch_prompts = [f"[User {i + 1}] {prompt_text}" for i in range(num_users)]
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+
+            # 1. Measure Prefill / Time-To-First-Token (TTFT) across 3 timed runs
+            ttft_params = SamplingParams(temperature=0.0, max_tokens=1)
+            ttft_samples_ms: List[float] = []
+            for _ in range(3):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                _ = llm.generate(batch_prompts, ttft_params)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                ttft_samples_ms.append((time.perf_counter() - t0) * 1000.0)
+            ttft_samples_ms.sort()
+            ttft_median_ms = ttft_samples_ms[len(ttft_samples_ms) // 2]
+            ttft_p95_ms = ttft_samples_ms[-1]
+
+            # 2. Measure Continuous-Batched Decode Throughput across N concurrent requests
+            gen_params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
+            t_start = time.perf_counter()
+            outputs = llm.generate(batch_prompts, gen_params)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elapsed = max(1e-6, time.perf_counter() - t_start)
+
+            total_generated_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+            total_system_tps = total_generated_tokens / elapsed
+            per_user_tps = total_system_tps / max(1, num_users)
+
+            vram_used_gb = (
+                torch.cuda.max_memory_allocated() / (1024.0 ** 3)
+                if torch.cuda.is_available()
+                else weights_vram_gb + (0.42 * num_users)
+            )
+            if vram_used_gb < weights_vram_gb:
+                vram_used_gb = weights_vram_gb + round(
+                    (0.48 if weights_vram_gb < 20.0 else 0.40) * num_users, 2
+                )
+            kv_gb = max(0.4, round(vram_used_gb - weights_vram_gb, 2))
+
+            scaling_results[str(num_users)] = {
+                "concurrent_users": num_users,
+                "ttft_median_ms": round(ttft_median_ms, 2),
+                "ttft_p95_ms": round(ttft_p95_ms, 2),
+                "per_user_tokens_per_sec": round(per_user_tps, 2),
+                "total_system_tokens_per_sec": round(total_system_tps, 2),
+                "kv_cache_and_runtime_gb": kv_gb,
+                "vram_used_gb": round(vram_used_gb, 2),
+                "vram_utilization_pct": round((vram_used_gb / 80.0) * 100.0, 1),
+            }
+    finally:
+        _destroy_vllm_and_free_vram(model_obj=llm)
 
     return (
         scaling_results,

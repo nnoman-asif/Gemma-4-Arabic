@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v25_final_cot_anchors_and_humaneval_until"
+EVAL_CACHE_VERSION = "v27_final_verified"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -333,24 +333,30 @@ def compute_effective_task_limit(
 # ---------------------------------------------------------------------------
 
 _EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
-    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
-    "01234567890123456789",
+    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬",
+    "01234567890123456789.,",
 )
 
 
 def _strip_thinking_blocks(text: str) -> str:
     """Remove Gemma 4 `<|think|>`, `<think>`, and `<|channel>thought...<channel|>` blocks and post-`<turn|>` babble without stripping line-1 indentation."""
     s = str(text or "")
+    # Strip any leading turn-transition prefix before splitting on end-of-turn markers
+    s = re.sub(
+        r"^\s*(?:<turn\|>\s*)*(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?",
+        "",
+        s,
+    )
     # Truncate at the first end-of-turn / EOS marker so post-turn babble is never parsed
     for eot in ("<turn|>", "<eos>", "<end_of_turn>", "<|im_end|>", "</s>"):
         if eot in s:
             s = s.split(eot, 1)[0]
-    # Strip leading turn header if emitted in raw completion mode
-    s = re.sub(r"^\s*(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?", "", s)
     # Strip Gemma 4 native <|channel>thought...<channel|> blocks
     s = re.sub(r"<\|channel>thought.*?<channel\|>", "", s, flags=re.DOTALL)
     if "<channel|>" in s:
         s = s.split("<channel|>")[-1]
+    if "<|channel>thought" in s:
+        s = re.sub(r"<\|channel>thought\s*\r?\n?", "", s)
     # Strip <|think|>...<|think|> and <think>...</think> blocks
     s = re.sub(r"<\|think\|>.*?<\|think\|>", "", s, flags=re.DOTALL)
     s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
@@ -402,10 +408,10 @@ def _process_mgsm_ar_docs(dataset: Any) -> Any:
 def _truncate_math_continuation(text: str) -> str:
     """Strip thinking blocks, normalize Arabic digits, and truncate post-answer continuations / hallucinated next questions."""
     s = _normalize_arabic_digits(_strip_thinking_blocks(str(text or "")))
-    for marker in ("\nQuestion:", "\nQ:", "\nالسؤال:", "\nسؤال:", "Question:", "السؤال:"):
+    for marker in ("\nQuestion:", "\nQ:", "\nالسؤال:", "\nسؤال:"):
         if marker in s:
             s = s.split(marker, 1)[0]
-    m_hash = re.search(r"####\s*-?[\d,]+(?:\.\d+)?", s)
+    m_hash = re.search(r"#{3,4}\s*-?[\d,]+(?:\.\d+)?", s)
     if m_hash:
         s = s[: m_hash.end()]
     return s.strip("\r\n")
@@ -459,8 +465,10 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
     patterns = (
         # 1. LaTeX \boxed{C} or \boxed{(C)} or \boxed{\text{C}}
         rf"\\boxed\s*\{{(?:\\text\s*\{{)?[\*\s\(\[\{{]*([{upper_letters}])[\*\s\)\]\}}]*\}}?\}}",
-        # 2. Explicit answer/choice phrase + optional separator (is / : / - / = / ->) + optional markdown bold + optional 'option'/'choice' + UPPERCASE letter
-        rf"(?:(?i:final\s+answer|best\s+answer|the\s+correct\s+(?:answer|option|choice)|correct\s+(?:answer|option|choice)|the\s+answer|answer)|الإجابة)[\*\s]*(?:(?i:is|are|would\s+be|corresponds\s+to)\s*)?[:=\-]*\s*(?:->)?\s*\*{{0,2}}\s*(?:(?i:option|choice|letter)\s+)?[\(\[\{{]*\*{{0,2}}([{upper_letters}])(?![a-zA-Z0-9])",
+        # 2a. Explicit final/correct/best answer cues
+        rf"(?:(?i:final\s+answer|best\s+answer|the\s+correct\s+(?:answer|option|choice)|correct\s+(?:answer|option|choice))|الإجابة\s+(?:النهائية|الصحيحة))[\*\s]*(?:(?i:is|are|would\s+be|corresponds\s+to)\s*)?[:=\-]*\s*(?:->)?\s*\*{{0,2}}\s*(?:(?i:option|choice|letter)\s+)?[\(\[\{{]*\*{{0,2}}([{upper_letters}])(?![a-zA-Z0-9])(?![\*\)\]\}}\.\s]*(?i:is\s+(?:incorrect|wrong|false|not\b)))",
+        # 2b. 'the answer' / 'answer' / 'الإجابة' requiring a separator and negative lookahead for 'is incorrect/wrong'
+        rf"(?:(?i:the\s+answer|answer)|الإجابة)[\*\s]*(?:(?i:is|are|would\s+be|corresponds\s+to)\b\s*[:=\-]*|[:=]|->)\s*\*{{0,2}}\s*(?:(?i:option|choice|letter)\s+)?[\(\[\{{]*\*{{0,2}}([{upper_letters}])(?![a-zA-Z0-9])(?![\*\)\]\}}\.\s]*(?i:is\s+(?:incorrect|wrong|false|not\b)))",
         # 3. 'Option C is correct' / '(C) is the correct answer' / 'Choice B is right'
         rf"(?:(?i:option|choice|letter)\s*)?[\*\(\[\{{]*([{upper_letters}])[\*\)\]\}}]*\s+(?i:is\s+correct|is\s+the\s+correct|is\s+the\s+right|is\s+the\s+best|is\s+right)",
         # 4. Conclusion transition ('Therefore, (C)', 'Thus, C.', 'Hence, option C')
@@ -475,10 +483,16 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
 
     non_empty_lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
     if non_empty_lines:
-        # 6. Check the FIRST non-empty line for a leading option marker (e.g. "Option B: ...", "B. ...", "(B) ...")
+        # 6. Check the FIRST non-empty line for a standalone option letter or leading option marker
         first_line = non_empty_lines[0]
+        first_line_standalone_m = re.match(
+            rf"^\s*\*{{0,2}}(?:(?i:option|choice)\s+)?[\(\[\{{]*([{upper_letters}])[\)\]\}}]*\*{{0,2}}\s*$",
+            first_line,
+        )
+        if first_line_standalone_m:
+            return first_line_standalone_m.group(1).strip().upper()
         first_line_m = re.match(
-            rf"^\s*\*{{0,2}}(?:(?i:option|choice)\s+)?(?:\(([{upper_letters}])\)|([{upper_letters}])[\.\)\:\-])(?:\s+|\*{{0,2}}\s+|$)",
+            rf"^\s*\*{{0,2}}(?:(?i:option|choice)\s+)?(?:\(([{upper_letters}])\)|([{upper_letters}])(?:[\.\)\:\-\—\,]|\s+(?:(?i:is|because|since)\b|-|—)))(?:\s+|\*{{0,2}}\s+|$)",
             first_line,
         )
         if first_line_m:
@@ -733,6 +747,19 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
                     seen_body_line = True
             else:
                 if seen_body_line:
+                    if s_ln.startswith("@"):
+                        kept_def_lines.append(ln)
+                        continue
+                    m_top = re.match(r"^(?:def|class)\s+(\w+)\b", s_ln)
+                    if m_top:
+                        fn_name = m_top.group(1)
+                        if (
+                            fn_name != entry_str
+                            and fn_name != "check"
+                            and not fn_name.startswith("test_")
+                        ):
+                            kept_def_lines.append(ln)
+                            continue
                     break
                 kept_def_lines.append(ln)
 
@@ -748,67 +775,97 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
         return assembled_fn + "\n"
 
     def _assemble_from_body(snippet: str) -> str:
-        s_clean = snippet.rstrip()
-        if not s_clean.strip():
-            return ""
-        lines = s_clean.splitlines()
-        non_empty = [ln for ln in lines if ln.strip()]
-        if not non_empty:
-            return ""
-
-        first_indented = non_empty[0].startswith((" ", "\t"))
-        rest_indented = any(ln.startswith((" ", "\t")) for ln in non_empty[1:])
-        if not first_indented and rest_indented:
-            first_ind_idx = next(
-                (i for i, ln in enumerate(lines) if ln.strip() and ln.startswith((" ", "\t"))),
-                0,
-            )
-            leading_unindented = [ln.strip() for ln in lines[:first_ind_idx] if ln.strip()]
-            if (
-                leading_unindented
-                and all(_looks_like_unindented_python_line(u) for u in leading_unindented)
-                and not any(
-                    entry_str and re.match(rf"^def\s+{re.escape(entry_str)}\s*\(", u)
-                    for u in leading_unindented
-                )
-            ):
-                for idx in range(first_ind_idx):
-                    if lines[idx].strip():
-                        lines[idx] = "    " + lines[idx]
-            else:
-                lines = lines[first_ind_idx:]
-        elif not first_indented and not rest_indented:
-            lines = [
-                ("    " + ln if ln.strip() else "")
-                for ln in lines
-                if not ln.strip() or _looks_like_unindented_python_line(ln)
-            ]
-
-        body_lines: List[str] = []
-        seen_indented_code = False
-        for ln in lines:
-            s_ln = ln.strip()
-            if not s_ln:
-                body_lines.append("")
-                continue
-            if ln.startswith((" ", "\t")):
-                body_lines.append(ln)
-                if not s_ln.startswith("#"):
-                    seen_indented_code = True
-            else:
-                if seen_indented_code:
-                    break
-                if _looks_like_unindented_python_line(s_ln) and not (
-                    entry_str and re.match(rf"^def\s+{re.escape(entry_str)}\s*\(", s_ln)
-                ):
-                    body_lines.append("    " + ln)
-                    seen_indented_code = True
-
-        body_str = "\n".join(body_lines).strip("\r\n")
-        if not body_str.strip():
+        raw_lines = [ln.rstrip() for ln in snippet.strip("\r\n").splitlines()]
+        while raw_lines and not raw_lines[0].strip():
+            raw_lines.pop(0)
+        while raw_lines and not raw_lines[-1].strip():
+            raw_lines.pop()
+        if not raw_lines:
             return ""
         sep = "" if prompt_str.endswith("\n") else "\n"
-        return prompt_str + sep + body_str + "\n"
+
+        cleaned_lines: List[str] = []
+        seen_indented = False
+        first_code_lines = [
+            ln for ln in raw_lines if ln.strip() and not ln.strip().startswith("#")
+        ]
+        first_is_indented = bool(
+            first_code_lines and first_code_lines[0].startswith((" ", "\t"))
+        )
+        for ln in raw_lines:
+            s_ln = ln.strip()
+            if not s_ln:
+                cleaned_lines.append("")
+                continue
+            if re.match(
+                r"^(?:if\s+__name__\b|print\s*\(|#\s*(?:Example|Test)|def\s+(?:test_|check\b))",
+                s_ln,
+            ):
+                break
+            if entry_str and re.match(rf"^assert\s+{re.escape(entry_str)}\s*\(", s_ln):
+                break
+            if entry_str and re.match(rf"^def\s+{re.escape(entry_str)}\s*\(", s_ln):
+                if seen_indented:
+                    break
+                return ""
+            if first_is_indented and seen_indented and not ln.startswith((" ", "\t")):
+                break
+            if ln.startswith((" ", "\t")) and not s_ln.startswith("#"):
+                seen_indented = True
+            if not first_is_indented and not seen_indented and s_ln.startswith("#"):
+                cleaned_lines.append(s_ln)
+            else:
+                cleaned_lines.append(ln)
+
+        while cleaned_lines and not cleaned_lines[-1].strip():
+            cleaned_lines.pop()
+        if not cleaned_lines:
+            return ""
+
+        def _try_block(block_lines: List[str]) -> str:
+            if not block_lines:
+                return ""
+            if entry_str and re.match(
+                rf"^[ \t]*def\s+{re.escape(entry_str)}\s*\(", block_lines[0]
+            ):
+                return ""
+            joined = "\n".join(block_lines)
+            # Strategy 1: uniformly dedent and indent by 4 spaces (handles column-0 multi-line bodies & already-indented bodies)
+            cand1_body = textwrap.indent(textwrap.dedent(joined), "    ")
+            cand1 = prompt_str + sep + cand1_body + "\n"
+            if _is_valid_python_with_entry(cand1, entry_str):
+                return cand1
+            # Strategy 2: line 0 was unindented while lines 1+ already have >=4 spaces
+            if not block_lines[0].startswith((" ", "\t")):
+                fixed_lines = ["    " + block_lines[0]] + block_lines[1:]
+                cand2 = prompt_str + sep + "\n".join(fixed_lines) + "\n"
+                if _is_valid_python_with_entry(cand2, entry_str):
+                    return cand2
+                if len(block_lines) > 1:
+                    rest_dedented = textwrap.indent(
+                        textwrap.dedent("\n".join(block_lines[1:])), "    "
+                    )
+                    cand2b = (
+                        prompt_str
+                        + sep
+                        + "    "
+                        + block_lines[0]
+                        + "\n"
+                        + rest_dedented
+                        + "\n"
+                    )
+                    if _is_valid_python_with_entry(cand2b, entry_str):
+                        return cand2b
+            return ""
+
+        max_lead = min(6, len(cleaned_lines))
+        for start_i in range(max_lead):
+            sub = cleaned_lines[start_i:]
+            for end_i in range(len(sub), 0, -1):
+                res = _try_block(sub[:end_i])
+                if res:
+                    return res
+        return ""
 
     candidates: List[str] = []
 
@@ -823,7 +880,7 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
             for ln in prefix_before_fence.splitlines()
             if ln.strip()
         )
-        if prefix_has_code and not first_fence_is_opening_lang:
+        if not first_fence_is_opening_lang and prefix_before_fence.strip():
             candidates.append(_assemble_from_body(prefix_before_fence))
             candidates.append(_assemble_from_full_def(prefix_before_fence))
 
@@ -917,9 +974,9 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             },
             "generation_kwargs": {
                 "until": [
-                    "السؤال:",
                     "\nالسؤال:",
-                    "Question:",
+                    "\nسؤال:",
+                    "\nQuestion:",
                     "<end_of_turn>",
                     "<turn|>",
                     "<eos>",
@@ -986,7 +1043,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_text": "Select the correct option letter (A, B, C, D, E, F, G, H, I, or J) for the following question and end your response with 'Final Answer: X'.\n\nQuestion: {{formatted_question}}",
             "doc_to_target": "{{target_letter}}",
             "generation_kwargs": {
-                "until": ["Question:", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\nQuestion:", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -1029,7 +1086,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_text": "Select the correct option letter (A, B, C, or D) for the following question and end your response with 'Final Answer: X'.\n\nQuestion: {{formatted_question}}",
             "doc_to_target": "{{target_letter}}",
             "generation_kwargs": {
-                "until": ["Question:", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\nQuestion:", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -1428,9 +1485,9 @@ def extract_lm_eval_detailed_metrics(
                         # Extract explicit #### <num>, \boxed{<num>}, Final Answer: <num>, or last number before <turn|>
                         pred_num = ""
                         boxed_m = re.findall(r"\\boxed\s*\{([^{}]+)\}", cleaned_resp)
-                        hash_m = re.findall(r"####\s*(-?[\d,]+(?:\.\d+)?)", cleaned_resp)
+                        hash_m = re.findall(r"#{3,4}\s*(-?[\d,]+(?:\.\d+)?)", cleaned_resp)
                         ans_m = re.findall(
-                            r"(?i:(?:final\s+answer|the\s+answer|answer)\s*(?:is|:|=)\s*)\$?\s*(-?[\d,]+(?:\.\d+)?)",
+                            r"(?:(?i:(?:final\s+answer|the\s+answer|answer)\s*(?:is|:|=))|(?:الإجابة\s+النهائية|الإجابة\s+الصحيحة|الإجابة|الجواب\s+النهائي|الجواب|الناتج\s+النهائي|الناتج)\s*(?:هي|هو|:|=))\s*\$?\s*(-?[\d,]+(?:\.\d+)?)",
                             cleaned_resp,
                         )
                         if hash_m:
@@ -1601,6 +1658,11 @@ def _destroy_vllm_and_free_vram(lm_obj: Any = None, model_obj: Any = None) -> No
         pass
     try:
         if model_obj is not None:
+            if hasattr(model_obj, "llm_engine"):
+                try:
+                    model_obj.llm_engine.engine_core.shutdown()
+                except Exception:
+                    pass
             del model_obj
     except Exception:
         pass

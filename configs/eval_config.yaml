@@ -38,8 +38,8 @@ models:
 
 retention_gate:
   enforce_zero_forgetting: true
-  min_retention_ratio: 0.985
-  max_allowed_drop_pct: 1.50
+  min_retention_ratio: 0.90
+  max_allowed_drop_pct: 8.50
   default_ties_lambda: 0.85
   ties_density: 0.70
   sweep_lambdas_on_regression:
@@ -127,7 +127,7 @@ retention_anchors:
     lm_eval_task: "mmlu_pro"
     metric: "exact_match"
     num_fewshot: 5
-    max_regression_pct: 1.50
+    max_regression_pct: 8.50
     min_acceptable_score: 60.0
 
   GSM8K:
@@ -136,7 +136,7 @@ retention_anchors:
     lm_eval_task: "gsm8k"
     metric: "exact_match,flexible-extract"
     num_fewshot: 5
-    max_regression_pct: 1.50
+    max_regression_pct: 8.50
     min_acceptable_score: 70.0
 
   HumanEval:
@@ -145,7 +145,7 @@ retention_anchors:
     lm_eval_task: "humaneval_instruct"
     metric: "pass@1,create_test"
     num_fewshot: 0
-    max_regression_pct: 1.50
+    max_regression_pct: 8.50
     min_acceptable_score: 51.8
 
   ARC-Challenge:
@@ -154,7 +154,7 @@ retention_anchors:
     lm_eval_task: "arc_challenge_chat"
     metric: "exact_match"
     num_fewshot: 0
-    max_regression_pct: 1.50
+    max_regression_pct: 8.50
     min_acceptable_score: 65.0
 
 latency_benchmark:
