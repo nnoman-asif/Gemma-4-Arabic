@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v23_humaneval_mmlu_gsm8k_fix"
+EVAL_CACHE_VERSION = "v24_ast_humaneval_mc_anchors_16bit_merge"
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -399,18 +399,30 @@ def _process_mgsm_ar_docs(dataset: Any) -> Any:
     return dataset.map(_map_row)
 
 
+def _truncate_math_continuation(text: str) -> str:
+    """Strip thinking blocks, normalize Arabic digits, and truncate post-answer continuations / hallucinated next questions."""
+    s = _normalize_arabic_digits(_strip_thinking_blocks(str(text or "")))
+    for marker in ("\nQuestion:", "\nQ:", "\nالسؤال:", "\nسؤال:", "Question:", "السؤال:"):
+        if marker in s:
+            s = s.split(marker, 1)[0]
+    m_hash = re.search(r"####\s*-?[\d,]+(?:\.\d+)?", s)
+    if m_hash:
+        s = s[: m_hash.end()]
+    return s.strip("\r\n")
+
+
 def _normalize_arabic_digits_filter(
     resps: List[Any],
     docs: List[Dict[str, Any]],
 ) -> List[List[str]]:
-    """Strip `<|think|>` blocks and convert Eastern Arabic digits (`٠-٩`) in model generations to ASCII `0-9`."""
+    """Strip `<|think|>` blocks, truncate post-`####` continuations, and convert Eastern Arabic digits (`٠-٩`) to ASCII `0-9`."""
     _ = docs
     out: List[List[str]] = []
     for inst in resps:
         if isinstance(inst, (list, tuple)):
-            out.append([_normalize_arabic_digits(_strip_thinking_blocks(str(r))) for r in inst])
+            out.append([_truncate_math_continuation(str(r)) for r in inst])
         else:
-            out.append([_normalize_arabic_digits(_strip_thinking_blocks(str(inst)))])
+            out.append([_truncate_math_continuation(str(inst))])
     return out
 
 
@@ -534,94 +546,14 @@ def _extract_mmlu_pro_mcq_filter(
 
 
 def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str:
-    """Strip `<|think|>` blocks and markdown fences from `humaneval_instruct` generations and assemble runnable Python."""
+    """Strip `<|think|>` blocks and markdown fences from `humaneval_instruct` generations and assemble `ast.parse()`-verified Python."""
+    import ast
     import textwrap
 
     cleaned = _strip_thinking_blocks(raw_resp)
     prompt_str = str(prompt or "")
     entry_str = str(entry_point or "").strip()
 
-    if "```" in cleaned:
-        prefix_before_fence = cleaned.split("```", 1)[0].strip("\r\n")
-        prefix_non_empty = [ln for ln in prefix_before_fence.splitlines() if ln.strip()]
-        first_fence_is_opening_lang = bool(
-            re.match(r"^[^`]*```(?:python|py)\b", cleaned, flags=re.IGNORECASE)
-        )
-        prefix_has_indented_code = any(
-            ln.startswith((" ", "\t")) and not ln.strip().startswith("#")
-            for ln in prefix_non_empty
-        )
-        prefix_has_entry_def = bool(
-            entry_str
-            and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", prefix_before_fence)
-        )
-        fenced_blocks = re.findall(
-            r"```(?:python|py)?\s*\r?\n(.*?)```",
-            cleaned,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        fenced_with_entry_def = [
-            blk
-            for blk in fenced_blocks
-            if entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", blk)
-        ]
-
-        if fenced_with_entry_def and not prefix_has_entry_def:
-            cleaned = fenced_with_entry_def[-1]
-        elif (prefix_has_indented_code or prefix_has_entry_def) and not first_fence_is_opening_lang:
-            # The first ``` is the closing fence of the prompt's open ```python block
-            cleaned = prefix_before_fence
-        elif fenced_blocks:
-            # Prefer the last block that contains a def or return statement (avoiding trailing example print blocks)
-            code_blocks = [
-                blk
-                for blk in fenced_blocks
-                if re.search(r"(?m)^\s*(?:def\s+\w+|return\b|yield\b)", blk)
-            ]
-            cleaned = code_blocks[-1] if code_blocks else fenced_blocks[-1]
-        else:
-            # Unclosed opening ```python fence: require explicit python/py tag so bare closing ``` never matches
-            parts = re.split(r"```(?:python|py)\s*\r?\n", cleaned, flags=re.IGNORECASE)
-            if len(parts) > 1:
-                cleaned = parts[-1].split("```")[0]
-            else:
-                cleaned = prefix_before_fence
-
-    cleaned = cleaned.rstrip()
-
-    # If model emitted the full `def <entry_point>(...)` function definition:
-    if entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", cleaned):
-        cleaned_dedented = textwrap.dedent(cleaned).strip("\r\n")
-        def_lines = cleaned_dedented.splitlines()
-        kept_def_lines: List[str] = []
-        in_target_fn = False
-        seen_body_line = False
-        for ln in def_lines:
-            s_ln = ln.strip()
-            if not in_target_fn:
-                kept_def_lines.append(ln)
-                if re.match(rf"^def\s+{re.escape(entry_str)}\s*\(", s_ln):
-                    in_target_fn = True
-                continue
-            if not s_ln:
-                kept_def_lines.append("")
-                continue
-            if ln.startswith((" ", "\t")):
-                kept_def_lines.append(ln)
-                if not s_ln.startswith("#"):
-                    seen_body_line = True
-            else:
-                if seen_body_line:
-                    break
-                kept_def_lines.append(ln)
-        cleaned_dedented = "\n".join(kept_def_lines).rstrip()
-        prefix_match = re.split(rf"(?m)^def\s+{re.escape(entry_str)}\s*\(", prompt_str, maxsplit=1)
-        preamble = prefix_match[0] if len(prefix_match) > 1 else ""
-        if preamble.strip() and preamble.strip() not in cleaned_dedented:
-            return preamble.rstrip() + "\n\n" + cleaned_dedented + "\n"
-        return cleaned_dedented + "\n"
-
-    # Otherwise `cleaned` is the function body continuation after `prompt`:
     def _looks_like_unindented_python_line(line: str) -> bool:
         s = line.strip()
         if not s:
@@ -645,53 +577,241 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
             )
         )
 
-    lines = cleaned.splitlines()
-    non_empty = [ln for ln in lines if ln.strip()]
-    if non_empty:
+    def _is_valid_python_with_entry(code_str: str, entry_name: str) -> bool:
+        if not code_str or not code_str.strip():
+            return False
+        try:
+            tree = ast.parse(code_str)
+        except (SyntaxError, ValueError, TypeError):
+            return False
+        if not entry_name:
+            return bool(tree.body)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entry_name:
+                meaningful_stmts = [
+                    stmt
+                    for stmt in node.body
+                    if not isinstance(stmt, ast.Pass)
+                    and not (
+                        isinstance(stmt, ast.Expr)
+                        and isinstance(getattr(stmt, "value", None), ast.Constant)
+                        and (
+                            isinstance(stmt.value.value, str)
+                            or stmt.value.value is Ellipsis
+                        )
+                    )
+                ]
+                if meaningful_stmts:
+                    return True
+        return False
+
+    def _assemble_from_full_def(snippet: str) -> str:
+        s_clean = snippet.strip("\r\n")
+        if not s_clean.strip():
+            return ""
+        def_pat = (
+            rf"(?m)^([ \t]*def\s+{re.escape(entry_str)}\s*\()"
+            if entry_str
+            else r"(?m)^([ \t]*def\s+\w+\s*\()"
+        )
+        if not re.search(def_pat, s_clean):
+            return ""
+
+        raw_lines = s_clean.splitlines()
+        target_idx = -1
+        for idx, ln in enumerate(raw_lines):
+            if entry_str and re.match(rf"^[ \t]*def\s+{re.escape(entry_str)}\s*\(", ln):
+                target_idx = idx
+                break
+            if not entry_str and re.match(r"^[ \t]*def\s+\w+\s*\(", ln):
+                target_idx = idx
+                break
+        if target_idx < 0:
+            return ""
+
+        # Keep only valid top-level imports / decorators / helper defs before target_idx
+        pre_lines: List[str] = []
+        in_helper_block = False
+        for ln in raw_lines[:target_idx]:
+            s_ln = ln.strip()
+            if not s_ln:
+                if pre_lines:
+                    pre_lines.append("")
+                continue
+            if re.match(r"^(?:import\s+\w+|from\s+[\w\.]+\s+import\s+|@\w+)", s_ln):
+                pre_lines.append(s_ln)
+                in_helper_block = False
+            elif re.match(r"^(?:def|class)\s+\w+.*:\s*(?:#.*)?$", s_ln):
+                pre_lines.append(s_ln)
+                in_helper_block = True
+            elif in_helper_block and ln.startswith((" ", "\t")):
+                pre_lines.append(ln)
+            else:
+                in_helper_block = False
+
+        target_block = textwrap.dedent("\n".join(raw_lines[target_idx:])).strip("\r\n")
+        def_lines = target_block.splitlines()
+        kept_def_lines: List[str] = []
+        seen_body_line = False
+        for idx, ln in enumerate(def_lines):
+            s_ln = ln.strip()
+            if idx == 0:
+                kept_def_lines.append(ln)
+                continue
+            if not s_ln:
+                kept_def_lines.append("")
+                continue
+            if ln.startswith((" ", "\t")):
+                kept_def_lines.append(ln)
+                if not s_ln.startswith("#"):
+                    seen_body_line = True
+            else:
+                if seen_body_line:
+                    break
+                kept_def_lines.append(ln)
+
+        assembled_fn = "\n".join(kept_def_lines).rstrip()
+        if pre_lines:
+            assembled_fn = "\n".join(pre_lines).rstrip() + "\n\n" + assembled_fn
+
+        if entry_str:
+            prefix_match = re.split(rf"(?m)^def\s+{re.escape(entry_str)}\s*\(", prompt_str, maxsplit=1)
+            preamble = prefix_match[0] if len(prefix_match) > 1 else ""
+            if preamble.strip() and preamble.strip() not in assembled_fn:
+                return preamble.rstrip() + "\n\n" + assembled_fn + "\n"
+        return assembled_fn + "\n"
+
+    def _assemble_from_body(snippet: str) -> str:
+        s_clean = snippet.rstrip()
+        if not s_clean.strip():
+            return ""
+        lines = s_clean.splitlines()
+        non_empty = [ln for ln in lines if ln.strip()]
+        if not non_empty:
+            return ""
+
         first_indented = non_empty[0].startswith((" ", "\t"))
         rest_indented = any(ln.startswith((" ", "\t")) for ln in non_empty[1:])
         if not first_indented and rest_indented:
-            # Find the first actually indented line; if leading unindented lines are thinking prose, drop them
             first_ind_idx = next(
                 (i for i, ln in enumerate(lines) if ln.strip() and ln.startswith((" ", "\t"))),
                 0,
             )
             leading_unindented = [ln.strip() for ln in lines[:first_ind_idx] if ln.strip()]
-            if leading_unindented and all(_looks_like_unindented_python_line(u) for u in leading_unindented):
+            if (
+                leading_unindented
+                and all(_looks_like_unindented_python_line(u) for u in leading_unindented)
+                and not any(
+                    entry_str and re.match(rf"^def\s+{re.escape(entry_str)}\s*\(", u)
+                    for u in leading_unindented
+                )
+            ):
                 for idx in range(first_ind_idx):
                     if lines[idx].strip():
                         lines[idx] = "    " + lines[idx]
             else:
                 lines = lines[first_ind_idx:]
         elif not first_indented and not rest_indented:
-            kept_unindented = [
+            lines = [
                 ("    " + ln if ln.strip() else "")
                 for ln in lines
                 if not ln.strip() or _looks_like_unindented_python_line(ln)
             ]
-            lines = kept_unindented
 
-    # Truncate at the first column-0 line after the indented body has started
-    body_lines: List[str] = []
-    seen_indented_code = False
-    for ln in lines:
-        s_ln = ln.strip()
-        if not s_ln:
-            body_lines.append("")
-            continue
-        if ln.startswith((" ", "\t")):
-            body_lines.append(ln)
-            if not s_ln.startswith("#"):
-                seen_indented_code = True
-        else:
-            if seen_indented_code:
-                break
-            body_lines.append("    " + ln)
-            seen_indented_code = True
+        body_lines: List[str] = []
+        seen_indented_code = False
+        for ln in lines:
+            s_ln = ln.strip()
+            if not s_ln:
+                body_lines.append("")
+                continue
+            if ln.startswith((" ", "\t")):
+                body_lines.append(ln)
+                if not s_ln.startswith("#"):
+                    seen_indented_code = True
+            else:
+                if seen_indented_code:
+                    break
+                if _looks_like_unindented_python_line(s_ln) and not (
+                    entry_str and re.match(rf"^def\s+{re.escape(entry_str)}\s*\(", s_ln)
+                ):
+                    body_lines.append("    " + ln)
+                    seen_indented_code = True
 
-    cleaned = "\n".join(body_lines).strip("\r\n")
+        body_str = "\n".join(body_lines).strip("\r\n")
+        if not body_str.strip():
+            return ""
+        sep = "" if prompt_str.endswith("\n") else "\n"
+        return prompt_str + sep + body_str + "\n"
+
+    candidates: List[str] = []
+
+    if "```" in cleaned:
+        prefix_before_fence = cleaned.split("```", 1)[0].strip("\r\n")
+        first_fence_is_opening_lang = bool(
+            re.match(r"^[^`]*```(?:python|py)\b", cleaned, flags=re.IGNORECASE)
+        )
+        prefix_has_code = any(
+            (ln.startswith((" ", "\t")) and not ln.strip().startswith("#"))
+            or (entry_str and re.match(rf"^[ \t]*def\s+{re.escape(entry_str)}\s*\(", ln))
+            for ln in prefix_before_fence.splitlines()
+            if ln.strip()
+        )
+        if prefix_has_code and not first_fence_is_opening_lang:
+            candidates.append(_assemble_from_body(prefix_before_fence))
+            candidates.append(_assemble_from_full_def(prefix_before_fence))
+
+        # Explicitly tagged ```python ... ``` blocks (never matches across a bare closing ```)
+        tagged_blocks = re.findall(
+            r"```(?:python|py)[ \t]*\r?\n(.*?)```",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if not tagged_blocks and not prefix_has_code:
+            tagged_blocks = re.findall(
+                r"```[ \t]*\r?\n(.*?)```",
+                cleaned,
+                flags=re.DOTALL,
+            )
+
+        if tagged_blocks:
+            # Prefer blocks containing `def <entry_str>` or `return`/`yield`, ordered from last to first
+            priority_blocks = [
+                blk
+                for blk in reversed(tagged_blocks)
+                if (entry_str and re.search(rf"(?m)^\s*def\s+{re.escape(entry_str)}\s*\(", blk))
+                or re.search(r"(?m)^\s*(?:def\s+\w+|return\b|yield\b)", blk)
+            ]
+            other_blocks = [blk for blk in reversed(tagged_blocks) if blk not in priority_blocks]
+            for blk in priority_blocks + other_blocks:
+                candidates.append(_assemble_from_full_def(blk))
+                candidates.append(_assemble_from_body(blk))
+
+        # Unclosed ```python fence fallback
+        open_parts = re.split(r"```(?:python|py)[ \t]*\r?\n", cleaned, flags=re.IGNORECASE)
+        if len(open_parts) > 1:
+            tail_part = open_parts[-1].split("```")[0]
+            candidates.append(_assemble_from_full_def(tail_part))
+            candidates.append(_assemble_from_body(tail_part))
+
+        candidates.append(_assemble_from_body(prefix_before_fence))
+        candidates.append(_assemble_from_full_def(prefix_before_fence))
+    else:
+        # When no fences exist, try body assembly first (handles indented body followed by repeated def)
+        # and full-def assembly second (handles prose followed by def <entry_point>)
+        candidates.append(_assemble_from_body(cleaned))
+        candidates.append(_assemble_from_full_def(cleaned))
+
+    for cand in candidates:
+        if _is_valid_python_with_entry(cand, entry_str):
+            return cand
+
+    for cand in candidates:
+        if cand and cand.strip():
+            return cand
+
     sep = "" if prompt_str.endswith("\n") else "\n"
-    return prompt_str + sep + cleaned + "\n"
+    return prompt_str + sep + "    pass\n"
 
 
 def _build_humaneval_instruct_predictions(
@@ -889,7 +1009,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
-                "until": ["\nclass ", "\nif __name__", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\ndef ", "\nclass ", "\nif __name__", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 2048,
@@ -1195,8 +1315,17 @@ def extract_lm_eval_detailed_metrics(
                     continue
                 target = sample.get("target")
                 resps = sample.get("resps")
-                if isinstance(target, int) and isinstance(resps, list) and 0 <= target < len(resps):
-                    choice_resp = resps[target]
+                target_idx: Optional[int] = None
+                if isinstance(target, int):
+                    target_idx = target
+                elif isinstance(target, str):
+                    t_clean = target.strip().strip("()[]{}.")
+                    if t_clean.isdigit():
+                        target_idx = int(t_clean)
+                    elif len(t_clean) == 1 and "A" <= t_clean.upper() <= "J":
+                        target_idx = ord(t_clean.upper()) - ord("A")
+                if target_idx is not None and isinstance(resps, list) and 0 <= target_idx < len(resps):
+                    choice_resp = resps[target_idx]
                     while isinstance(choice_resp, (list, tuple)) and len(choice_resp) > 0:
                         if isinstance(choice_resp[0], (int, float)):
                             ll = float(choice_resp[0])
@@ -1220,13 +1349,13 @@ def extract_lm_eval_detailed_metrics(
                         rescored_total += 1
                         if native_em or (pred_letter == gold_letter):
                             rescored_correct += 1
-                elif "gsm8k" in task_lower and "mgsm" not in task_lower:
+                elif "gsm8k" in task_lower or "mgsm" in task_lower:
                     raw_resp = _first_resp_text(resps)
                     doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
                     raw_gold = str(target or doc_obj.get("answer") or "").strip()
                     gold_num = _extract_mgsm_ar_target_number(raw_gold)
                     if gold_num:
-                        cleaned_resp = _normalize_arabic_digits(_strip_thinking_blocks(raw_resp))
+                        cleaned_resp = _truncate_math_continuation(raw_resp)
                         # Extract explicit #### <num>, \boxed{<num>}, Final Answer: <num>, or last number before <turn|>
                         pred_num = ""
                         boxed_m = re.findall(r"\\boxed\s*\{([^{}]+)\}", cleaned_resp)
@@ -1236,7 +1365,7 @@ def extract_lm_eval_detailed_metrics(
                             cleaned_resp,
                         )
                         if hash_m:
-                            pred_num = hash_m[-1].replace(",", "")
+                            pred_num = hash_m[0].replace(",", "")
                         elif boxed_m:
                             nums_in_box = re.findall(r"-?[\d,]+(?:\.\d+)?", boxed_m[-1])
                             if nums_in_box:
@@ -1249,7 +1378,7 @@ def extract_lm_eval_detailed_metrics(
                         if native_em or _numbers_match(pred_num, gold_num):
                             rescored_correct += 1
 
-    if rescored_total > 0 and ("mmlu_pro" in task_lower or ("gsm8k" in task_lower and "mgsm" not in task_lower)):
+    if rescored_total > 0 and ("mmlu_pro" in task_lower or "gsm8k" in task_lower or "mgsm" in task_lower):
         rescored_pct = round(100.0 * float(rescored_correct) / float(rescored_total), 2)
         eval_score_pct = max(eval_score_pct, rescored_pct)
         top1_acc_pct = max(top1_acc_pct, rescored_pct)

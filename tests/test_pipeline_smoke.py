@@ -639,6 +639,23 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             _normalize_arabic_digits_filter([["<|think|>\n١٢٣\n<|think|>\nالإجابة هي ٥٧٥٠٠"]], [{}]),
             [["الإجابة هي 57500"]],
         )
+        truncated_math = _normalize_arabic_digits_filter(
+            [["الحل هو 10 + 5 = 15\n#### 15\nالسؤال: اشترى أحمد 3 تفاحات..."]],
+            [{}],
+        )[0][0]
+        self.assertTrue(truncated_math.endswith("#### 15"))
+        self.assertNotIn("اشترى", truncated_math)
+
+        for raw_candidate in (
+            "    return a + b\n\ndef foo(a, b):\n    return a + b\n",
+            "Sure! Here is the function:\ndef foo(a, b):\n    return a + b\n",
+            "    return a + b\n```\nHere is an example:\n```python\nprint(foo(1, 2))\n```",
+        ):
+            code_out = _extract_humaneval_code(raw_candidate, "def foo(a, b):\n", "foo")
+            compile(code_out, "<humaneval>", "exec")
+            ns: Dict[str, Any] = {}
+            exec(code_out, ns)
+            self.assertEqual(ns["foo"](3, 4), 7)
 
         eval_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
@@ -720,10 +737,10 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eval_cfg["arabic_benchmarks"]["EXAMS-AR"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["num_fewshot"], 5)
-        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
+        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "leaderboard_mmlu_pro")
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval_instruct")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge_chat")
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge")
 
         le_payload = {
             "results": {

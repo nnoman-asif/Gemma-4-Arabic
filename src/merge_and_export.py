@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.model_loader import (
     configure_clean_logging,
+    ensure_tied_lm_head,
     ensure_unsloth_builtins,
     load_gemma4_8gb_model_and_tokenizer,
 )
@@ -173,23 +174,49 @@ def scale_and_trim_peft_lora_weights(
     as the input projection basis.
     """
     modified_count = 0
+    sft_merged_count = 0
     for name, param in model.named_parameters():
         if "lora_B" in name:
-            sft_key = (
-                name
-                if (sft_adapter_state is not None and name in sft_adapter_state)
-                else name.replace(".default.", ".")
-            )
-            if sft_adapter_state is not None and sft_key in sft_adapter_state:
+            sft_key: Optional[str] = None
+            if sft_adapter_state is not None:
+                candidates = (
+                    name,
+                    name.replace(".default.", "."),
+                    name.replace(".lora_B.weight", ".lora_B.default.weight"),
+                )
+                for cand in candidates:
+                    if cand in sft_adapter_state:
+                        sft_key = cand
+                        break
+                    if (
+                        cand.startswith("base_model.model.")
+                        and cand[len("base_model.model.") :] in sft_adapter_state
+                    ):
+                        sft_key = cand[len("base_model.model.") :]
+                        break
+                    prefixed = f"base_model.model.{cand}"
+                    if prefixed in sft_adapter_state:
+                        sft_key = prefixed
+                        break
+            if sft_adapter_state is not None and sft_key is not None:
                 merged_b = ties_merge_deltas(
                     deltas=[sft_adapter_state[sft_key].to(param.device), param.data],
-                    weights=[0.35, 0.65],
+                    weights=[0.50, 0.50],
                     density=density,
                 )
+                sft_merged_count += 1
             else:
                 merged_b = ties_trim_tensor(param.data, density=density)
             param.data.copy_(merged_b * float(lambda_scale))
             modified_count += 1
+    logger.info(
+        "scale_and_trim_peft_lora_weights: modified=%d lora_B tensors (sft_ties_merged=%d, solo_trimmed=%d, lambda=%.2f, density=%.2f)",
+        modified_count,
+        sft_merged_count,
+        modified_count - sft_merged_count,
+        float(lambda_scale),
+        float(density),
+    )
     return modified_count
 
 
@@ -260,6 +287,7 @@ def export_merged_checkpoint(
     output_dir: pathlib.Path,
     export_format: str = "merged_16bit",
     gguf_quant: str = "q4_k_m",
+    base_model_id: Optional[str] = None,
 ) -> List[str]:
     """Export the restored and TIES-interpolated model to 16-bit Safetensors and/or GGUF."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -276,27 +304,50 @@ def export_merged_checkpoint(
                     cfg.text_config.tie_word_embeddings = True
             except Exception:
                 pass
-        saved_via_unsloth = False
-        if hasattr(model, "save_pretrained_merged"):
+        saved_16bit = False
+        if hasattr(model, "merge_and_unload") and not getattr(model, "_is_unsloth_model", False):
+            try:
+                merged = model.merge_and_unload()
+                ensure_tied_lm_head(merged)
+                merged.save_pretrained(str(out_16bit), safe_serialization=True)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(str(out_16bit))
+                if base_model_id:
+                    try:
+                        from transformers import AutoProcessor
+
+                        proc = AutoProcessor.from_pretrained(base_model_id)
+                        proc.save_pretrained(str(out_16bit))
+                    except Exception as proc_exc:
+                        logger.debug("Processor save skipped for %s: %s", base_model_id, proc_exc)
+                saved_16bit = True
+            except Exception as peft_merge_exc:
+                logger.warning(
+                    "PEFT merge_and_unload failed (%s); falling back to save_pretrained_merged.",
+                    peft_merge_exc,
+                )
+        if not saved_16bit and hasattr(model, "save_pretrained_merged"):
             try:
                 model.save_pretrained_merged(
                     str(out_16bit),
                     tokenizer,
                     save_method="merged_16bit",
                 )
-                saved_via_unsloth = True
+                saved_16bit = True
             except Exception as unsloth_merge_exc:
                 logger.warning(
                     "save_pretrained_merged failed (%s); falling back to PEFT merge_and_unload.",
                     unsloth_merge_exc,
                 )
-        if not saved_via_unsloth:
+        if not saved_16bit:
             if hasattr(model, "merge_and_unload"):
                 merged = model.merge_and_unload()
+                ensure_tied_lm_head(merged)
                 merged.save_pretrained(str(out_16bit), safe_serialization=True)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(str(out_16bit))
             else:
+                ensure_tied_lm_head(model)
                 model.save_pretrained(str(out_16bit), safe_serialization=True)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(str(out_16bit))
@@ -405,6 +456,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Enable low-VRAM CPU offload hooks during model loading.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing merged_16bit checkpoint if present.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run a synthetic verification of TIES-Merging math and multimodal tower restoration.",
@@ -449,7 +505,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     out_16bit_cfg = pathlib.Path(args.output_dir) / "merged_16bit" / "config.json"
-    if effective_format == "merged_16bit" and out_16bit_cfg.exists():
+    if effective_format == "merged_16bit" and out_16bit_cfg.exists() and not args.force:
         logger.info(
             "Merged 16-bit checkpoint already exists at %s; skipping TIES merge.",
             out_16bit_cfg.parent,
@@ -499,6 +555,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_dir=pathlib.Path(args.output_dir),
         export_format=effective_format,
         gguf_quant=args.gguf_quant,
+        base_model_id=args.base_model,
     )
     logger.info(
         "Exported merged checkpoint (TIES lambda=%.2f, density=%.2f, modified=%d, restored=%s) -> %s",

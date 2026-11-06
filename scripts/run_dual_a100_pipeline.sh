@@ -49,67 +49,86 @@ echo "  - GPU 0: Gemma-4-E4B-Arabic-It      -> logs/gpu0_e4b.log"
 echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  -> logs/gpu1_26b_a4b.log"
 echo "======================================================================"
 
-if [[ -f "outputs/merged_gemma4_e4b_arabic/merged_16bit/config.json" && -f "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit/config.json" ]]; then
-  echo "[Skip] Both merged 16-bit checkpoints already exist on disk. Skipping Phase 2."
-else
-  rm -rf unsloth_compiled_cache unsloth_compiled_cache_gpu0 unsloth_compiled_cache_gpu1
+rm -rf unsloth_compiled_cache unsloth_compiled_cache_gpu0 unsloth_compiled_cache_gpu1
 
-  (
-    export CUDA_VISIBLE_DEVICES=0
-    export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu0"
+(
+  export CUDA_VISIBLE_DEVICES=0
+  export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu0"
+  if [[ -f "outputs/sft_e4b_a100/adapter_config.json" ]]; then
+    echo "[GPU 0] [Skip] Stage 1 SFT adapter already exists at outputs/sft_e4b_a100."
+  else
     echo "[GPU 0] Starting Stage 1 rsLoRA SFT for Gemma-4-E4B-Arabic-It..."
     "${PYTHON_BIN}" src/train_sft.py \
       --config configs/sft_e4b_a100.yaml \
       --dataset-dir data/sft_mixed \
       --output-dir outputs/sft_e4b_a100
+  fi
 
+  if [[ -f "outputs/dpo_e4b_a100/adapter_config.json" ]]; then
+    echo "[GPU 0] [Skip] Stage 2 DPO adapter already exists at outputs/dpo_e4b_a100."
+  else
     echo "[GPU 0] Starting Stage 2 Trust-Region DPO for Gemma-4-E4B-Arabic-It..."
     "${PYTHON_BIN}" src/train_dpo.py \
       --config configs/dpo_e4b_a100.yaml \
       --dataset-dir data/dpo_mixed \
       --sft-adapter-dir outputs/sft_e4b_a100 \
       --output-dir outputs/dpo_e4b_a100
+  fi
 
-    echo "[GPU 0] Running TIES-Merging (lambda=0.85, density=0.70) -> merged_16bit..."
-    "${PYTHON_BIN}" src/merge_and_export.py \
-      --base-model unsloth/gemma-4-E4B-it \
-      --sft-adapter-dir outputs/sft_e4b_a100 \
-      --adapter-dir outputs/dpo_e4b_a100 \
-      --output-dir outputs/merged_gemma4_e4b_arabic \
-      --export-format merged_16bit
-  ) 2>&1 | tee -a logs/gpu0_e4b.log &
-  PID_GPU0=$!
+  echo "[GPU 0] Running lossless 16-bit TIES-Merging (lambda=0.55, density=0.70, SFT+DPO 50/50) -> merged_16bit..."
+  "${PYTHON_BIN}" src/merge_and_export.py \
+    --base-model unsloth/gemma-4-E4B-it \
+    --sft-adapter-dir outputs/sft_e4b_a100 \
+    --adapter-dir outputs/dpo_e4b_a100 \
+    --output-dir outputs/merged_gemma4_e4b_arabic \
+    --lambda-scale 0.55 \
+    --export-format merged_16bit \
+    --force
+) 2>&1 | tee -a logs/gpu0_e4b.log &
+PID_GPU0=$!
 
-  (
-    export CUDA_VISIBLE_DEVICES=1
-    export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu1"
+(
+  export CUDA_VISIBLE_DEVICES=1
+  export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu1"
+  if [[ -f "outputs/sft_26b_a4b_a100/adapter_config.json" ]]; then
+    echo "[GPU 1] [Skip] Stage 1 SFT adapter already exists at outputs/sft_26b_a4b_a100."
+  else
     echo "[GPU 1] Starting Stage 1 rsLoRA SFT for Gemma-4-26B-A4B-Arabic-It (Frozen MoE Router)..."
     "${PYTHON_BIN}" src/train_sft.py \
       --config configs/sft_26b_a4b_a100.yaml \
       --dataset-dir data/sft_mixed \
       --output-dir outputs/sft_26b_a4b_a100
+  fi
 
+  if [[ -f "outputs/dpo_26b_a4b_a100/adapter_config.json" ]]; then
+    echo "[GPU 1] [Skip] Stage 2 DPO adapter already exists at outputs/dpo_26b_a4b_a100."
+  else
     echo "[GPU 1] Starting Stage 2 Trust-Region DPO for Gemma-4-26B-A4B-Arabic-It..."
     "${PYTHON_BIN}" src/train_dpo.py \
       --config configs/dpo_26b_a4b_a100.yaml \
       --dataset-dir data/dpo_mixed \
       --sft-adapter-dir outputs/sft_26b_a4b_a100 \
       --output-dir outputs/dpo_26b_a4b_a100
+  fi
 
+  if [[ -f "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit/config.json" ]]; then
+    echo "[GPU 1] [Skip] Merged 16-bit checkpoint already exists at outputs/merged_gemma4_26b_a4b_arabic/merged_16bit."
+  else
     echo "[GPU 1] Running TIES-Merging (lambda=0.85, density=0.70) -> merged_16bit..."
     "${PYTHON_BIN}" src/merge_and_export.py \
       --base-model unsloth/gemma-4-26B-A4B-it \
       --sft-adapter-dir outputs/sft_26b_a4b_a100 \
       --adapter-dir outputs/dpo_26b_a4b_a100 \
       --output-dir outputs/merged_gemma4_26b_a4b_arabic \
+      --lambda-scale 0.85 \
       --export-format merged_16bit
-  ) 2>&1 | tee -a logs/gpu1_26b_a4b.log &
-  PID_GPU1=$!
+  fi
+) 2>&1 | tee -a logs/gpu1_26b_a4b.log &
+PID_GPU1=$!
 
-  echo "Waiting for GPU 0 (PID ${PID_GPU0}) and GPU 1 (PID ${PID_GPU1}) to complete..."
-  wait "${PID_GPU0}"
-  wait "${PID_GPU1}"
-fi
+echo "Waiting for GPU 0 (PID ${PID_GPU0}) and GPU 1 (PID ${PID_GPU1}) to complete..."
+wait "${PID_GPU0}"
+wait "${PID_GPU1}"
 
 echo "======================================================================"
 echo "[Phase 3/4] Evaluating Both Models on 7 Arabic + 4 Retention Benchmarks"

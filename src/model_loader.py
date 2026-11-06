@@ -788,6 +788,12 @@ def load_gemma4_8gb_model_and_tokenizer(
 
     used_unsloth_loader = False
     try:
+        if not load_in_4bit and adapter_checkpoint is not None and not is_trainable:
+            raise RuntimeError(
+                "Bypassing Unsloth FastLanguageModel for 16-bit checkpoint merge so "
+                f"the true BF16 base model '{model_name}' is loaded instead of the 4-bit "
+                "base_model_name_or_path recorded in adapter_config.json."
+            )
         from unsloth import FastLanguageModel  # type: ignore
 
         logger.info(
