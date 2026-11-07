@@ -1256,7 +1256,6 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "unsafe_code": True,
             "generation_kwargs": {
                 "until": [
-                    "\n```",
                     "\nif __name__",
                     "<end_of_turn>",
                     "<turn|>",
@@ -1613,10 +1612,26 @@ def extract_lm_eval_detailed_metrics(
         for _subtask, sample_list in samples_block.items():
             if not isinstance(sample_list, list):
                 continue
-            n_samples += len(sample_list)
+            doc_any_em: Dict[Any, bool] = {}
+            for s_item in sample_list:
+                if isinstance(s_item, dict) and s_item.get("doc_id") is not None:
+                    did = s_item.get("doc_id")
+                    item_em = any(
+                        float(v or 0.0) >= 1.0
+                        for k, v in s_item.items()
+                        if str(k).startswith("exact_match") and isinstance(v, (int, float))
+                    )
+                    doc_any_em[did] = doc_any_em.get(did, False) or item_em
+            seen_doc_ids = set()
             for sample in sample_list:
                 if not isinstance(sample, dict):
                     continue
+                doc_id = sample.get("doc_id")
+                if doc_id is not None:
+                    if doc_id in seen_doc_ids:
+                        continue
+                    seen_doc_ids.add(doc_id)
+                n_samples += 1
                 target = sample.get("target")
                 resps = sample.get("resps")
                 target_idx: Optional[int] = None
@@ -1638,10 +1653,14 @@ def extract_lm_eval_detailed_metrics(
                             break
                         choice_resp = choice_resp[0]
 
-                native_em = any(
-                    float(v or 0.0) >= 1.0
-                    for k, v in sample.items()
-                    if str(k).startswith("exact_match") and isinstance(v, (int, float))
+                native_em = (
+                    doc_any_em.get(doc_id, False)
+                    if doc_id is not None
+                    else any(
+                        float(v or 0.0) >= 1.0
+                        for k, v in sample.items()
+                        if str(k).startswith("exact_match") and isinstance(v, (int, float))
+                    )
                 )
                 if "mmlu_pro" in task_lower or "arc_challenge_chat" in task_lower:
                     raw_resp = _first_resp_text(resps)
@@ -2061,7 +2080,7 @@ def _get_lm_eval_gen_kwargs(
     clean = task_name.strip().lower()
     if clean in ("mmlu_pro", "gsm8k"):
         max_toks = (
-            6144
+            8192
             if (model_key_prefix == "26b_a4b" and clean == "mmlu_pro")
             else 4096
         )
@@ -2088,7 +2107,7 @@ def _should_apply_chat_template_for_task(
 ) -> bool:
     """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`) and `False` for standard completion/log-likelihood benchmarks."""
     clean = task_name.strip().lower()
-    if model_key_prefix == "26b_a4b" and clean in ("gsm8k", "mgsm_ar", "arc_challenge"):
+    if model_key_prefix == "26b_a4b" and clean in ("humaneval", "arc_challenge"):
         return bool(apply_chat_template)
     if clean in (
         "arc_challenge",
@@ -2112,6 +2131,7 @@ def _configure_lm_eval_thinking_for_task(
     effective_use_vllm: bool,
     task_chat_tpl: bool,
     task_name: str = "",
+    model_key_prefix: str = "e4b",
 ) -> None:
     """Configure `enable_thinking` and `chat_template_args` per task on `VLLM` or `HFLM`.
 
@@ -2124,11 +2144,19 @@ def _configure_lm_eval_thinking_for_task(
     if effective_use_vllm:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = use_thinking
+        if hasattr(lm_obj, "think_end_token"):
+            lm_obj.think_end_token = (
+                "<channel|>" if (use_thinking and model_key_prefix == "26b_a4b") else None
+            )
         if hasattr(lm_obj, "chat_template_args"):
             lm_obj.chat_template_args = {}
     else:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = False
+        if hasattr(lm_obj, "think_end_token"):
+            lm_obj.think_end_token = (
+                "<channel|>" if (use_thinking and model_key_prefix == "26b_a4b") else None
+            )
         if hasattr(lm_obj, "chat_template_args"):
             lm_obj.chat_template_args = {"enable_thinking": True} if use_thinking else {}
 
@@ -2279,7 +2307,7 @@ def _evaluate_checkpoint_with_lm_eval(
     batch_size = int(model_specific_cfg.get("batch_size", default_bs))
     max_seq_len = int(eval_cfg.get("max_seq_length", 8192))
     if model_key_prefix == "26b_a4b":
-        max_seq_len = max(max_seq_len, 10240)
+        max_seq_len = max(max_seq_len, 12288)
 
     preserved_ar = _preserved_arabic or {}
     preserved_ret = _preserved_retention or {}
@@ -2530,6 +2558,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 effective_use_vllm=effective_use_vllm,
                 task_chat_tpl=task_chat_tpl,
                 task_name=task_name,
+                model_key_prefix=model_key_prefix,
             )
             gen_kwargs = _get_lm_eval_gen_kwargs(
                 task_name,
