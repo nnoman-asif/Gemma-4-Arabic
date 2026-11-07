@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v29_zero_shot_and_non_thinking_fix"
+EVAL_CACHE_VERSION = "v30_family_verified"
 
 # LightEval suites whose validated scores are preserved across partial cache refreshes
 PRESERVED_LIGHTEVAL_SUITES: Tuple[str, ...] = (
@@ -1247,17 +1247,17 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "test_split": "test",
             "num_fewshot": 0,
             "output_type": "generate_until",
-            "doc_to_text": "{{prompt}}",
+            "doc_to_text": (
+                "Write a solution to the following problem and make sure that it passes the tests:\n"
+                "```python\n{{prompt}}\n```\n"
+                "Here is the completed function:\n```python\n{{prompt}}"
+            ),
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
                 "until": [
-                    "\nclass",
-                    "\ndef",
-                    "\n#",
-                    "\nif",
-                    "\nprint",
                     "\n```",
+                    "\nif __name__",
                     "<end_of_turn>",
                     "<turn|>",
                     "<eos>",
@@ -1274,7 +1274,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                     "filter": [
                         {
                             "function": "custom",
-                            "filter_fn": _build_humaneval_completion_predictions,
+                            "filter_fn": _build_humaneval_instruct_predictions,
                         },
                     ],
                 }
@@ -1584,6 +1584,7 @@ def extract_lm_eval_detailed_metrics(
     results_payload: Dict[str, Any],
     task_name: str,
     metric_hint: str = "acc_norm",
+    model_key_prefix: str = "e4b",
 ) -> Dict[str, Any]:
     """Extract `eval_score_pct`, `top1_acc_pct` (unnormalized `acc`), `nll` (`GoldNLL`), and `n_samples`."""
     eval_score_pct = parse_lm_eval_results_json(
@@ -1654,10 +1655,38 @@ def extract_lm_eval_detailed_metrics(
                         rescored_total += 1
                         if native_em or (pred_letter == gold_letter):
                             rescored_correct += 1
+                elif model_key_prefix == "26b_a4b" and ("gsm8k" in task_lower or "mgsm" in task_lower):
+                    raw_resp = _first_resp_text(resps)
+                    doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
+                    raw_gold = str(target or doc_obj.get("answer") or "").strip()
+                    gold_num = _extract_mgsm_ar_target_number(raw_gold)
+                    if gold_num:
+                        cleaned_resp = _truncate_math_continuation(raw_resp)
+                        pred_num = ""
+                        boxed_m = re.findall(r"\\boxed\s*\{([^{}]+)\}", cleaned_resp)
+                        hash_m = re.findall(r"#{3,4}\s*\$?\s*\**(-?[\d,]+(?:\.\d+)?)", cleaned_resp)
+                        ans_m = re.findall(
+                            r"(?:(?i:(?:final\s+answer|the\s+answer|answer)\s*(?:is|:|=))|(?:الإجابة\s+النهائية|الإجابة\s+الصحيحة|الإجابة|الجواب\s+النهائي|الجواب|الناتج\s+النهائي|الناتج)\s*(?:هي|هو|:|=))\s*\**\s*\$?\s*\**(-?[\d,]+(?:\.\d+)?)",
+                            cleaned_resp,
+                        )
+                        if hash_m:
+                            pred_num = hash_m[0].replace(",", "")
+                        elif boxed_m:
+                            nums_in_box = re.findall(r"-?[\d,]+(?:\.\d+)?", boxed_m[-1])
+                            if nums_in_box:
+                                pred_num = nums_in_box[-1].replace(",", "")
+                        elif ans_m:
+                            pred_num = ans_m[-1].replace(",", "")
+                        else:
+                            pred_num = _extract_mgsm_ar_target_number(cleaned_resp)
+                        rescored_total += 1
+                        if native_em or _numbers_match(pred_num, gold_num):
+                            rescored_correct += 1
 
     if rescored_total > 0 and (
         "mmlu_pro" in task_lower
         or "arc_challenge_chat" in task_lower
+        or (model_key_prefix == "26b_a4b" and ("gsm8k" in task_lower or "mgsm" in task_lower))
     ):
         rescored_pct = round(100.0 * float(rescored_correct) / float(rescored_total), 2)
         eval_score_pct = max(eval_score_pct, rescored_pct)
@@ -2024,12 +2053,20 @@ pathlib.Path({repr(str(out_json_file))}).write_text(
     return parsed_out
 
 
-def _get_lm_eval_gen_kwargs(task_name: str) -> Optional[Dict[str, Any]]:
+def _get_lm_eval_gen_kwargs(
+    task_name: str,
+    model_key_prefix: str = "e4b",
+) -> Optional[Dict[str, Any]]:
     """Return standardized `generation_kwargs` overrides for built-in `lm_eval` generative tasks (`mmlu_pro`, `gsm8k`)."""
     clean = task_name.strip().lower()
     if clean in ("mmlu_pro", "gsm8k"):
+        max_toks = (
+            6144
+            if (model_key_prefix == "26b_a4b" and clean == "mmlu_pro")
+            else 4096
+        )
         return {
-            "max_gen_toks": 4096,
+            "max_gen_toks": max_toks,
             "until": [
                 "\nQuestion:",
                 "<turn|>",
@@ -2044,9 +2081,15 @@ def _get_lm_eval_gen_kwargs(task_name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _should_apply_chat_template_for_task(task_name: str, apply_chat_template: bool) -> bool:
+def _should_apply_chat_template_for_task(
+    task_name: str,
+    apply_chat_template: bool,
+    model_key_prefix: str = "e4b",
+) -> bool:
     """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`) and `False` for standard completion/log-likelihood benchmarks."""
     clean = task_name.strip().lower()
+    if model_key_prefix == "26b_a4b" and clean in ("gsm8k", "mgsm_ar", "arc_challenge"):
+        return bool(apply_chat_template)
     if clean in (
         "arc_challenge",
         "arc_easy",
@@ -2235,6 +2278,8 @@ def _evaluate_checkpoint_with_lm_eval(
     default_bs = 8 if model_key_prefix == "26b_a4b" else int(eval_cfg.get("batch_size", 32))
     batch_size = int(model_specific_cfg.get("batch_size", default_bs))
     max_seq_len = int(eval_cfg.get("max_seq_length", 8192))
+    if model_key_prefix == "26b_a4b":
+        max_seq_len = max(max_seq_len, 10240)
 
     preserved_ar = _preserved_arabic or {}
     preserved_ret = _preserved_retention or {}
@@ -2468,19 +2513,28 @@ def _evaluate_checkpoint_with_lm_eval(
             task_name = str(spec["lm_eval_task"])
             num_fewshot = int(spec.get("num_fewshot", 0))
             metric_hint = str(spec.get("metric", "acc_norm"))
+            if model_key_prefix == "26b_a4b" and task_name.strip().lower() == "gsm8k":
+                metric_hint = "exact_match,flexible-extract"
             tasks_arg, primary_key, eff_limit = resolve_lm_eval_task_specs(
                 task_name=task_name,
                 num_fewshot=num_fewshot,
                 limit=limit,
             )
-            task_chat_tpl = _should_apply_chat_template_for_task(task_name, apply_chat_template)
+            task_chat_tpl = _should_apply_chat_template_for_task(
+                task_name,
+                apply_chat_template,
+                model_key_prefix=model_key_prefix,
+            )
             _configure_lm_eval_thinking_for_task(
                 lm_obj=lm_obj,
                 effective_use_vllm=effective_use_vllm,
                 task_chat_tpl=task_chat_tpl,
                 task_name=task_name,
             )
-            gen_kwargs = _get_lm_eval_gen_kwargs(task_name)
+            gen_kwargs = _get_lm_eval_gen_kwargs(
+                task_name,
+                model_key_prefix=model_key_prefix,
+            )
             logger.info(
                 "[%s] Running lm_eval on %s/%s (task=%s, shots=%d, limit=%s, metric=%s, chat_template=%s)...",
                 tag,
@@ -2516,6 +2570,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 results_payload=payload,
                 task_name=primary_key,
                 metric_hint=metric_hint,
+                model_key_prefix=model_key_prefix,
             )
             out[cat][suite_name] = metrics
             nll_display = f"{metrics['nll']:.4f}" if metrics.get("nll") is not None else "N/A"
@@ -2555,8 +2610,9 @@ def _evaluate_checkpoint_with_lm_eval(
 
 def _extract_preserved_lighteval_from_cache(
     cache_path: pathlib.Path,
+    model_key: str = "e4b",
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    """Return `(preserved_base_arabic, preserved_tuned_arabic)` for validated LightEval suites in `cache_path`."""
+    """Return `(preserved_base_arabic, preserved_tuned_arabic)` for validated Arabic suites in `cache_path`."""
     if not cache_path.exists():
         return ({}, {})
     try:
@@ -2566,11 +2622,14 @@ def _extract_preserved_lighteval_from_cache(
         tuned_ar = raw.get("tuned", {}).get("arabic", {})
         if not isinstance(base_ar, dict) or not isinstance(tuned_ar, dict):
             return ({}, {})
-        candidate_suites: Tuple[str, ...] = (
-            ("ArabicMMLU", "MadinahQA") + PRESERVED_LIGHTEVAL_SUITES
-            if eval_ver and eval_ver != "v28_linkedin_verified"
-            else PRESERVED_LIGHTEVAL_SUITES
-        )
+        if eval_ver and eval_ver != "v28_linkedin_verified":
+            candidate_suites: Tuple[str, ...] = (
+                ("ArabicMMLU", "MadinahQA")
+                + PRESERVED_LIGHTEVAL_SUITES
+                + (("MGSM-Ar",) if model_key == "e4b" else ())
+            )
+        else:
+            candidate_suites = PRESERVED_LIGHTEVAL_SUITES
         pres_base: Dict[str, Dict[str, Any]] = {}
         pres_tuned: Dict[str, Dict[str, Any]] = {}
         for sname in candidate_suites:
@@ -2599,14 +2658,26 @@ def _extract_preserved_lighteval_from_cache(
 
 def _extract_preserved_retention_from_cache(
     cache_path: pathlib.Path,
+    model_key: str = "e4b",
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    """Return `(preserved_base_retention, preserved_tuned_retention)` for validated `MMLU-Pro` scores from `v28_linkedin_verified` or later."""
+    """Return `(preserved_base_retention, preserved_tuned_retention)` for validated retention scores."""
     if not cache_path.exists():
         return ({}, {})
+    if model_key == "26b_a4b":
+        try:
+            raw_check = json.loads(cache_path.read_text(encoding="utf-8"))
+            if str(raw_check.get("eval_version") or "") != EVAL_CACHE_VERSION:
+                return ({}, {})
+        except Exception:
+            return ({}, {})
     try:
         raw = json.loads(cache_path.read_text(encoding="utf-8"))
         eval_ver = str(raw.get("eval_version") or "")
-        if eval_ver not in ("v28_linkedin_verified", EVAL_CACHE_VERSION):
+        if eval_ver not in (
+            "v28_linkedin_verified",
+            "v29_zero_shot_and_non_thinking_fix",
+            EVAL_CACHE_VERSION,
+        ):
             return ({}, {})
         base_ret = raw.get("base", {}).get("retention", {})
         tuned_ret = raw.get("tuned", {}).get("retention", {})
@@ -2614,7 +2685,12 @@ def _extract_preserved_retention_from_cache(
             return ({}, {})
         pres_base: Dict[str, Dict[str, Any]] = {}
         pres_tuned: Dict[str, Dict[str, Any]] = {}
-        for sname in ("MMLU-Pro",):
+        candidate_ret = (
+            ("MMLU-Pro", "GSM8K", "ARC-Challenge")
+            if (model_key == "e4b" and eval_ver in ("v29_zero_shot_and_non_thinking_fix", EVAL_CACHE_VERSION))
+            else ("MMLU-Pro",)
+        )
+        for sname in candidate_ret:
             b_entry = base_ret.get(sname)
             t_entry = tuned_ret.get(sname)
             if (
@@ -2876,8 +2952,12 @@ def run_inprocess_gpu_eval(
             sel_ret,
         )
     else:
-        pres_base_ar, pres_tuned_ar = _extract_preserved_lighteval_from_cache(cache_path)
-        pres_base_ret, pres_tuned_ret = _extract_preserved_retention_from_cache(cache_path)
+        pres_base_ar, pres_tuned_ar = _extract_preserved_lighteval_from_cache(
+            cache_path, model_key=model_key
+        )
+        pres_base_ret, pres_tuned_ret = _extract_preserved_retention_from_cache(
+            cache_path, model_key=model_key
+        )
 
     base_metrics = _evaluate_checkpoint_with_lm_eval(
         model_path=base_model_id,

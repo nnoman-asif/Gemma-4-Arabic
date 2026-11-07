@@ -585,11 +585,24 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                 "temperature": 0.0,
             },
         )
+        self.assertEqual(
+            _get_lm_eval_gen_kwargs("mmlu_pro", model_key_prefix="26b_a4b"),
+            {
+                "max_gen_toks": 6144,
+                "until": ["\nQuestion:", "<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "do_sample": False,
+                "temperature": 0.0,
+            },
+        )
         self.assertIsNone(_get_lm_eval_gen_kwargs("arc_challenge"))
         self.assertFalse(_should_apply_chat_template_for_task("arc_challenge", True))
         self.assertFalse(_should_apply_chat_template_for_task("humaneval", True))
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True))
+        self.assertTrue(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
+        self.assertTrue(_should_apply_chat_template_for_task("gsm8k", True, model_key_prefix="26b_a4b"))
+        self.assertTrue(_should_apply_chat_template_for_task("mgsm_ar", True, model_key_prefix="26b_a4b"))
+        self.assertFalse(_should_apply_chat_template_for_task("humaneval", True, model_key_prefix="26b_a4b"))
         self.assertTrue(_should_apply_chat_template_for_task("arc_challenge_chat", True))
         self.assertTrue(_should_apply_chat_template_for_task("mmlu_pro", True))
         self.assertTrue(_should_apply_chat_template_for_task("humaneval_instruct", True))
@@ -601,9 +614,12 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(arc_mc_spec["doc_to_target"], "gold")
 
         he_base_spec = build_custom_lm_eval_task_dict("humaneval", num_fewshot=0)
-        self.assertEqual(he_base_spec["doc_to_text"], "{{prompt}}")
+        self.assertTrue(
+            he_base_spec["doc_to_text"].endswith("Here is the completed function:\n```python\n{{prompt}}")
+        )
         self.assertEqual(he_base_spec["generation_kwargs"]["max_gen_toks"], 4096)
-        self.assertIn("\ndef", he_base_spec["generation_kwargs"]["until"])
+        self.assertIn("\n```", he_base_spec["generation_kwargs"]["until"])
+        self.assertNotIn("\ndef", he_base_spec["generation_kwargs"]["until"])
 
         class _MockLMObj:
             enable_thinking = True
