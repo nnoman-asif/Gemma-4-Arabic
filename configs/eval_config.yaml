@@ -53,21 +53,21 @@ arabic_benchmarks:
   ArabicMMLU:
     runner: "lighteval"
     lm_eval_task: "arabicmmlu"
-    lighteval_task: "community|arabic_mmlu:All|5"
+    lighteval_task: "community|arabic_mmlu:All|0"
     helm_task: "arabic_mmlu"
     qimma_task: "MBZUAI/ArabicMMLU"
     metric: "acc_norm"
-    num_fewshot: 5
+    num_fewshot: 0
     description: "Native 40-subject curriculum across KSA, Jordan, Egypt, and UAE (STEM, Islamic Studies, Arab Law, History, Civics)"
 
   MadinahQA:
     runner: "lighteval"
     lm_eval_task: "madinahqa"
-    lighteval_task: "community|madinah_qa:_average|5"
+    lighteval_task: "community|madinah_qa:_average|0"
     helm_task: "madinah_qa"
     qimma_task: "MBZUAI/MadinahQA"
     metric: "acc_norm"
-    num_fewshot: 5
+    num_fewshot: 0
     description: "Classical and MSA Arabic language and grammar (Nahw, Sarf, Irab, Balagha)"
 
   AlGhafa:
@@ -151,9 +151,9 @@ retention_anchors:
   ARC-Challenge:
     runner: "lm_eval"
     domain: "english_science_anchor"
-    lm_eval_task: "arc_challenge"
-    metric: "acc_norm"
-    num_fewshot: 25
+    lm_eval_task: "arc_challenge_chat"
+    metric: "exact_match"
+    num_fewshot: 0
     max_regression_pct: 8.50
     min_acceptable_score: 65.0
 

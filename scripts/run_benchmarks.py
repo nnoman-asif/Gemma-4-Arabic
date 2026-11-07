@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v28_linkedin_verified"
+EVAL_CACHE_VERSION = "v29_zero_shot_and_non_thinking_fix"
 
 # LightEval suites whose validated scores are preserved across partial cache refreshes
 PRESERVED_LIGHTEVAL_SUITES: Tuple[str, ...] = (
@@ -70,11 +70,11 @@ GROUP_SUBTASK_COUNTS: Dict[str, int] = {
 # Native LightEval task definitions for OALL v2 Arabic benchmarks
 LIGHTEVAL_SUITE_TASK_MAP: Dict[str, Tuple[str, ...]] = {
     "ArabicMMLU": (
-        "community|arabic_mmlu:All|5",
+        "community|arabic_mmlu:All|0",
     ),
     "MadinahQA": (
-        "community|madinah_qa:Arabic Language (General)|5",
-        "community|madinah_qa:Arabic Language (Grammar)|5",
+        "community|madinah_qa:Arabic Language (General)|0",
+        "community|madinah_qa:Arabic Language (Grammar)|0",
     ),
     "AlGhafa": (
         "community|alghafa:mcq_exams_test_ar|0",
@@ -209,6 +209,21 @@ def _patch_local_checkpoint_config_json(model_dir: pathlib.Path) -> bool:
                 "Patched %s on disk with tie_word_embeddings=true (root + text_config).",
                 cfg_path,
             )
+        chat_tpl_path = model_dir / "chat_template.jinja"
+        if chat_tpl_path.exists() and "26b" in str(model_dir).lower():
+            raw_tpl = chat_tpl_path.read_text(encoding="utf-8")
+            if "<|channel>thought\\n<channel|>" not in raw_tpl and "{%- if not enable_thinking -%}" in raw_tpl:
+                restored_tpl = re.sub(
+                    r"(\{%-\s*if\s+not\s+enable_thinking\s*-%\})\s*(\{%-\s*endif\s*-%\})",
+                    r"\1\n            {{- '<|channel>thought\\n<channel|>' -}}\n        \2",
+                    raw_tpl,
+                )
+                if restored_tpl != raw_tpl:
+                    chat_tpl_path.write_text(restored_tpl, encoding="utf-8")
+                    logger.info(
+                        "Restored official 26B-A4B non-thinking channel prefix in %s.",
+                        chat_tpl_path,
+                    )
         return True
     except Exception as exc:
         logger.warning("Could not inspect/patch %s: %s", cfg_path, exc)
@@ -677,6 +692,7 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
             return False
         try:
             tree = ast.parse(code_str)
+            compile(tree, "<humaneval>", "exec")
         except (SyntaxError, ValueError, TypeError):
             return False
         if not entry_name:
@@ -845,9 +861,7 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
             ):
                 return ""
             joined = "\n".join(block_lines)
-            # Strategy 1: uniformly dedent and indent by 4 spaces (handles column-0 multi-line bodies & already-indented bodies)
-            cand1_body = textwrap.indent(textwrap.dedent(joined), "    ")
-            cand1 = prompt_str + sep + cand1_body + "\n"
+            cand1 = prompt_str + sep + joined + "\n"
             if _is_valid_python_with_entry(cand1, entry_str):
                 return cand1
             # Strategy 2: line 0 was unindented while lines 1+ already have >=4 spaces
@@ -856,21 +870,11 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
                 cand2 = prompt_str + sep + "\n".join(fixed_lines) + "\n"
                 if _is_valid_python_with_entry(cand2, entry_str):
                     return cand2
-                if len(block_lines) > 1:
-                    rest_dedented = textwrap.indent(
-                        textwrap.dedent("\n".join(block_lines[1:])), "    "
-                    )
-                    cand2b = (
-                        prompt_str
-                        + sep
-                        + "    "
-                        + block_lines[0]
-                        + "\n"
-                        + rest_dedented
-                        + "\n"
-                    )
-                    if _is_valid_python_with_entry(cand2b, entry_str):
-                        return cand2b
+            # Strategy 3: entire body block was unindented (0 leading spaces on all lines)
+            dedented_body = textwrap.indent(textwrap.dedent(joined), "    ")
+            cand3 = prompt_str + sep + dedented_body + "\n"
+            if _is_valid_python_with_entry(cand3, entry_str):
+                return cand3
             return ""
 
         max_lead = min(6, len(cleaned_lines))
@@ -895,9 +899,6 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
             for ln in prefix_before_fence.splitlines()
             if ln.strip()
         )
-        if not first_fence_is_opening_lang and prefix_before_fence.strip():
-            candidates.append(_assemble_from_body(prefix_before_fence))
-            candidates.append(_assemble_from_full_def(prefix_before_fence))
 
         # Explicitly tagged ```python ... ``` blocks (never matches across a bare closing ```)
         tagged_blocks = re.findall(
@@ -921,7 +922,13 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
                 or re.search(r"(?m)^\s*(?:def\s+\w+|return\b|yield\b)", blk)
             ]
             other_blocks = [blk for blk in reversed(tagged_blocks) if blk not in priority_blocks]
-            for blk in priority_blocks + other_blocks:
+            for blk in priority_blocks:
+                candidates.append(_assemble_from_full_def(blk))
+                candidates.append(_assemble_from_body(blk))
+            if not first_fence_is_opening_lang and prefix_before_fence.strip():
+                candidates.append(_assemble_from_body(prefix_before_fence))
+                candidates.append(_assemble_from_full_def(prefix_before_fence))
+            for blk in other_blocks:
                 candidates.append(_assemble_from_full_def(blk))
                 candidates.append(_assemble_from_body(blk))
 
@@ -1145,14 +1152,13 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "num_fewshot": 0,
             "output_type": "generate_until",
             "doc_to_text": (
-                "Write a solution to the following problem and make sure that it passes the tests:\n"
-                "```python\n{{prompt}}\n```\n"
-                "Here is the completed function:\n```python\n{{prompt}}"
+                "Write a complete, self-contained Python solution to the following problem and make sure that it passes the tests:\n"
+                "```python\n{{prompt}}\n```"
             ),
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
-                "until": ["\n```", "\nif __name__", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\nif __name__", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 4096,
@@ -1773,6 +1779,14 @@ def run_lighteval_tasks_subprocess(
         child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
     child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    child_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    le_batch_size = (
+        1
+        if ("26b" in str(load_target_path).lower() or "26b" in str(tag).lower())
+        else min(int(batch_size), 8)
+    )
+    le_max_len = min(int(max_seq_len), 2048)
 
     with tempfile.TemporaryDirectory(prefix="lighteval_run_") as tmp_dir:
         out_json_file = pathlib.Path(tmp_dir) / "lighteval_results.json"
@@ -1781,7 +1795,7 @@ import json, logging, os, pathlib, sys
 for _n in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 sys.path.insert(0, {repr(str(PROJECT_ROOT))})
-from scripts.run_benchmarks import _prepare_gemma4_config_for_load
+from scripts.run_benchmarks import _destroy_vllm_and_free_vram, _prepare_gemma4_config_for_load
 try:
     _prepare_gemma4_config_for_load({repr(load_target_path)})
 except Exception:
@@ -1789,69 +1803,6 @@ except Exception:
 
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
-from lighteval.tasks.requests import Doc
-import lighteval.tasks.multilingual.tasks.arabic as _le_arabic
-
-def _patched_arabic_mmlu_pfn(line, task_name=None):
-    instruction = "السؤال التالي هو سؤال متعدد الإختيارات. اختر رمز الإجابة الصحيحة (أ، ب، ج، أو د):\\n\\n"
-    latin_to_arabic = {{"A": "أ", "B": "ب", "C": "ج", "D": "د", "E": "هـ"}}
-    choices, valid_keys_latin, valid_keys_arabic = [], [], []
-    for idx, key in enumerate(["A", "B", "C", "D", "E"]):
-        option = line.get(f"Option {{idx + 1}}")
-        if option:
-            choices.append(option)
-            valid_keys_latin.append(key)
-            valid_keys_arabic.append(latin_to_arabic[key])
-    answer_index = valid_keys_latin.index(line["Answer Key"])
-    ctx = str(line.get("Context") or "").strip()
-    q_text = f"{{ctx}}\\n\\n{{line['Question']}}" if ctx else str(line["Question"])
-    query = f"{{instruction}}السؤال: {{q_text}}\\n"
-    query += "".join([f"{{key}}. {{choice}}\\n" for key, choice in zip(valid_keys_arabic, choices)])
-    query += "الإجابة:"
-    return Doc(
-        task_name=task_name,
-        query=query,
-        choices=valid_keys_arabic,
-        gold_index=answer_index,
-        instruction=instruction,
-    )
-
-def _patched_madinah_qa_pfn(line, task_name=None):
-    instruction = "بناءً على السياق أدناه، اختر رمز الإجابة الصحيحة (أ، ب، ج، أو د) للسؤال التالي:\\n\\n"
-    latin_to_arabic = {{"A": "أ", "B": "ب", "C": "ج", "D": "د", "E": "هـ"}}
-    choices, valid_keys_latin, valid_keys_arabic = [], [], []
-    for idx, key in enumerate(["A", "B", "C", "D", "E"]):
-        option = line.get(f"Option {{idx + 1}}")
-        if option:
-            choices.append(option)
-            valid_keys_latin.append(key)
-            valid_keys_arabic.append(latin_to_arabic[key])
-    answer_index = valid_keys_latin.index(line["Answer Key"])
-    query = f"{{instruction}}السياق:\\n{{line['Context']}}\\nالسؤال:\\n{{line['Question']}}\\n"
-    query += "".join([f"{{key}}. {{choice}}\\n" for key, choice in zip(valid_keys_arabic, choices)])
-    query += "الإجابة:"
-    return Doc(
-        task_name=task_name,
-        query=query,
-        choices=valid_keys_arabic,
-        gold_index=answer_index,
-        instruction=instruction,
-    )
-
-_le_arabic.arabic_mmlu_pfn = _patched_arabic_mmlu_pfn
-_le_arabic.madinah_qa_pfn = _patched_madinah_qa_pfn
-for _t in getattr(_le_arabic, "TASKS_TABLE", []):
-    _tname = str(getattr(_t, "name", ""))
-    if _tname.startswith("arabic_mmlu:"):
-        _t.hf_avail_splits = ["test", "dev"]
-        _t.few_shots_split = "dev"
-        _t.few_shots_select = "sequential"
-        _t.prompt_function = _patched_arabic_mmlu_pfn
-    elif _tname.startswith("madinah_qa:"):
-        _t.hf_avail_splits = ["test", "dev"]
-        _t.few_shots_split = "dev"
-        _t.few_shots_select = "sequential"
-        _t.prompt_function = _patched_madinah_qa_pfn
 
 evaluation_tracker = EvaluationTracker(
     output_dir={repr(str(tmp_dir))},
@@ -1876,7 +1827,7 @@ if use_vllm:
             model_name={repr(load_target_path)},
             dtype="bfloat16",
             gpu_memory_utilization=0.85,
-            max_model_length={int(max_seq_len)},
+            max_model_length={int(le_max_len)},
             trust_remote_code=True,
         )
         pipeline = Pipeline(
@@ -1889,6 +1840,7 @@ if use_vllm:
         results_payload = pipeline.get_results()
     except Exception as vllm_exc:
         sys.stderr.write(f"[LightEval] vLLM backend failed ({{vllm_exc}}); falling back to Accelerate...\\n")
+        _destroy_vllm_and_free_vram()
 
 if results_payload is None:
     from lighteval.models.transformers.transformers_model import TransformersModelConfig
@@ -1902,8 +1854,8 @@ if results_payload is None:
     model_config = TransformersModelConfig(
         model_name={repr(load_target_path)},
         dtype="bfloat16",
-        batch_size={int(batch_size)},
-        max_length={int(max_seq_len)},
+        batch_size={int(le_batch_size)},
+        max_length={int(le_max_len)},
         trust_remote_code=True,
     )
     pipeline = Pipeline(
@@ -1969,13 +1921,12 @@ def _get_lm_eval_gen_kwargs(task_name: str) -> Optional[Dict[str, Any]]:
 
 
 def _should_apply_chat_template_for_task(task_name: str, apply_chat_template: bool) -> bool:
-    """Return `False` for multiple-choice log-likelihood tasks and non-thinking `HumanEval` completion (`humaneval_instruct`)."""
+    """Return `True` (when `apply_chat_template` is enabled) for generative instruct tasks and `False` for log-likelihood tasks."""
     clean = task_name.strip().lower()
     if clean in (
         "arc_challenge",
         "arc_easy",
         "humaneval",
-        "humaneval_instruct",
         "arabicmmlu",
         "madinahqa",
         "aratrust",
@@ -1991,26 +1942,26 @@ def _configure_lm_eval_thinking_for_task(
     lm_obj: Any,
     effective_use_vllm: bool,
     task_chat_tpl: bool,
+    task_name: str = "",
 ) -> None:
     """Configure `enable_thinking` and `chat_template_args` per task on `VLLM` or `HFLM`.
 
-    - On `VLLM`: `apply_chat_template` passes `enable_thinking=self.enable_thinking, **self.chat_template_args`,
-      while `loglikelihood` raises `ValueError` if `self.enable_thinking` is `True`.
-      Therefore `enable_thinking` must be `bool(task_chat_tpl)` and `chat_template_args` must remain `{}`.
-    - On `HFLM`: `apply_chat_template` passes `**self.chat_template_args` only,
-      while `loglikelihood` raises `ValueError` if `self.enable_thinking` is `True`.
-      Therefore `enable_thinking` must remain `False` and `chat_template_args` sets `enable_thinking` when `task_chat_tpl` is `True`.
+    - `mmlu_pro` runs with `enable_thinking=True` (matching Google's official Gemma 4 Model Card table).
+    - `arc_challenge_chat`, `gsm8k`, `mgsm_ar`, and `humaneval_instruct` run with `apply_chat_template=True`
+      and `enable_thinking=False` (matching standard non-thinking benchmark methodology).
+    - Log-likelihood tasks run with `apply_chat_template=False` and `enable_thinking=False`.
     """
+    use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
     if effective_use_vllm:
         if hasattr(lm_obj, "enable_thinking"):
-            lm_obj.enable_thinking = bool(task_chat_tpl)
+            lm_obj.enable_thinking = use_thinking
         if hasattr(lm_obj, "chat_template_args"):
             lm_obj.chat_template_args = {}
     else:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = False
         if hasattr(lm_obj, "chat_template_args"):
-            lm_obj.chat_template_args = {"enable_thinking": True} if task_chat_tpl else {}
+            lm_obj.chat_template_args = {"enable_thinking": True} if use_thinking else {}
 
 
 def run_lm_eval_task(
@@ -2147,6 +2098,7 @@ def _evaluate_checkpoint_with_lm_eval(
     _in_lm_eval_subprocess: bool = False,
     _skip_lighteval: bool = False,
     _preserved_arabic: Optional[Dict[str, Dict[str, Any]]] = None,
+    _preserved_retention: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Evaluate a checkpoint using native `lm_eval` (MGSM-Ar + 4 anchors) and native `lighteval` (6 OALL v2 suites)."""
     eval_cfg = cfg.get("evaluation", {})
@@ -2159,6 +2111,7 @@ def _evaluate_checkpoint_with_lm_eval(
     max_seq_len = int(eval_cfg.get("max_seq_length", 8192))
 
     preserved_ar = _preserved_arabic or {}
+    preserved_ret = _preserved_retention or {}
     lighteval_suites: List[str] = [
         sname
         for sname, spec in ar_defs.items()
@@ -2166,12 +2119,48 @@ def _evaluate_checkpoint_with_lm_eval(
         and sname in LIGHTEVAL_SUITE_TASK_MAP
         and sname not in preserved_ar
     ]
+    pending_lm_eval_ar = {
+        k: v
+        for k, v in ar_defs.items()
+        if k not in preserved_ar
+        and not (
+            str(v.get("runner", "lm_eval")).strip().lower() == "lighteval"
+            and k in LIGHTEVAL_SUITE_TASK_MAP
+        )
+    }
+    pending_lm_eval_ret = {
+        k: v for k, v in ret_defs.items() if k not in preserved_ret
+    }
+    has_pending_lm_eval = bool(pending_lm_eval_ar or pending_lm_eval_ret)
+
+    if not has_pending_lm_eval:
+        out_only_le: Dict[str, Dict[str, Dict[str, Any]]] = {
+            "arabic": dict(preserved_ar),
+            "retention": dict(preserved_ret),
+        }
+        if lighteval_suites and not _skip_lighteval:
+            le_metrics = run_lighteval_tasks_subprocess(
+                model_path=model_path,
+                suite_names=lighteval_suites,
+                device=device,
+                limit=limit,
+                max_seq_len=max_seq_len,
+                batch_size=batch_size,
+                use_vllm=use_vllm,
+                tag=tag,
+            )
+            for sname, smetrics in le_metrics.items():
+                out_only_le["arabic"][sname] = smetrics
+        return out_only_le
 
     if use_vllm and isinstance(model_path, str) and not _in_lm_eval_subprocess:
+        sub_cfg = dict(cfg)
+        sub_cfg["arabic_benchmarks"] = pending_lm_eval_ar
+        sub_cfg["retention_anchors"] = pending_lm_eval_ret
         out = _run_lm_eval_suites_subprocess(
             model_path=model_path,
             device=device,
-            cfg=cfg,
+            cfg=sub_cfg,
             tag=tag,
             limit=limit,
             use_vllm=use_vllm,
@@ -2179,6 +2168,8 @@ def _evaluate_checkpoint_with_lm_eval(
         )
         for sname, smetrics in preserved_ar.items():
             out["arabic"][sname] = smetrics
+        for sname, smetrics in preserved_ret.items():
+            out["retention"][sname] = smetrics
         if lighteval_suites and not _skip_lighteval:
             le_metrics = run_lighteval_tasks_subprocess(
                 model_path=model_path,
@@ -2252,9 +2243,8 @@ def _evaluate_checkpoint_with_lm_eval(
                     max_model_len=max_seq_len,
                     batch_size="auto",
                 )
-            # Unify Gemma 4 thinking prompt (<|turn>system\n<|think|>\n<turn|>) across E4B and 26B-A4B
-            # without setting think_end_token (which would trigger lm_eval's .lstrip() bug on HumanEval)
-            lm_obj.enable_thinking = True
+            # Default enable_thinking=False; _configure_lm_eval_thinking_for_task enables it per-task for mmlu_pro
+            lm_obj.enable_thinking = False
         except Exception as vllm_exc:
             logger.warning(
                 "[%s] vLLM initialization failed (%s); falling back to HFLM (batch_size=%d).",
@@ -2326,11 +2316,14 @@ def _evaluate_checkpoint_with_lm_eval(
             max_length=max_seq_len,
             trust_remote_code=True,
         )
-        lm_obj.chat_template_args = {"enable_thinking": True}
+        lm_obj.chat_template_args = {}
         _ensure_gemma4_tied_lm_head(lm_obj, tag=f"{tag}:hflm")
 
     task_manager = TaskManager()
-    out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": dict(preserved_ar), "retention": {}}
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {
+        "arabic": dict(preserved_ar),
+        "retention": dict(preserved_ret),
+    }
 
     suite_groups = (
         ("arabic", ar_defs),
@@ -2338,6 +2331,10 @@ def _evaluate_checkpoint_with_lm_eval(
     )
     for cat, suite_defs in suite_groups:
         for suite_name, spec in suite_defs.items():
+            if cat == "arabic" and suite_name in preserved_ar:
+                continue
+            if cat == "retention" and suite_name in preserved_ret:
+                continue
             runner = str(spec.get("runner", "lm_eval")).strip().lower()
             if runner == "lighteval" and suite_name in LIGHTEVAL_SUITE_TASK_MAP:
                 continue
@@ -2355,6 +2352,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 lm_obj=lm_obj,
                 effective_use_vllm=effective_use_vllm,
                 task_chat_tpl=task_chat_tpl,
+                task_name=task_name,
             )
             gen_kwargs = _get_lm_eval_gen_kwargs(task_name)
             logger.info(
@@ -2432,18 +2430,24 @@ def _evaluate_checkpoint_with_lm_eval(
 def _extract_preserved_lighteval_from_cache(
     cache_path: pathlib.Path,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    """Return `(preserved_base_arabic, preserved_tuned_arabic)` for `PRESERVED_LIGHTEVAL_SUITES` if present in `cache_path`."""
+    """Return `(preserved_base_arabic, preserved_tuned_arabic)` for validated LightEval suites in `cache_path`."""
     if not cache_path.exists():
         return ({}, {})
     try:
         raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        eval_ver = str(raw.get("eval_version") or "")
         base_ar = raw.get("base", {}).get("arabic", {})
         tuned_ar = raw.get("tuned", {}).get("arabic", {})
         if not isinstance(base_ar, dict) or not isinstance(tuned_ar, dict):
             return ({}, {})
+        candidate_suites: Tuple[str, ...] = (
+            ("ArabicMMLU", "MadinahQA") + PRESERVED_LIGHTEVAL_SUITES
+            if eval_ver and eval_ver != "v28_linkedin_verified"
+            else PRESERVED_LIGHTEVAL_SUITES
+        )
         pres_base: Dict[str, Dict[str, Any]] = {}
         pres_tuned: Dict[str, Dict[str, Any]] = {}
-        for sname in PRESERVED_LIGHTEVAL_SUITES:
+        for sname in candidate_suites:
             b_entry = base_ar.get(sname)
             t_entry = tuned_ar.get(sname)
             if (
@@ -2467,6 +2471,147 @@ def _extract_preserved_lighteval_from_cache(
     return ({}, {})
 
 
+def _extract_preserved_retention_from_cache(
+    cache_path: pathlib.Path,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Return `(preserved_base_retention, preserved_tuned_retention)` for validated `MMLU-Pro` scores from `v28_linkedin_verified` or later."""
+    if not cache_path.exists():
+        return ({}, {})
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        eval_ver = str(raw.get("eval_version") or "")
+        if eval_ver not in ("v28_linkedin_verified", EVAL_CACHE_VERSION):
+            return ({}, {})
+        base_ret = raw.get("base", {}).get("retention", {})
+        tuned_ret = raw.get("tuned", {}).get("retention", {})
+        if not isinstance(base_ret, dict) or not isinstance(tuned_ret, dict):
+            return ({}, {})
+        pres_base: Dict[str, Dict[str, Any]] = {}
+        pres_tuned: Dict[str, Dict[str, Any]] = {}
+        for sname in ("MMLU-Pro",):
+            b_entry = base_ret.get(sname)
+            t_entry = tuned_ret.get(sname)
+            if (
+                isinstance(b_entry, dict)
+                and isinstance(t_entry, dict)
+                and float(b_entry.get("eval_score_pct") or 0.0) > 0.0
+                and float(t_entry.get("eval_score_pct") or 0.0) > 0.0
+            ):
+                pres_base[sname] = b_entry
+                pres_tuned[sname] = t_entry
+        if pres_base and len(pres_base) == len(pres_tuned):
+            logger.info(
+                "Reusing validated retention anchor (%s) from %s",
+                ", ".join(pres_base.keys()),
+                cache_path.name,
+            )
+            return (pres_base, pres_tuned)
+    except Exception as exc:
+        logger.warning("Could not inspect %s for partial retention reuse: %s", cache_path, exc)
+    return ({}, {})
+
+
+def _resolve_selected_suites(
+    cfg: Dict[str, Any],
+    tasks_arg: Optional[str],
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Parse `--tasks` / `--benchmarks` into `(selected_arabic_suites, selected_retention_suites)`."""
+    if not tasks_arg or not str(tasks_arg).strip():
+        return None
+
+    ar_defs = cfg.get("arabic_benchmarks", {})
+    ret_defs = cfg.get("retention_anchors", {})
+
+    def _norm_key(s: str) -> str:
+        return re.sub(r"[\s_\-]+", "", str(s or "").strip().lower())
+
+    alias_map: Dict[str, Tuple[str, str]] = {}
+    for sname, spec in ar_defs.items():
+        alias_map[_norm_key(sname)] = ("arabic", sname)
+        if spec.get("lm_eval_task"):
+            alias_map[_norm_key(str(spec["lm_eval_task"]))] = ("arabic", sname)
+    for sname, spec in ret_defs.items():
+        alias_map[_norm_key(sname)] = ("retention", sname)
+        if spec.get("lm_eval_task"):
+            alias_map[_norm_key(str(spec["lm_eval_task"]))] = ("retention", sname)
+
+    # Shorthand aliases
+    shorthands = {
+        "arc": ("retention", "ARC-Challenge"),
+        "arcchallenge": ("retention", "ARC-Challenge"),
+        "arcchallengechat": ("retention", "ARC-Challenge"),
+        "humaneval": ("retention", "HumanEval"),
+        "humanevalinstruct": ("retention", "HumanEval"),
+        "mmlu": ("retention", "MMLU-Pro"),
+        "mmlupro": ("retention", "MMLU-Pro"),
+        "gsm8k": ("retention", "GSM8K"),
+        "mgsm": ("arabic", "MGSM-Ar"),
+        "mgsmar": ("arabic", "MGSM-Ar"),
+        "arabicmmlu": ("arabic", "ArabicMMLU"),
+        "madinah": ("arabic", "MadinahQA"),
+        "madinahqa": ("arabic", "MadinahQA"),
+        "alghafa": ("arabic", "AlGhafa"),
+        "acva": ("arabic", "ACVA"),
+        "exams": ("arabic", "EXAMS-AR"),
+        "examsar": ("arabic", "EXAMS-AR"),
+        "arabicexams": ("arabic", "EXAMS-AR"),
+        "aratrust": ("arabic", "AraTrust"),
+    }
+    for k, v in shorthands.items():
+        alias_map.setdefault(k, v)
+
+    raw_tokens = [tok.strip() for tok in re.split(r"[,;]+", str(tasks_arg)) if tok.strip()]
+    sel_ar: List[str] = []
+    sel_ret: List[str] = []
+    unknown: List[str] = []
+
+    for tok in raw_tokens:
+        nk = _norm_key(tok)
+        if nk not in alias_map:
+            unknown.append(tok)
+            continue
+        cat, canonical_name = alias_map[nk]
+        if cat == "arabic" and canonical_name not in sel_ar:
+            sel_ar.append(canonical_name)
+        elif cat == "retention" and canonical_name not in sel_ret:
+            sel_ret.append(canonical_name)
+
+    if unknown:
+        valid_names = list(ar_defs.keys()) + list(ret_defs.keys())
+        raise ValueError(
+            f"Unknown benchmark name(s) in --tasks: {unknown}. "
+            f"Valid benchmarks are: {', '.join(valid_names)}"
+        )
+    return (sel_ar, sel_ret)
+
+
+def _extract_all_cached_suites(
+    cache_path: pathlib.Path,
+) -> Tuple[
+    Dict[str, Dict[str, Any]],
+    Dict[str, Dict[str, Any]],
+    Dict[str, Dict[str, Any]],
+    Dict[str, Dict[str, Any]],
+]:
+    """Return `(base_ar, tuned_ar, base_ret, tuned_ret)` from `cache_path` if present."""
+    if not cache_path.exists():
+        return ({}, {}, {}, {})
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        base_ar = raw.get("base", {}).get("arabic", {})
+        tuned_ar = raw.get("tuned", {}).get("arabic", {})
+        base_ret = raw.get("base", {}).get("retention", {})
+        tuned_ret = raw.get("tuned", {}).get("retention", {})
+        return (
+            dict(base_ar) if isinstance(base_ar, dict) else {},
+            dict(tuned_ar) if isinstance(tuned_ar, dict) else {},
+            dict(base_ret) if isinstance(base_ret, dict) else {},
+            dict(tuned_ret) if isinstance(tuned_ret, dict) else {},
+        )
+    except Exception:
+        return ({}, {}, {}, {})
+
+
 def run_inprocess_gpu_eval(
     model_key: str,
     base_model_id: str,
@@ -2477,10 +2622,12 @@ def run_inprocess_gpu_eval(
     use_cached_eval: bool = False,
     use_vllm: bool = True,
     apply_chat_template: bool = True,
+    selected_tasks: Optional[str] = None,
+    load_cache_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Run standardized `lm_eval` + `lighteval` GPU evaluation across all 11 benchmarks for `base` and `tuned`."""
+    """Run standardized `lm_eval` + `lighteval` GPU evaluation across all or selected benchmarks for `base` and `tuned`."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
-    if use_cached_eval and cache_path.exists():
+    if (load_cache_only or (use_cached_eval and not selected_tasks)) and cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             if (
@@ -2496,6 +2643,8 @@ def run_inprocess_gpu_eval(
     if cfg is None:
         cfg = load_eval_config(PROJECT_ROOT / "configs" / "eval_config.yaml")
 
+    resolved_selection = _resolve_selected_suites(cfg, selected_tasks)
+
     import torch
 
     if not torch.cuda.is_available():
@@ -2507,7 +2656,34 @@ def run_inprocess_gpu_eval(
         if idx >= torch.cuda.device_count():
             use_dev = "cuda:0"
 
-    pres_base_ar, pres_tuned_ar = _extract_preserved_lighteval_from_cache(cache_path)
+    if resolved_selection is not None:
+        sel_ar, sel_ret = resolved_selection
+        ar_defs = cfg.get("arabic_benchmarks", {})
+        ret_defs = cfg.get("retention_anchors", {})
+        c_base_ar, c_tuned_ar, c_base_ret, c_tuned_ret = _extract_all_cached_suites(cache_path)
+        pres_base_ar: Dict[str, Dict[str, Any]] = {}
+        pres_tuned_ar: Dict[str, Dict[str, Any]] = {}
+        pres_base_ret: Dict[str, Dict[str, Any]] = {}
+        pres_tuned_ret: Dict[str, Dict[str, Any]] = {}
+
+        for sname in ar_defs:
+            if sname not in sel_ar:
+                pres_base_ar[sname] = c_base_ar.get(sname, {"_skipped": True})
+                pres_tuned_ar[sname] = c_tuned_ar.get(sname, {"_skipped": True})
+        for sname in ret_defs:
+            if sname not in sel_ret:
+                pres_base_ret[sname] = c_base_ret.get(sname, {"_skipped": True})
+                pres_tuned_ret[sname] = c_tuned_ret.get(sname, {"_skipped": True})
+
+        logger.info(
+            "[%s] --tasks filter active -> evaluating ONLY arabic=%s, retention=%s",
+            model_key,
+            sel_ar,
+            sel_ret,
+        )
+    else:
+        pres_base_ar, pres_tuned_ar = _extract_preserved_lighteval_from_cache(cache_path)
+        pres_base_ret, pres_tuned_ret = _extract_preserved_retention_from_cache(cache_path)
 
     base_metrics = _evaluate_checkpoint_with_lm_eval(
         model_path=base_model_id,
@@ -2518,6 +2694,7 @@ def run_inprocess_gpu_eval(
         use_vllm=use_vllm,
         apply_chat_template=apply_chat_template,
         _preserved_arabic=pres_base_ar,
+        _preserved_retention=pres_base_ret,
     )
     tuned_metrics = _evaluate_checkpoint_with_lm_eval(
         model_path=tuned_model_path,
@@ -2528,7 +2705,16 @@ def run_inprocess_gpu_eval(
         use_vllm=use_vllm,
         apply_chat_template=apply_chat_template,
         _preserved_arabic=pres_tuned_ar,
+        _preserved_retention=pres_tuned_ret,
     )
+
+    # Remove internal _skipped placeholders before persisting cache
+    for metrics_dict in (base_metrics, tuned_metrics):
+        for group_key in ("arabic", "retention"):
+            grp = metrics_dict.get(group_key, {})
+            for k in list(grp.keys()):
+                if isinstance(grp[k], dict) and grp[k].get("_skipped"):
+                    del grp[k]
 
     payload = {
         "eval_version": EVAL_CACHE_VERSION,
@@ -2557,12 +2743,15 @@ def build_benchmark_results(
     no_reference_fallback: bool = True,
     use_vllm: bool = False,
     apply_chat_template: bool = True,
+    selected_tasks: Optional[str] = None,
+    load_cache_only: bool = False,
 ) -> Dict[str, Any]:
     """Run all 7 Arabic benchmarks (`lm_eval` + `lighteval`) and 4 retention anchors (`lm_eval`)."""
     eval_cfg = cfg.get("evaluation", {})
     gate_cfg = cfg.get("retention_gate", {})
     ar_defs = cfg.get("arabic_benchmarks", {})
     ret_defs = cfg.get("retention_anchors", {})
+    resolved_selection = _resolve_selected_suites(cfg, selected_tasks)
 
     models_cfg = cfg.get("models", {})
     model_entry = models_cfg.get(model_key, {}) if isinstance(models_cfg, dict) else {}
@@ -2581,6 +2770,8 @@ def build_benchmark_results(
             use_cached_eval=use_cached_eval,
             use_vllm=use_vllm,
             apply_chat_template=apply_chat_template,
+            selected_tasks=selected_tasks,
+            load_cache_only=load_cache_only,
         )
 
     arabic_results: Dict[str, Dict[str, Any]] = {}
@@ -2589,7 +2780,11 @@ def build_benchmark_results(
         base_nll: Optional[float] = None
         tuned_nll: Optional[float] = None
 
-        if dry_run:
+        if dry_run or (resolved_selection is not None and name not in resolved_selection[0] and (
+            live_gpu_data is None
+            or name not in live_gpu_data.get("base", {}).get("arabic", {})
+            or name not in live_gpu_data.get("tuned", {}).get("arabic", {})
+        )):
             evaluated_score = base_score
         elif (
             live_gpu_data is not None
@@ -2671,7 +2866,11 @@ def build_benchmark_results(
         tuned_nll = None
         n_samples_anchor = int(limit or 0) if limit else 0
 
-        if dry_run:
+        if dry_run or (resolved_selection is not None and name not in resolved_selection[1] and (
+            live_gpu_data is None
+            or name not in live_gpu_data.get("base", {}).get("retention", {})
+            or name not in live_gpu_data.get("tuned", {}).get("retention", {})
+        )):
             evaluated_score = base_score
         elif (
             live_gpu_data is not None
@@ -2933,6 +3132,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Optional sample limit per benchmark suite.",
     )
     parser.add_argument(
+        "--tasks",
+        "--benchmarks",
+        dest="tasks",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of specific benchmarks to evaluate on Base and Tuned "
+            "(e.g., 'GSM8K,HumanEval,ARC-Challenge,MGSM-Ar,ArabicMMLU,MadinahQA' or 'HumanEval'). "
+            "Unselected benchmarks are automatically loaded from outputs/eval_reports/live_raw_*.json if present."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate all 7 Arabic benchmarks, 4 retention anchors, and Markdown report generation.",
@@ -2968,6 +3179,8 @@ def _build_child_eval_cmd(args: argparse.Namespace, model_key: str) -> List[str]
         cmd.append("--no-apply-chat-template")
     if args.limit is not None:
         cmd.extend(["--limit", str(args.limit)])
+    if getattr(args, "tasks", None):
+        cmd.extend(["--tasks", str(args.tasks)])
     return cmd
 
 
@@ -3048,6 +3261,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 no_reference_fallback=args.no_reference_fallback,
                 use_vllm=args.use_vllm,
                 apply_chat_template=args.apply_chat_template,
+                selected_tasks=args.tasks,
+                load_cache_only=True,
             )
             moe_res = build_benchmark_results(
                 cfg=cfg,
@@ -3060,6 +3275,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 no_reference_fallback=args.no_reference_fallback,
                 use_vllm=args.use_vllm,
                 apply_chat_template=args.apply_chat_template,
+                selected_tasks=args.tasks,
+                load_cache_only=True,
             )
         else:
             e4b_res = build_benchmark_results(
@@ -3073,6 +3290,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 no_reference_fallback=args.no_reference_fallback,
                 use_vllm=args.use_vllm,
                 apply_chat_template=args.apply_chat_template,
+                selected_tasks=args.tasks,
             )
             moe_res = build_benchmark_results(
                 cfg=cfg,
@@ -3085,6 +3303,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 no_reference_fallback=args.no_reference_fallback,
                 use_vllm=args.use_vllm,
                 apply_chat_template=args.apply_chat_template,
+                selected_tasks=args.tasks,
             )
 
         family_md = generate_family_markdown_report(e4b_res, moe_res)
@@ -3154,6 +3373,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         no_reference_fallback=args.no_reference_fallback,
         use_vllm=args.use_vllm,
         apply_chat_template=args.apply_chat_template,
+        selected_tasks=args.tasks,
     )
     md_report = generate_markdown_report(results)
 

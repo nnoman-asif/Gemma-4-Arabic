@@ -546,10 +546,9 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(mmlu_pro_spec["dataset_path"], "TIGER-Lab/MMLU-Pro")
         self.assertEqual(mmlu_pro_spec["doc_to_target"], "{{target_letter}}")
         he_spec = build_custom_lm_eval_task_dict("humaneval_instruct", num_fewshot=0)
-        self.assertTrue(
-            he_spec["doc_to_text"].endswith("Here is the completed function:\n```python\n{{prompt}}")
-        )
-        self.assertIn("\n```", he_spec["generation_kwargs"]["until"])
+        self.assertIn("```python\n{{prompt}}\n```", he_spec["doc_to_text"])
+        self.assertNotIn("Here is the completed function:", he_spec["doc_to_text"])
+        self.assertNotIn("\n```", he_spec["generation_kwargs"]["until"])
         self.assertEqual(he_spec["generation_kwargs"]["max_gen_toks"], 4096)
 
         mgsm_spec = build_custom_lm_eval_task_dict("mgsm_ar", num_fewshot=5)
@@ -567,6 +566,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         arc_spec = build_custom_lm_eval_task_dict("arc_challenge_chat", num_fewshot=0)
         self.assertIn("\nQuestion:", arc_spec["generation_kwargs"]["until"])
         self.assertNotIn("Question:", arc_spec["generation_kwargs"]["until"])
+        self.assertEqual(arc_spec["generation_kwargs"]["max_gen_toks"], 4096)
         self.assertEqual(
             _get_lm_eval_gen_kwargs("gsm8k"),
             {
@@ -587,27 +587,42 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         self.assertIsNone(_get_lm_eval_gen_kwargs("arc_challenge"))
         self.assertFalse(_should_apply_chat_template_for_task("arc_challenge", True))
+        self.assertTrue(_should_apply_chat_template_for_task("arc_challenge_chat", True))
         self.assertTrue(_should_apply_chat_template_for_task("gsm8k", True))
+        self.assertTrue(_should_apply_chat_template_for_task("mgsm_ar", True))
         self.assertTrue(_should_apply_chat_template_for_task("mmlu_pro", True))
-        self.assertFalse(_should_apply_chat_template_for_task("humaneval_instruct", True))
+        self.assertTrue(_should_apply_chat_template_for_task("humaneval_instruct", True))
 
         class _MockLMObj:
             enable_thinking = True
             chat_template_args: Dict[str, Any] = {}
 
         mock_vllm = _MockLMObj()
-        _configure_lm_eval_thinking_for_task(mock_vllm, effective_use_vllm=True, task_chat_tpl=True)
+        _configure_lm_eval_thinking_for_task(
+            mock_vllm, effective_use_vllm=True, task_chat_tpl=True, task_name="mmlu_pro"
+        )
         self.assertTrue(mock_vllm.enable_thinking)
         self.assertEqual(mock_vllm.chat_template_args, {})
-        _configure_lm_eval_thinking_for_task(mock_vllm, effective_use_vllm=True, task_chat_tpl=False)
+        _configure_lm_eval_thinking_for_task(
+            mock_vllm, effective_use_vllm=True, task_chat_tpl=True, task_name="gsm8k"
+        )
+        self.assertFalse(mock_vllm.enable_thinking)
+        self.assertEqual(mock_vllm.chat_template_args, {})
+        _configure_lm_eval_thinking_for_task(
+            mock_vllm, effective_use_vllm=True, task_chat_tpl=False, task_name="arc_challenge"
+        )
         self.assertFalse(mock_vllm.enable_thinking)
         self.assertEqual(mock_vllm.chat_template_args, {})
 
         mock_hflm = _MockLMObj()
-        _configure_lm_eval_thinking_for_task(mock_hflm, effective_use_vllm=False, task_chat_tpl=True)
+        _configure_lm_eval_thinking_for_task(
+            mock_hflm, effective_use_vllm=False, task_chat_tpl=True, task_name="mmlu_pro"
+        )
         self.assertFalse(mock_hflm.enable_thinking)
         self.assertEqual(mock_hflm.chat_template_args, {"enable_thinking": True})
-        _configure_lm_eval_thinking_for_task(mock_hflm, effective_use_vllm=False, task_chat_tpl=False)
+        _configure_lm_eval_thinking_for_task(
+            mock_hflm, effective_use_vllm=False, task_chat_tpl=True, task_name="gsm8k"
+        )
         self.assertFalse(mock_hflm.enable_thinking)
         self.assertEqual(mock_hflm.chat_template_args, {})
         self.assertEqual(
@@ -913,10 +928,10 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eff_armmlu, 5)
 
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ArabicMMLU"]["runner"], "lighteval")
-        self.assertEqual(eval_cfg["arabic_benchmarks"]["ArabicMMLU"]["num_fewshot"], 5)
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["ArabicMMLU"]["num_fewshot"], 0)
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AlGhafa"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["MadinahQA"]["runner"], "lighteval")
-        self.assertEqual(eval_cfg["arabic_benchmarks"]["MadinahQA"]["num_fewshot"], 5)
+        self.assertEqual(eval_cfg["arabic_benchmarks"]["MadinahQA"]["num_fewshot"], 0)
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["EXAMS-AR"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
@@ -924,9 +939,9 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval_instruct")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["metric"], "acc_norm")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["num_fewshot"], 25)
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge_chat")
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["metric"], "exact_match")
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["num_fewshot"], 0)
 
         le_payload = {
             "results": {
