@@ -161,6 +161,7 @@ fi
   --eval-base \
   --limit 200 \
   --use-vllm \
+  --apply-chat-template \
   --no-reference-fallback
 
 echo "======================================================================"

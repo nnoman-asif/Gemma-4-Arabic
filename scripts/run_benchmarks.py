@@ -40,7 +40,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-EVAL_CACHE_VERSION = "v27_final_verified"
+EVAL_CACHE_VERSION = "v28_linkedin_verified"
+
+# LightEval suites whose validated scores are preserved across partial cache refreshes
+PRESERVED_LIGHTEVAL_SUITES: Tuple[str, ...] = (
+    "AlGhafa",
+    "ACVA",
+    "EXAMS-AR",
+    "AraTrust",
+)
 
 # Core ACVA subtasks in lm_eval covering Saudi & Arab cultural alignment when --limit is used
 ACVA_CORE_SUBTASKS: Tuple[str, ...] = (
@@ -62,11 +70,11 @@ GROUP_SUBTASK_COUNTS: Dict[str, int] = {
 # Native LightEval task definitions for OALL v2 Arabic benchmarks
 LIGHTEVAL_SUITE_TASK_MAP: Dict[str, Tuple[str, ...]] = {
     "ArabicMMLU": (
-        "community|arabic_mmlu:All|0",
+        "community|arabic_mmlu:All|5",
     ),
     "MadinahQA": (
-        "community|madinah_qa:Arabic Language (General)|0",
-        "community|madinah_qa:Arabic Language (Grammar)|0",
+        "community|madinah_qa:Arabic Language (General)|5",
+        "community|madinah_qa:Arabic Language (Grammar)|5",
     ),
     "AlGhafa": (
         "community|alghafa:mcq_exams_test_ar|0",
@@ -473,8 +481,6 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
         rf"(?:(?i:option|choice|letter)\s*)?[\*\(\[\{{]*([{upper_letters}])[\*\)\]\}}]*\s+(?i:is\s+correct|is\s+the\s+correct|is\s+the\s+right|is\s+the\s+best|is\s+right)",
         # 4. Conclusion transition ('Therefore, (C)', 'Thus, C.', 'Hence, option C')
         rf"(?i:therefore|thus|hence|consequently|so\s+the\s+answer\s+is)[,\s]+(?:(?i:option|choice)\s*)?[\*\(\[\{{]*([{upper_letters}])[\*\)\]\}}]*(?:\s*[\.\),]|$)",
-        # 5. Standalone bold uppercase letter e.g. **C** or **(C)** or **C.** or **B. The sun...**
-        rf"\*\*[\(\[\{{]*([{upper_letters}])[\)\]\}}]*(?:\.[^\*\n]+|\.?)\*\*",
     )
     for pat in patterns:
         matches = re.findall(pat, cleaned)
@@ -483,7 +489,7 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
 
     non_empty_lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
     if non_empty_lines:
-        # 6. Check the FIRST non-empty line for a standalone option letter or leading option marker
+        # 5. Check the FIRST non-empty line for a standalone option letter or leading option marker
         first_line = non_empty_lines[0]
         first_line_standalone_m = re.match(
             rf"^\s*\*{{0,2}}(?:(?i:option|choice)\s+)?[\(\[\{{]*([{upper_letters}])[\)\]\}}]*\*{{0,2}}\s*$",
@@ -500,17 +506,26 @@ def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
             if chosen_first:
                 return chosen_first
 
-        # 7. Check the LAST non-empty line (e.g. "(C)", "C.", "C", "Option B: ...")
+        # 6. Check the LAST non-empty line (e.g. "(C)", "C.", "C", "Option B: ...")
         last_line = non_empty_lines[-1]
-        last_line_matches = re.findall(
-            rf"(?:^\s*\*{{0,2}}(?:(?i:option|choice)\s+)?[\*\(\[\{{]*([{upper_letters}])(?:\s*[\.\)\]\}}\*\:\-]|$))|\(([{upper_letters}])\)",
-            last_line,
-        )
-        if last_line_matches:
-            for g1, g2 in reversed(last_line_matches):
-                chosen = (g1 or g2).strip().upper()
-                if chosen:
-                    return chosen
+        if not re.match(r"^(?:[\*\-\+]\s+|\d+\.\s+)", last_line):
+            last_line_matches = re.findall(
+                rf"(?:^\s*\*{{0,2}}(?:(?i:option|choice)\s+)?[\*\(\[\{{]*([{upper_letters}])(?:\s*[\.\)\]\}}\*\:\-]|$))|\(([{upper_letters}])\)",
+                last_line,
+            )
+            if last_line_matches:
+                for g1, g2 in reversed(last_line_matches):
+                    chosen = (g1 or g2).strip().upper()
+                    if chosen:
+                        return chosen
+
+    # 7. Standalone bold uppercase letter e.g. **C** or **(C)** or **C.** (ignoring bullet items that state 'is incorrect/wrong')
+    bold_matches = re.findall(
+        rf"\*\*[\(\[\{{]*([{upper_letters}])[\)\]\}}]*(?:\.[^\*\n]+|\.?)\*\*(?![\s\)\]\}}\.]*(?i:is\s+(?:incorrect|wrong|false|not\b)))",
+        cleaned,
+    )
+    if bold_matches:
+        return str(bold_matches[-1]).upper()
 
     # 8. Final fallback: parenthesized uppercase letter (C) or single-character response
     paren_matches = re.findall(rf"\(([{upper_letters}])\)", cleaned)
@@ -985,7 +1000,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                 ],
                 "do_sample": False,
                 "temperature": 0.0,
-                "max_gen_toks": 2048,
+                "max_gen_toks": 4096,
             },
             "filter_list": [
                 {
@@ -1046,7 +1061,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                 "until": ["\nQuestion:", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
-                "max_gen_toks": 2048,
+                "max_gen_toks": 4096,
             },
             "filter_list": [
                 {
@@ -1089,7 +1104,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                 "until": ["\nQuestion:", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
-                "max_gen_toks": 2048,
+                "max_gen_toks": 4096,
             },
             "filter_list": [
                 {
@@ -1129,14 +1144,17 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "test_split": "test",
             "num_fewshot": 0,
             "output_type": "generate_until",
-            "doc_to_text": "Write a solution to the following problem and make sure that it passes the tests:\n```python\n{{prompt}}\n```\nHere is the completed function:\n```python\n{{prompt}}",
+            "doc_to_text": (
+                "Write a complete, self-contained Python solution for the following problem and make sure "
+                "that it passes all tests. Wrap your code in a ```python code block:\n```python\n{{prompt}}\n```"
+            ),
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
                 "until": ["\nif __name__", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
-                "max_gen_toks": 2048,
+                "max_gen_toks": 4096,
             },
             "filter_list": [
                 {
@@ -1567,16 +1585,28 @@ def parse_lighteval_results_json(
         f"{prefix}:_average:0",
         f"{prefix}:_average|5",
         f"{prefix}:_average:5",
+        f"community|{prefix}:All|5",
+        f"community:{prefix}:All:5",
+        f"lighteval|{prefix}:All|5",
+        f"lighteval:{prefix}:All:5",
+        f"{prefix}:All|5",
+        f"{prefix}:All:5",
         f"community|{prefix}:All|0",
         f"community:{prefix}:All:0",
         f"{prefix}:All|0",
         f"{prefix}:All:0",
+        f"community|{prefix}|5",
+        f"community:{prefix}:5",
         f"community|{prefix}|0",
         f"community:{prefix}:0",
+        f"community|{prefix}:default|5",
+        f"community:{prefix}:default:5",
         f"community|{prefix}:default|0",
         f"community:{prefix}:default:0",
         f"{prefix}:default|0",
         f"{prefix}:default:0",
+        f"{prefix}|5",
+        f"{prefix}:5",
         f"{prefix}|0",
         f"{prefix}:0",
     )
@@ -1758,6 +1788,69 @@ except Exception:
 
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+from lighteval.tasks.requests import Doc
+import lighteval.tasks.multilingual.tasks.arabic as _le_arabic
+
+def _patched_arabic_mmlu_pfn(line, task_name=None):
+    instruction = "السؤال التالي هو سؤال متعدد الإختيارات. اختر رمز الإجابة الصحيحة (أ، ب، ج، أو د):\\n\\n"
+    latin_to_arabic = {{"A": "أ", "B": "ب", "C": "ج", "D": "د", "E": "هـ"}}
+    choices, valid_keys_latin, valid_keys_arabic = [], [], []
+    for idx, key in enumerate(["A", "B", "C", "D", "E"]):
+        option = line.get(f"Option {{idx + 1}}")
+        if option:
+            choices.append(option)
+            valid_keys_latin.append(key)
+            valid_keys_arabic.append(latin_to_arabic[key])
+    answer_index = valid_keys_latin.index(line["Answer Key"])
+    ctx = str(line.get("Context") or "").strip()
+    q_text = f"{{ctx}}\\n\\n{{line['Question']}}" if ctx else str(line["Question"])
+    query = f"{{instruction}}السؤال: {{q_text}}\\n"
+    query += "".join([f"{{key}}. {{choice}}\\n" for key, choice in zip(valid_keys_arabic, choices)])
+    query += "الإجابة:"
+    return Doc(
+        task_name=task_name,
+        query=query,
+        choices=valid_keys_arabic,
+        gold_index=answer_index,
+        instruction=instruction,
+    )
+
+def _patched_madinah_qa_pfn(line, task_name=None):
+    instruction = "بناءً على السياق أدناه، اختر رمز الإجابة الصحيحة (أ، ب، ج، أو د) للسؤال التالي:\\n\\n"
+    latin_to_arabic = {{"A": "أ", "B": "ب", "C": "ج", "D": "د", "E": "هـ"}}
+    choices, valid_keys_latin, valid_keys_arabic = [], [], []
+    for idx, key in enumerate(["A", "B", "C", "D", "E"]):
+        option = line.get(f"Option {{idx + 1}}")
+        if option:
+            choices.append(option)
+            valid_keys_latin.append(key)
+            valid_keys_arabic.append(latin_to_arabic[key])
+    answer_index = valid_keys_latin.index(line["Answer Key"])
+    query = f"{{instruction}}السياق:\\n{{line['Context']}}\\nالسؤال:\\n{{line['Question']}}\\n"
+    query += "".join([f"{{key}}. {{choice}}\\n" for key, choice in zip(valid_keys_arabic, choices)])
+    query += "الإجابة:"
+    return Doc(
+        task_name=task_name,
+        query=query,
+        choices=valid_keys_arabic,
+        gold_index=answer_index,
+        instruction=instruction,
+    )
+
+_le_arabic.arabic_mmlu_pfn = _patched_arabic_mmlu_pfn
+_le_arabic.madinah_qa_pfn = _patched_madinah_qa_pfn
+for _t in getattr(_le_arabic, "TASKS_TABLE", []):
+    _tname = str(getattr(_t, "name", ""))
+    if _tname.startswith("arabic_mmlu:"):
+        _t.hf_avail_splits = ["test", "dev"]
+        _t.few_shots_split = "dev"
+        _t.few_shots_select = "sequential"
+        _t.prompt_function = _patched_arabic_mmlu_pfn
+    elif _tname.startswith("madinah_qa:"):
+        _t.hf_avail_splits = ["test", "dev"]
+        _t.few_shots_split = "dev"
+        _t.few_shots_select = "sequential"
+        _t.prompt_function = _patched_madinah_qa_pfn
 
 evaluation_tracker = EvaluationTracker(
     output_dir={repr(str(tmp_dir))},
@@ -1854,6 +1947,43 @@ pathlib.Path({repr(str(out_json_file))}).write_text(
     return parsed_out
 
 
+def _get_lm_eval_gen_kwargs(task_name: str) -> Optional[Dict[str, Any]]:
+    """Return standardized `generation_kwargs` overrides for built-in `lm_eval` generative tasks (`mmlu_pro`, `gsm8k`)."""
+    clean = task_name.strip().lower()
+    if clean in ("mmlu_pro", "gsm8k"):
+        return {
+            "max_gen_toks": 4096,
+            "until": [
+                "\nQuestion:",
+                "<turn|>",
+                "<end_of_turn>",
+                "<eos>",
+                "</s>",
+                "<|im_end|>",
+            ],
+            "do_sample": False,
+            "temperature": 0.0,
+        }
+    return None
+
+
+def _should_apply_chat_template_for_task(task_name: str, apply_chat_template: bool) -> bool:
+    """Return `False` for multiple-choice log-likelihood tasks (`arc_challenge`, etc.) and `apply_chat_template` for generative tasks."""
+    clean = task_name.strip().lower()
+    if clean in (
+        "arc_challenge",
+        "arc_easy",
+        "arabicmmlu",
+        "madinahqa",
+        "aratrust",
+        "arabic_exams",
+        "arabic_leaderboard_alghafa_light",
+        "arabic_leaderboard_acva_light",
+    ):
+        return False
+    return bool(apply_chat_template)
+
+
 def run_lm_eval_task(
     model_path: str,
     task_name: str,
@@ -1863,7 +1993,7 @@ def run_lm_eval_task(
     limit: Optional[int] = None,
     metric_hint: str = "acc_norm",
     use_vllm: bool = False,
-    apply_chat_template: bool = False,
+    apply_chat_template: bool = True,
 ) -> float:
     """Run a single `lm_eval` task via `lm_eval.simple_evaluate` and return the score."""
     import lm_eval
@@ -1886,7 +2016,8 @@ def run_lm_eval_task(
         if use_vllm
         else f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True,tie_word_embeddings=True"
     )
-    gen_kwargs = "max_gen_toks=2048" if task_name.strip() in ("mmlu_pro", "gsm8k") else None
+    gen_kwargs = _get_lm_eval_gen_kwargs(task_name)
+    task_chat_tpl = _should_apply_chat_template_for_task(task_name, apply_chat_template)
     payload = lm_eval.simple_evaluate(
         model=model_backend,
         model_args=model_args,
@@ -1900,7 +2031,7 @@ def run_lm_eval_task(
         numpy_random_seed=42,
         torch_random_seed=42,
         confirm_run_unsafe_code=True,
-        apply_chat_template=apply_chat_template,
+        apply_chat_template=task_chat_tpl,
         log_samples=True,
         bootstrap_iters=0,
         task_manager=TaskManager(),
@@ -1921,7 +2052,7 @@ def _run_lm_eval_suites_subprocess(
     tag: str,
     limit: Optional[int] = None,
     use_vllm: bool = True,
-    apply_chat_template: bool = False,
+    apply_chat_template: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Run the `lm_eval` tasks for `model_path` in an isolated child subprocess so the OS reclaims 100% of vLLM's 85% GPU memory pool upon completion."""
     child_env = os.environ.copy()
@@ -1983,11 +2114,12 @@ def _evaluate_checkpoint_with_lm_eval(
     tag: str,
     limit: Optional[int] = None,
     use_vllm: bool = True,
-    apply_chat_template: bool = False,
+    apply_chat_template: bool = True,
     _in_lm_eval_subprocess: bool = False,
     _skip_lighteval: bool = False,
+    _preserved_arabic: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Evaluate a checkpoint using native `lm_eval` (8 tasks + MGSM-Ar) and native `lighteval` (MadinahQA + AraTrust)."""
+    """Evaluate a checkpoint using native `lm_eval` (MGSM-Ar + 4 anchors) and native `lighteval` (6 OALL v2 suites)."""
     eval_cfg = cfg.get("evaluation", {})
     ar_defs = cfg.get("arabic_benchmarks", {})
     ret_defs = cfg.get("retention_anchors", {})
@@ -1997,11 +2129,13 @@ def _evaluate_checkpoint_with_lm_eval(
     batch_size = int(model_specific_cfg.get("batch_size", default_bs))
     max_seq_len = int(eval_cfg.get("max_seq_length", 8192))
 
+    preserved_ar = _preserved_arabic or {}
     lighteval_suites: List[str] = [
         sname
         for sname, spec in ar_defs.items()
         if str(spec.get("runner", "lm_eval")).strip().lower() == "lighteval"
         and sname in LIGHTEVAL_SUITE_TASK_MAP
+        and sname not in preserved_ar
     ]
 
     if use_vllm and isinstance(model_path, str) and not _in_lm_eval_subprocess:
@@ -2014,6 +2148,8 @@ def _evaluate_checkpoint_with_lm_eval(
             use_vllm=use_vllm,
             apply_chat_template=apply_chat_template,
         )
+        for sname, smetrics in preserved_ar.items():
+            out["arabic"][sname] = smetrics
         if lighteval_suites and not _skip_lighteval:
             le_metrics = run_lighteval_tasks_subprocess(
                 model_path=model_path,
@@ -2087,6 +2223,9 @@ def _evaluate_checkpoint_with_lm_eval(
                     max_model_len=max_seq_len,
                     batch_size="auto",
                 )
+            # Unify Gemma 4 thinking prompt (<|turn>system\n<|think|>\n<turn|>) across E4B and 26B-A4B
+            # without setting think_end_token (which would trigger lm_eval's .lstrip() bug on HumanEval)
+            lm_obj.enable_thinking = True
         except Exception as vllm_exc:
             logger.warning(
                 "[%s] vLLM initialization failed (%s); falling back to HFLM (batch_size=%d).",
@@ -2158,10 +2297,11 @@ def _evaluate_checkpoint_with_lm_eval(
             max_length=max_seq_len,
             trust_remote_code=True,
         )
+        lm_obj.chat_template_args = {"enable_thinking": True}
         _ensure_gemma4_tied_lm_head(lm_obj, tag=f"{tag}:hflm")
 
     task_manager = TaskManager()
-    out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": {}, "retention": {}}
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {"arabic": dict(preserved_ar), "retention": {}}
 
     suite_groups = (
         ("arabic", ar_defs),
@@ -2181,8 +2321,10 @@ def _evaluate_checkpoint_with_lm_eval(
                 num_fewshot=num_fewshot,
                 limit=limit,
             )
+            task_chat_tpl = _should_apply_chat_template_for_task(task_name, apply_chat_template)
+            gen_kwargs = _get_lm_eval_gen_kwargs(task_name)
             logger.info(
-                "[%s] Running lm_eval on %s/%s (task=%s, shots=%d, limit=%s, metric=%s)...",
+                "[%s] Running lm_eval on %s/%s (task=%s, shots=%d, limit=%s, metric=%s, chat_template=%s)...",
                 tag,
                 cat,
                 suite_name,
@@ -2190,8 +2332,8 @@ def _evaluate_checkpoint_with_lm_eval(
                 num_fewshot,
                 str(eff_limit),
                 metric_hint,
+                str(task_chat_tpl),
             )
-            gen_kwargs = "max_gen_toks=2048" if task_name.strip() in ("mmlu_pro", "gsm8k") else None
             payload = lm_eval.simple_evaluate(
                 model=lm_obj,
                 tasks=tasks_arg,
@@ -2203,7 +2345,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 numpy_random_seed=42,
                 torch_random_seed=42,
                 confirm_run_unsafe_code=True,
-                apply_chat_template=apply_chat_template,
+                apply_chat_template=task_chat_tpl,
                 log_samples=True,
                 bootstrap_iters=0,
                 task_manager=task_manager,
@@ -2253,6 +2395,44 @@ def _evaluate_checkpoint_with_lm_eval(
     return out
 
 
+def _extract_preserved_lighteval_from_cache(
+    cache_path: pathlib.Path,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Return `(preserved_base_arabic, preserved_tuned_arabic)` for `PRESERVED_LIGHTEVAL_SUITES` if present in `cache_path`."""
+    if not cache_path.exists():
+        return ({}, {})
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        base_ar = raw.get("base", {}).get("arabic", {})
+        tuned_ar = raw.get("tuned", {}).get("arabic", {})
+        if not isinstance(base_ar, dict) or not isinstance(tuned_ar, dict):
+            return ({}, {})
+        pres_base: Dict[str, Dict[str, Any]] = {}
+        pres_tuned: Dict[str, Dict[str, Any]] = {}
+        for sname in PRESERVED_LIGHTEVAL_SUITES:
+            b_entry = base_ar.get(sname)
+            t_entry = tuned_ar.get(sname)
+            if (
+                isinstance(b_entry, dict)
+                and isinstance(t_entry, dict)
+                and float(b_entry.get("eval_score_pct") or 0.0) > 0.0
+                and float(t_entry.get("eval_score_pct") or 0.0) > 0.0
+            ):
+                pres_base[sname] = b_entry
+                pres_tuned[sname] = t_entry
+        if pres_base and len(pres_base) == len(pres_tuned):
+            logger.info(
+                "Reusing %d validated LightEval suites (%s) from %s",
+                len(pres_base),
+                ", ".join(pres_base.keys()),
+                cache_path.name,
+            )
+            return (pres_base, pres_tuned)
+    except Exception as exc:
+        logger.warning("Could not inspect %s for partial LightEval reuse: %s", cache_path, exc)
+    return ({}, {})
+
+
 def run_inprocess_gpu_eval(
     model_key: str,
     base_model_id: str,
@@ -2262,7 +2442,7 @@ def run_inprocess_gpu_eval(
     limit: Optional[int] = None,
     use_cached_eval: bool = False,
     use_vllm: bool = True,
-    apply_chat_template: bool = False,
+    apply_chat_template: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Run standardized `lm_eval` + `lighteval` GPU evaluation across all 11 benchmarks for `base` and `tuned`."""
     cache_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"live_raw_{model_key}.json"
@@ -2293,6 +2473,8 @@ def run_inprocess_gpu_eval(
         if idx >= torch.cuda.device_count():
             use_dev = "cuda:0"
 
+    pres_base_ar, pres_tuned_ar = _extract_preserved_lighteval_from_cache(cache_path)
+
     base_metrics = _evaluate_checkpoint_with_lm_eval(
         model_path=base_model_id,
         device=use_dev,
@@ -2301,6 +2483,7 @@ def run_inprocess_gpu_eval(
         limit=limit,
         use_vllm=use_vllm,
         apply_chat_template=apply_chat_template,
+        _preserved_arabic=pres_base_ar,
     )
     tuned_metrics = _evaluate_checkpoint_with_lm_eval(
         model_path=tuned_model_path,
@@ -2310,6 +2493,7 @@ def run_inprocess_gpu_eval(
         limit=limit,
         use_vllm=use_vllm,
         apply_chat_template=apply_chat_template,
+        _preserved_arabic=pres_tuned_ar,
     )
 
     payload = {
@@ -2338,7 +2522,7 @@ def build_benchmark_results(
     use_cached_eval: bool = False,
     no_reference_fallback: bool = True,
     use_vllm: bool = False,
-    apply_chat_template: bool = False,
+    apply_chat_template: bool = True,
 ) -> Dict[str, Any]:
     """Run all 7 Arabic benchmarks (`lm_eval` + `lighteval`) and 4 retention anchors (`lm_eval`)."""
     eval_cfg = cfg.get("evaluation", {})
@@ -2685,9 +2869,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--apply-chat-template",
+        dest="apply_chat_template",
         action="store_true",
-        default=False,
-        help="Apply the model's Hugging Face chat template consistently across both base and tuned runs.",
+        default=True,
+        help="Apply the model's Hugging Face chat template consistently across both base and tuned generative runs (default: True).",
+    )
+    parser.add_argument(
+        "--no-apply-chat-template",
+        dest="apply_chat_template",
+        action="store_false",
+        help="Disable applying the chat template on generative lm_eval tasks.",
     )
     parser.add_argument(
         "--output-md",
@@ -2739,6 +2930,8 @@ def _build_child_eval_cmd(args: argparse.Namespace, model_key: str) -> List[str]
         cmd.append("--no-vllm")
     if args.apply_chat_template:
         cmd.append("--apply-chat-template")
+    else:
+        cmd.append("--no-apply-chat-template")
     if args.limit is not None:
         cmd.extend(["--limit", str(args.limit)])
     return cmd
