@@ -619,7 +619,17 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertFalse(_should_apply_chat_template_for_task("humaneval", True))
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True))
-        self.assertFalse(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
+        self.assertTrue(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
+        self.assertEqual(
+            resolve_lm_eval_task_specs("arc_challenge", num_fewshot=25, limit=200, model_key_prefix="26b_a4b"),
+            (["arc_challenge"], "arc_challenge", 200),
+        )
+        e4b_arc_tasks, e4b_arc_key, e4b_arc_lim = resolve_lm_eval_task_specs(
+            "arc_challenge", num_fewshot=25, limit=200, model_key_prefix="e4b"
+        )
+        self.assertIsInstance(e4b_arc_tasks[0], dict)
+        self.assertEqual(e4b_arc_key, "arc_challenge")
+        self.assertEqual(e4b_arc_lim, 200)
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("humaneval", True, model_key_prefix="26b_a4b"))
@@ -761,6 +771,12 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(
             _strip_thinking_blocks("<turn|>\n<|turn>model\n<|channel>thought\nLet's think\n<channel|>    return a + b"),
             "    return a + b",
+        )
+        self.assertEqual(
+            _strip_thinking_blocks(
+                "    pass\n```\n<turn|>\n<|turn>model\n<|channel>thought\n<channel|>```python\ndef foo(a, b):\n    return a + b\n```<turn|>"
+            ),
+            "```python\ndef foo(a, b):\n    return a + b\n```",
         )
         self.assertEqual(
             _strip_thinking_blocks("<|channel>thought\nUnclosed thought with The answer is (D)"),

@@ -364,12 +364,19 @@ _EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
 def _strip_thinking_blocks(text: str) -> str:
     """Remove Gemma 4 `<|think|>`, `<think>`, and `<|channel>thought...<channel|>` blocks and post-`<turn|>` babble without stripping line-1 indentation."""
     s = str(text or "")
-    # Strip any leading turn-transition prefix before splitting on end-of-turn markers
+    # Strip any short prompt-closing stub (e.g. `pass\n```\n<turn|>\n<|turn>model\n`) emitted before starting a model turn
+    s = re.sub(
+        r"^\s*(?:(?:pass|\.\.\.)?[ \t]*\r?\n)?[ \t]*```[ \t]*\r?\n?\s*<turn\|>\s*(?:(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?)?(?=\S)",
+        "",
+        s,
+    )
+    # Strip any leading turn-transition prefix or bare leading <turn|> at token 0 before splitting on end-of-turn markers
     s = re.sub(
         r"^\s*(?:<turn\|>\s*)*(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?",
         "",
         s,
     )
+    s = re.sub(r"^\s*(?:<turn\|>\s*)+", "", s)
     # Truncate at the first end-of-turn / EOS marker so post-turn babble is never parsed
     for eot in ("<turn|>", "<eos>", "<end_of_turn>", "<|im_end|>", "</s>"):
         if eot in s:
@@ -1368,10 +1375,14 @@ def resolve_lm_eval_task_specs(
     task_name: str,
     num_fewshot: int = 0,
     limit: Optional[int] = None,
+    model_key_prefix: str = "e4b",
 ) -> Tuple[List[Union[str, Dict[str, Any]]], str, Optional[int]]:
     """Resolve a benchmark's `lm_eval_task` into `(tasks_arg, primary_result_key, effective_limit)`."""
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
+
+    if model_key_prefix == "26b_a4b" and clean_name.lower() == "arc_challenge":
+        return ([clean_name], clean_name, eff_limit)
 
     if clean_name.lower() in (
         "mgsm_ar",
@@ -2159,9 +2170,10 @@ def _should_apply_chat_template_for_task(
     apply_chat_template: bool,
     model_key_prefix: str = "e4b",
 ) -> bool:
-    """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`) and `False` for standard completion/log-likelihood benchmarks."""
-    _ = model_key_prefix
+    """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`, plus `arc_challenge` on `26b_a4b`) and `False` for raw completion benchmarks."""
     clean = task_name.strip().lower()
+    if model_key_prefix == "26b_a4b" and clean == "arc_challenge":
+        return bool(apply_chat_template)
     if clean in (
         "arc_challenge",
         "arc_easy",
@@ -2482,7 +2494,6 @@ def _evaluate_checkpoint_with_lm_eval(
             from lm_eval.models.vllm_causallms import VLLM
 
             model_dir = pathlib.Path(model_path)
-            vllm_add_bos = True if model_key_prefix == "26b_a4b" else None
             if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
                 adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
                 base_model_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
@@ -2494,7 +2505,6 @@ def _evaluate_checkpoint_with_lm_eval(
                     gpu_memory_utilization=0.85,
                     max_model_len=max_seq_len,
                     batch_size="auto",
-                    add_bos_token=vllm_add_bos,
                 )
             else:
                 lm_obj = VLLM(
@@ -2504,7 +2514,6 @@ def _evaluate_checkpoint_with_lm_eval(
                     gpu_memory_utilization=0.85,
                     max_model_len=max_seq_len,
                     batch_size="auto",
-                    add_bos_token=vllm_add_bos,
                 )
             # Default enable_thinking=False; _configure_lm_eval_thinking_for_task enables it per-task for mmlu_pro
             lm_obj.enable_thinking = False
@@ -2611,6 +2620,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 task_name=task_name,
                 num_fewshot=num_fewshot,
                 limit=limit,
+                model_key_prefix=model_key_prefix,
             )
             task_chat_tpl = _should_apply_chat_template_for_task(
                 task_name,
@@ -2651,7 +2661,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 torch_random_seed=42,
                 confirm_run_unsafe_code=True,
                 apply_chat_template=task_chat_tpl,
-                fewshot_as_multiturn=bool(task_chat_tpl),
+                fewshot_as_multiturn=False if model_key_prefix == "26b_a4b" else bool(task_chat_tpl),
                 log_samples=True,
                 bootstrap_iters=0,
                 task_manager=task_manager,
