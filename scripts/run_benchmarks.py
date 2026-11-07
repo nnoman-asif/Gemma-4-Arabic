@@ -479,6 +479,46 @@ def _process_arc_challenge_chat_docs(dataset: Any) -> Any:
     return dataset.map(_map_row)
 
 
+def _process_arc_challenge_mc_docs(dataset: Any) -> Any:
+    """Format `allenai/ai2_arc` (`ARC-Challenge`) rows with explicit options for 25-shot `multiple_choice` `acc_norm` evaluation."""
+    letters = ("A", "B", "C", "D", "E")
+
+    def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
+        choices_obj = doc.get("choices") or {}
+        texts = list(choices_obj.get("text") or [])
+        labels = [str(lbl).strip() for lbl in (choices_obj.get("label") or [])]
+        ans_key = str(doc.get("answerKey") or "A").strip()
+        if ans_key in labels:
+            gold_idx = labels.index(ans_key)
+        else:
+            idx_map = {
+                "A": 0,
+                "B": 1,
+                "C": 2,
+                "D": 3,
+                "E": 4,
+                "1": 0,
+                "2": 1,
+                "3": 2,
+                "4": 3,
+                "5": 4,
+            }
+            gold_idx = idx_map.get(ans_key.upper(), 0)
+        gold_idx = max(0, min(gold_idx, max(0, len(texts) - 1)))
+
+        opt_letters = [letters[i] for i in range(min(len(texts), len(letters)))]
+        opt_lines = [f"{opt_letters[i]}. {texts[i]}" for i in range(len(opt_letters))]
+        stem = str(doc.get("question") or "").strip()
+        query = f"Question: {stem}\n" + "\n".join(opt_lines) + "\nAnswer:"
+        return {
+            "query": query,
+            "choice_letters": opt_letters,
+            "gold": int(gold_idx),
+        }
+
+    return dataset.map(_map_row)
+
+
 def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
     """Strip thinking blocks and extract the final selected option letter (`A`-`D` or `A`-`J`)."""
     cleaned = _strip_thinking_blocks(text).strip()
@@ -973,8 +1013,35 @@ def _build_humaneval_instruct_predictions(
     return out
 
 
+def _build_humaneval_completion_predictions(
+    resps: List[Any],
+    docs: List[Dict[str, Any]],
+) -> List[List[str]]:
+    """Standard `lm_eval` HumanEval 0-shot completion filter (`doc['prompt'] + r`, stripping any markdown fence)."""
+    out: List[List[str]] = []
+    for inst, doc in zip(resps, docs):
+        prompt = str(doc.get("prompt") or "")
+        seq = inst if isinstance(inst, (list, tuple)) else [inst]
+        preds: List[str] = []
+        for r in seq:
+            s = _strip_thinking_blocks(str(r))
+            if s.lstrip().startswith("```"):
+                s = re.sub(
+                    r"^\s*```(?:python|py)?[ \t]*\r?\n",
+                    "",
+                    s,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            if "```" in s:
+                s = s[: s.find("```")]
+            preds.append(prompt + s)
+        out.append(preds)
+    return out
+
+
 def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict[str, Any]:
-    """Return task configuration dictionary for `mgsm_ar`, `arc_challenge_chat`, `humaneval_instruct`, and metadata stubs."""
+    """Return task configuration dictionary for `mgsm_ar`, `arc_challenge`, `humaneval`, and metadata stubs."""
     key = task_name.strip().lower()
     if key == "mgsm_ar":
         return {
@@ -1034,7 +1101,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                         },
                         {
                             "function": "regex",
-                            "regex_pattern": "#### (\\-?[0-9\\.\\,]+)",
+                            "regex_pattern": "#{3,4}\\s*(\\-?[0-9\\.\\,]+)",
                         },
                         {"function": "take_first"},
                     ],
@@ -1093,6 +1160,35 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             ],
             "metadata": {"version": 1.0},
         }
+    if key == "arc_challenge":
+        return {
+            "task": "arc_challenge",
+            "dataset_path": "allenai/ai2_arc",
+            "dataset_name": "ARC-Challenge",
+            "training_split": "train",
+            "validation_split": "validation",
+            "test_split": "test",
+            "fewshot_split": "train",
+            "num_fewshot": int(num_fewshot),
+            "output_type": "multiple_choice",
+            "process_docs": _process_arc_challenge_mc_docs,
+            "doc_to_text": "{{query}}",
+            "doc_to_target": "gold",
+            "doc_to_choice": "choice_letters",
+            "metric_list": [
+                {
+                    "metric": "acc",
+                    "aggregation": "mean",
+                    "higher_is_better": True,
+                },
+                {
+                    "metric": "acc_norm",
+                    "aggregation": "mean",
+                    "higher_is_better": True,
+                },
+            ],
+            "metadata": {"version": 1.0},
+        }
     if key == "arc_challenge_chat":
         return {
             "task": "arc_challenge_chat",
@@ -1132,6 +1228,63 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
                     "higher_is_better": True,
                     "ignore_case": True,
                     "ignore_punctuation": True,
+                }
+            ],
+            "metadata": {"version": 1.0},
+        }
+    if key == "humaneval":
+        try:
+            from lm_eval.tasks.humaneval.utils import pass_at_k
+        except Exception:
+
+            def pass_at_k(references: List[str], predictions: List[List[str]], k: Optional[List[int]] = None) -> Dict[str, float]:  # type: ignore
+                _ = (references, predictions, k)
+                return {"pass@1": 0.0}
+
+        return {
+            "task": "humaneval",
+            "dataset_path": "openai/openai_humaneval",
+            "test_split": "test",
+            "num_fewshot": 0,
+            "output_type": "generate_until",
+            "doc_to_text": "{{prompt}}",
+            "doc_to_target": "{{test}}\ncheck({{entry_point}})",
+            "unsafe_code": True,
+            "generation_kwargs": {
+                "until": [
+                    "\nclass",
+                    "\ndef",
+                    "\n#",
+                    "\nif",
+                    "\nprint",
+                    "\n```",
+                    "<end_of_turn>",
+                    "<turn|>",
+                    "<eos>",
+                    "</s>",
+                    "<|im_end|>",
+                ],
+                "do_sample": False,
+                "temperature": 0.0,
+                "max_gen_toks": 4096,
+            },
+            "filter_list": [
+                {
+                    "name": "create_test",
+                    "filter": [
+                        {
+                            "function": "custom",
+                            "filter_fn": _build_humaneval_completion_predictions,
+                        },
+                    ],
+                }
+            ],
+            "metric_list": [
+                {
+                    "metric": pass_at_k,
+                    "aggregation": "mean",
+                    "higher_is_better": True,
+                    "k": [1],
                 }
             ],
             "metadata": {"version": 1.0},
@@ -1213,16 +1366,17 @@ def resolve_lm_eval_task_specs(
     num_fewshot: int = 0,
     limit: Optional[int] = None,
 ) -> Tuple[List[Union[str, Dict[str, Any]]], str, Optional[int]]:
-    """Resolve a benchmark's `lm_eval_task` into `(tasks_arg, primary_result_key, effective_limit)`.
-
-    Uses native built-in `lm_eval` tasks for `arabicmmlu`, `arabic_leaderboard_alghafa_light`,
-    `arabic_leaderboard_acva_light`, `arabic_exams`, `arc_challenge`, `gsm8k`, `humaneval`,
-    and `leaderboard_mmlu_pro`.
-    """
+    """Resolve a benchmark's `lm_eval_task` into `(tasks_arg, primary_result_key, effective_limit)`."""
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
 
-    if clean_name.lower() in ("mgsm_ar", "arc_challenge_chat", "humaneval_instruct"):
+    if clean_name.lower() in (
+        "mgsm_ar",
+        "arc_challenge",
+        "arc_challenge_chat",
+        "humaneval",
+        "humaneval_instruct",
+    ):
         custom_dict = build_custom_lm_eval_task_dict(clean_name, num_fewshot=num_fewshot)
         return ([custom_dict], str(custom_dict["task"]), eff_limit)
 
@@ -1355,17 +1509,17 @@ def parse_lm_eval_results_json(
         raise ValueError(f"lm_eval results JSON has no 'results' entries for task '{task_name}'.")
 
     candidate_keys = [
+        metric_hint,
         f"{metric_hint},none",
         f"{metric_hint},flexible-extract",
         f"{metric_hint},strict-match",
         f"{metric_hint},create_test",
-        metric_hint,
         "acc_norm,none",
         "acc,none",
         "exact_match,custom-extract",
         "exact_match,remove_whitespace",
-        "exact_match,flexible-extract",
         "exact_match,strict-match",
+        "exact_match,flexible-extract",
         "exact_match,none",
         "pass@1,create_test",
         "pass@1,none",
@@ -1500,40 +1654,10 @@ def extract_lm_eval_detailed_metrics(
                         rescored_total += 1
                         if native_em or (pred_letter == gold_letter):
                             rescored_correct += 1
-                elif "gsm8k" in task_lower or "mgsm" in task_lower:
-                    raw_resp = _first_resp_text(resps)
-                    doc_obj = sample.get("doc") if isinstance(sample.get("doc"), dict) else {}
-                    raw_gold = str(target or doc_obj.get("answer") or "").strip()
-                    gold_num = _extract_mgsm_ar_target_number(raw_gold)
-                    if gold_num:
-                        cleaned_resp = _truncate_math_continuation(raw_resp)
-                        # Extract explicit #### <num>, \boxed{<num>}, Final Answer: <num>, or last number before <turn|>
-                        pred_num = ""
-                        boxed_m = re.findall(r"\\boxed\s*\{([^{}]+)\}", cleaned_resp)
-                        hash_m = re.findall(r"#{3,4}\s*(-?[\d,]+(?:\.\d+)?)", cleaned_resp)
-                        ans_m = re.findall(
-                            r"(?:(?i:(?:final\s+answer|the\s+answer|answer)\s*(?:is|:|=))|(?:الإجابة\s+النهائية|الإجابة\s+الصحيحة|الإجابة|الجواب\s+النهائي|الجواب|الناتج\s+النهائي|الناتج)\s*(?:هي|هو|:|=))\s*\$?\s*(-?[\d,]+(?:\.\d+)?)",
-                            cleaned_resp,
-                        )
-                        if hash_m:
-                            pred_num = hash_m[0].replace(",", "")
-                        elif boxed_m:
-                            nums_in_box = re.findall(r"-?[\d,]+(?:\.\d+)?", boxed_m[-1])
-                            if nums_in_box:
-                                pred_num = nums_in_box[-1].replace(",", "")
-                        elif ans_m:
-                            pred_num = ans_m[-1].replace(",", "")
-                        else:
-                            pred_num = _extract_mgsm_ar_target_number(cleaned_resp)
-                        rescored_total += 1
-                        if native_em or _numbers_match(pred_num, gold_num):
-                            rescored_correct += 1
 
     if rescored_total > 0 and (
         "mmlu_pro" in task_lower
         or "arc_challenge_chat" in task_lower
-        or "gsm8k" in task_lower
-        or "mgsm" in task_lower
     ):
         rescored_pct = round(100.0 * float(rescored_correct) / float(rescored_total), 2)
         eval_score_pct = max(eval_score_pct, rescored_pct)
@@ -1921,12 +2045,14 @@ def _get_lm_eval_gen_kwargs(task_name: str) -> Optional[Dict[str, Any]]:
 
 
 def _should_apply_chat_template_for_task(task_name: str, apply_chat_template: bool) -> bool:
-    """Return `True` (when `apply_chat_template` is enabled) for generative instruct tasks and `False` for log-likelihood tasks."""
+    """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`) and `False` for standard completion/log-likelihood benchmarks."""
     clean = task_name.strip().lower()
     if clean in (
         "arc_challenge",
         "arc_easy",
         "humaneval",
+        "gsm8k",
+        "mgsm_ar",
         "arabicmmlu",
         "madinahqa",
         "aratrust",
@@ -2587,29 +2713,97 @@ def _resolve_selected_suites(
 
 def _extract_all_cached_suites(
     cache_path: pathlib.Path,
+    model_key: str = "e4b",
 ) -> Tuple[
     Dict[str, Dict[str, Any]],
     Dict[str, Dict[str, Any]],
     Dict[str, Dict[str, Any]],
     Dict[str, Dict[str, Any]],
 ]:
-    """Return `(base_ar, tuned_ar, base_ret, tuned_ret)` from `cache_path` if present."""
-    if not cache_path.exists():
-        return ({}, {}, {}, {})
-    try:
-        raw = json.loads(cache_path.read_text(encoding="utf-8"))
-        base_ar = raw.get("base", {}).get("arabic", {})
-        tuned_ar = raw.get("tuned", {}).get("arabic", {})
-        base_ret = raw.get("base", {}).get("retention", {})
-        tuned_ret = raw.get("tuned", {}).get("retention", {})
-        return (
-            dict(base_ar) if isinstance(base_ar, dict) else {},
-            dict(tuned_ar) if isinstance(tuned_ar, dict) else {},
-            dict(base_ret) if isinstance(base_ret, dict) else {},
-            dict(tuned_ret) if isinstance(tuned_ret, dict) else {},
-        )
-    except Exception:
-        return ({}, {}, {}, {})
+    """Return `(base_ar, tuned_ar, base_ret, tuned_ret)` from `cache_path` (and fallback report JSONs) if present."""
+    out_base_ar: Dict[str, Dict[str, Any]] = {}
+    out_tuned_ar: Dict[str, Dict[str, Any]] = {}
+    out_base_ret: Dict[str, Dict[str, Any]] = {}
+    out_tuned_ret: Dict[str, Dict[str, Any]] = {}
+
+    if cache_path.exists():
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+            base_ar = raw.get("base", {}).get("arabic", {})
+            tuned_ar = raw.get("tuned", {}).get("arabic", {})
+            base_ret = raw.get("base", {}).get("retention", {})
+            tuned_ret = raw.get("tuned", {}).get("retention", {})
+            if isinstance(base_ar, dict):
+                out_base_ar.update(base_ar)
+            if isinstance(tuned_ar, dict):
+                out_tuned_ar.update(tuned_ar)
+            if isinstance(base_ret, dict):
+                out_base_ret.update(base_ret)
+            if isinstance(tuned_ret, dict):
+                out_tuned_ret.update(tuned_ret)
+        except Exception:
+            pass
+
+    for fallback_name in ("benchmark_results.json", "family_benchmark_comparison.json"):
+        fb_path = cache_path.parent / fallback_name
+        if not fb_path.exists():
+            continue
+        try:
+            fb_raw = json.loads(fb_path.read_text(encoding="utf-8"))
+            model_block = fb_raw.get("models", {}).get(model_key) if isinstance(fb_raw.get("models"), dict) else None
+            if not isinstance(model_block, dict):
+                if fb_raw.get("model_key") == model_key:
+                    model_block = fb_raw
+            if not isinstance(model_block, dict) or model_block.get("mode") != "live_lm_eval":
+                continue
+            for sname, sdict in (model_block.get("arabic_benchmarks") or {}).items():
+                if not isinstance(sdict, dict):
+                    continue
+                b_sc = float(sdict.get("baseline_score", 0.0) or 0.0)
+                t_sc = float(sdict.get("evaluated_score", 0.0) or 0.0)
+                if (b_sc > 0.0 or t_sc > 0.0) and (sname not in out_base_ar or sname not in out_tuned_ar):
+                    out_base_ar[sname] = {
+                        "eval_score_pct": b_sc,
+                        "raw_signal_pct": b_sc,
+                        "top1_acc_pct": b_sc,
+                        "nll": sdict.get("base_nll"),
+                        "ppl": None,
+                        "n_samples": int(sdict.get("n_samples", 0) or 0),
+                    }
+                    out_tuned_ar[sname] = {
+                        "eval_score_pct": t_sc,
+                        "raw_signal_pct": t_sc,
+                        "top1_acc_pct": t_sc,
+                        "nll": sdict.get("tuned_nll"),
+                        "ppl": None,
+                        "n_samples": int(sdict.get("n_samples", 0) or 0),
+                    }
+            for sname, sdict in ((model_block.get("retention_gate") or {}).get("anchors") or {}).items():
+                if not isinstance(sdict, dict):
+                    continue
+                b_sc = float(sdict.get("baseline_score", 0.0) or 0.0)
+                t_sc = float(sdict.get("evaluated_score", 0.0) or 0.0)
+                if (b_sc > 0.0 or t_sc > 0.0) and (sname not in out_base_ret or sname not in out_tuned_ret):
+                    out_base_ret[sname] = {
+                        "eval_score_pct": b_sc,
+                        "raw_signal_pct": b_sc,
+                        "top1_acc_pct": b_sc,
+                        "nll": sdict.get("base_nll"),
+                        "ppl": None,
+                        "n_samples": int(sdict.get("n_samples", 0) or 0),
+                    }
+                    out_tuned_ret[sname] = {
+                        "eval_score_pct": t_sc,
+                        "raw_signal_pct": t_sc,
+                        "top1_acc_pct": t_sc,
+                        "nll": sdict.get("tuned_nll"),
+                        "ppl": None,
+                        "n_samples": int(sdict.get("n_samples", 0) or 0),
+                    }
+        except Exception:
+            pass
+
+    return (out_base_ar, out_tuned_ar, out_base_ret, out_tuned_ret)
 
 
 def run_inprocess_gpu_eval(
@@ -2660,7 +2854,7 @@ def run_inprocess_gpu_eval(
         sel_ar, sel_ret = resolved_selection
         ar_defs = cfg.get("arabic_benchmarks", {})
         ret_defs = cfg.get("retention_anchors", {})
-        c_base_ar, c_tuned_ar, c_base_ret, c_tuned_ret = _extract_all_cached_suites(cache_path)
+        c_base_ar, c_tuned_ar, c_base_ret, c_tuned_ret = _extract_all_cached_suites(cache_path, model_key=model_key)
         pres_base_ar: Dict[str, Dict[str, Any]] = {}
         pres_tuned_ar: Dict[str, Dict[str, Any]] = {}
         pres_base_ret: Dict[str, Dict[str, Any]] = {}
@@ -2861,7 +3055,11 @@ def build_benchmark_results(
 
     anchor_results: Dict[str, Dict[str, Any]] = {}
     for name, spec in ret_defs.items():
-        base_score = float(spec.get("baseline_score", spec.get("min_acceptable_score", 0.0)))
+        base_score = (
+            float(spec.get("baseline_score", spec.get("min_acceptable_score", 0.0)))
+            if dry_run
+            else float(spec.get("baseline_score", 0.0))
+        )
         base_nll = None
         tuned_nll = None
         n_samples_anchor = int(limit or 0) if limit else 0

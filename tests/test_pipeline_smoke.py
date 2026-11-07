@@ -587,11 +587,23 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         self.assertIsNone(_get_lm_eval_gen_kwargs("arc_challenge"))
         self.assertFalse(_should_apply_chat_template_for_task("arc_challenge", True))
+        self.assertFalse(_should_apply_chat_template_for_task("humaneval", True))
+        self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True))
+        self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True))
         self.assertTrue(_should_apply_chat_template_for_task("arc_challenge_chat", True))
-        self.assertTrue(_should_apply_chat_template_for_task("gsm8k", True))
-        self.assertTrue(_should_apply_chat_template_for_task("mgsm_ar", True))
         self.assertTrue(_should_apply_chat_template_for_task("mmlu_pro", True))
         self.assertTrue(_should_apply_chat_template_for_task("humaneval_instruct", True))
+
+        arc_mc_spec = build_custom_lm_eval_task_dict("arc_challenge", num_fewshot=25)
+        self.assertEqual(arc_mc_spec["output_type"], "multiple_choice")
+        self.assertEqual(arc_mc_spec["num_fewshot"], 25)
+        self.assertEqual(arc_mc_spec["doc_to_choice"], "choice_letters")
+        self.assertEqual(arc_mc_spec["doc_to_target"], "gold")
+
+        he_base_spec = build_custom_lm_eval_task_dict("humaneval", num_fewshot=0)
+        self.assertEqual(he_base_spec["doc_to_text"], "{{prompt}}")
+        self.assertEqual(he_base_spec["generation_kwargs"]["max_gen_toks"], 4096)
+        self.assertIn("\ndef", he_base_spec["generation_kwargs"]["until"])
 
         class _MockLMObj:
             enable_thinking = True
@@ -768,26 +780,27 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         mgsm_rescored = extract_lm_eval_detailed_metrics(
             {
-                "results": {"mgsm_ar": {"exact_match,flexible-extract": 0.0}},
-                "samples": {
-                    "mgsm_ar": [
-                        {
-                            "target": "57500",
-                            "resps": [["المعطيات في السؤال: ...\nالإجابة النهائية هي: ٥٧٬٥٠٠"]],
-                            "exact_match": 0.0,
-                        },
-                        {
-                            "target": "70000",
-                            "resps": [["خطوات الحل...\n### ٧٠٬٠٠٠"]],
-                            "exact_match": 0.0,
-                        },
-                    ]
-                },
+                "results": {"mgsm_ar": {"exact_match,flexible-extract": 0.84}},
+                "samples": {"mgsm_ar": [{"target": "57500"}, {"target": "70000"}]},
             },
             task_name="mgsm_ar",
             metric_hint="exact_match",
         )
-        self.assertEqual(mgsm_rescored["eval_score_pct"], 100.0)
+        self.assertEqual(mgsm_rescored["eval_score_pct"], 84.0)
+        gsm8k_strict = extract_lm_eval_detailed_metrics(
+            {
+                "results": {
+                    "gsm8k": {
+                        "exact_match,strict-match": 0.763,
+                        "exact_match,flexible-extract": 0.910,
+                    }
+                },
+                "samples": {"gsm8k": [{"target": "42"}]},
+            },
+            task_name="gsm8k",
+            metric_hint="exact_match,strict-match",
+        )
+        self.assertEqual(gsm8k_strict["eval_score_pct"], 76.3)
         self.assertEqual(
             _normalize_arabic_digits_filter([["<|think|>\n١٢٣\n<|think|>\nالإجابة هي ٥٧٥٠٠"]], [{}]),
             [["الإجابة هي 57500"]],
@@ -938,10 +951,12 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["num_fewshot"], 5)
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["num_fewshot"], 5)
-        self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval_instruct")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge_chat")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["metric"], "exact_match")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["num_fewshot"], 0)
+        self.assertEqual(eval_cfg["retention_anchors"]["GSM8K"]["lm_eval_task"], "gsm8k")
+        self.assertEqual(eval_cfg["retention_anchors"]["GSM8K"]["metric"], "exact_match,strict-match")
+        self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval")
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge")
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["metric"], "acc_norm")
+        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["num_fewshot"], 25)
 
         le_payload = {
             "results": {

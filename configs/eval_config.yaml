@@ -134,7 +134,7 @@ retention_anchors:
     runner: "lm_eval"
     domain: "math_reasoning"
     lm_eval_task: "gsm8k"
-    metric: "exact_match,flexible-extract"
+    metric: "exact_match,strict-match"
     num_fewshot: 5
     max_regression_pct: 8.50
     min_acceptable_score: 70.0
@@ -142,7 +142,7 @@ retention_anchors:
   HumanEval:
     runner: "lm_eval"
     domain: "code_generation"
-    lm_eval_task: "humaneval_instruct"
+    lm_eval_task: "humaneval"
     metric: "pass@1,create_test"
     num_fewshot: 0
     max_regression_pct: 8.50
@@ -151,9 +151,9 @@ retention_anchors:
   ARC-Challenge:
     runner: "lm_eval"
     domain: "english_science_anchor"
-    lm_eval_task: "arc_challenge_chat"
-    metric: "exact_match"
-    num_fewshot: 0
+    lm_eval_task: "arc_challenge"
+    metric: "acc_norm"
+    num_fewshot: 25
     max_regression_pct: 8.50
     min_acceptable_score: 65.0
 
