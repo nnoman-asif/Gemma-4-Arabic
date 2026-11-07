@@ -1145,13 +1145,14 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "num_fewshot": 0,
             "output_type": "generate_until",
             "doc_to_text": (
-                "Write a complete, self-contained Python solution for the following problem and make sure "
-                "that it passes all tests. Wrap your code in a ```python code block:\n```python\n{{prompt}}\n```"
+                "Write a solution to the following problem and make sure that it passes the tests:\n"
+                "```python\n{{prompt}}\n```\n"
+                "Here is the completed function:\n```python\n{{prompt}}"
             ),
             "doc_to_target": "{{test}}\ncheck({{entry_point}})",
             "unsafe_code": True,
             "generation_kwargs": {
-                "until": ["\nif __name__", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\n```", "\nif __name__", "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
                 "max_gen_toks": 4096,
@@ -1968,11 +1969,13 @@ def _get_lm_eval_gen_kwargs(task_name: str) -> Optional[Dict[str, Any]]:
 
 
 def _should_apply_chat_template_for_task(task_name: str, apply_chat_template: bool) -> bool:
-    """Return `False` for multiple-choice log-likelihood tasks (`arc_challenge`, etc.) and `apply_chat_template` for generative tasks."""
+    """Return `False` for multiple-choice log-likelihood tasks and non-thinking `HumanEval` completion (`humaneval_instruct`)."""
     clean = task_name.strip().lower()
     if clean in (
         "arc_challenge",
         "arc_easy",
+        "humaneval",
+        "humaneval_instruct",
         "arabicmmlu",
         "madinahqa",
         "aratrust",
@@ -1982,6 +1985,32 @@ def _should_apply_chat_template_for_task(task_name: str, apply_chat_template: bo
     ):
         return False
     return bool(apply_chat_template)
+
+
+def _configure_lm_eval_thinking_for_task(
+    lm_obj: Any,
+    effective_use_vllm: bool,
+    task_chat_tpl: bool,
+) -> None:
+    """Configure `enable_thinking` and `chat_template_args` per task on `VLLM` or `HFLM`.
+
+    - On `VLLM`: `apply_chat_template` passes `enable_thinking=self.enable_thinking, **self.chat_template_args`,
+      while `loglikelihood` raises `ValueError` if `self.enable_thinking` is `True`.
+      Therefore `enable_thinking` must be `bool(task_chat_tpl)` and `chat_template_args` must remain `{}`.
+    - On `HFLM`: `apply_chat_template` passes `**self.chat_template_args` only,
+      while `loglikelihood` raises `ValueError` if `self.enable_thinking` is `True`.
+      Therefore `enable_thinking` must remain `False` and `chat_template_args` sets `enable_thinking` when `task_chat_tpl` is `True`.
+    """
+    if effective_use_vllm:
+        if hasattr(lm_obj, "enable_thinking"):
+            lm_obj.enable_thinking = bool(task_chat_tpl)
+        if hasattr(lm_obj, "chat_template_args"):
+            lm_obj.chat_template_args = {}
+    else:
+        if hasattr(lm_obj, "enable_thinking"):
+            lm_obj.enable_thinking = False
+        if hasattr(lm_obj, "chat_template_args"):
+            lm_obj.chat_template_args = {"enable_thinking": True} if task_chat_tpl else {}
 
 
 def run_lm_eval_task(
@@ -2322,6 +2351,11 @@ def _evaluate_checkpoint_with_lm_eval(
                 limit=limit,
             )
             task_chat_tpl = _should_apply_chat_template_for_task(task_name, apply_chat_template)
+            _configure_lm_eval_thinking_for_task(
+                lm_obj=lm_obj,
+                effective_use_vllm=effective_use_vllm,
+                task_chat_tpl=task_chat_tpl,
+            )
             gen_kwargs = _get_lm_eval_gen_kwargs(task_name)
             logger.info(
                 "[%s] Running lm_eval on %s/%s (task=%s, shots=%d, limit=%s, metric=%s, chat_template=%s)...",

@@ -38,6 +38,7 @@ from scripts.benchmark_vllm_concurrency import (
 )
 from scripts.run_benchmarks import (
     _build_child_eval_cmd,
+    _configure_lm_eval_thinking_for_task,
     _ensure_gemma4_tied_lm_head,
     _extract_arc_mcq_letter,
     _extract_humaneval_code,
@@ -545,8 +546,10 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(mmlu_pro_spec["dataset_path"], "TIGER-Lab/MMLU-Pro")
         self.assertEqual(mmlu_pro_spec["doc_to_target"], "{{target_letter}}")
         he_spec = build_custom_lm_eval_task_dict("humaneval_instruct", num_fewshot=0)
-        self.assertIn("Write a complete, self-contained Python solution", he_spec["doc_to_text"])
-        self.assertEqual(he_spec["doc_to_text"].count("{{prompt}}"), 1)
+        self.assertTrue(
+            he_spec["doc_to_text"].endswith("Here is the completed function:\n```python\n{{prompt}}")
+        )
+        self.assertIn("\n```", he_spec["generation_kwargs"]["until"])
         self.assertEqual(he_spec["generation_kwargs"]["max_gen_toks"], 4096)
 
         mgsm_spec = build_custom_lm_eval_task_dict("mgsm_ar", num_fewshot=5)
@@ -586,7 +589,27 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertFalse(_should_apply_chat_template_for_task("arc_challenge", True))
         self.assertTrue(_should_apply_chat_template_for_task("gsm8k", True))
         self.assertTrue(_should_apply_chat_template_for_task("mmlu_pro", True))
-        self.assertTrue(_should_apply_chat_template_for_task("humaneval_instruct", True))
+        self.assertFalse(_should_apply_chat_template_for_task("humaneval_instruct", True))
+
+        class _MockLMObj:
+            enable_thinking = True
+            chat_template_args: Dict[str, Any] = {}
+
+        mock_vllm = _MockLMObj()
+        _configure_lm_eval_thinking_for_task(mock_vllm, effective_use_vllm=True, task_chat_tpl=True)
+        self.assertTrue(mock_vllm.enable_thinking)
+        self.assertEqual(mock_vllm.chat_template_args, {})
+        _configure_lm_eval_thinking_for_task(mock_vllm, effective_use_vllm=True, task_chat_tpl=False)
+        self.assertFalse(mock_vllm.enable_thinking)
+        self.assertEqual(mock_vllm.chat_template_args, {})
+
+        mock_hflm = _MockLMObj()
+        _configure_lm_eval_thinking_for_task(mock_hflm, effective_use_vllm=False, task_chat_tpl=True)
+        self.assertFalse(mock_hflm.enable_thinking)
+        self.assertEqual(mock_hflm.chat_template_args, {"enable_thinking": True})
+        _configure_lm_eval_thinking_for_task(mock_hflm, effective_use_vllm=False, task_chat_tpl=False)
+        self.assertFalse(mock_hflm.enable_thinking)
+        self.assertEqual(mock_hflm.chat_template_args, {})
         self.assertEqual(
             mgsm_spec["metric_list"][0]["regexes_to_ignore"],
             [",", "\\$", "\\.$"],
