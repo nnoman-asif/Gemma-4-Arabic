@@ -375,11 +375,15 @@ def _strip_thinking_blocks(text: str) -> str:
         if eot in s:
             s = s.split(eot, 1)[0]
     # Strip Gemma 4 native <|channel>thought...<channel|> blocks
-    s = re.sub(r"<\|channel>thought.*?<channel\|>", "", s, flags=re.DOTALL)
-    if "<channel|>" in s:
-        s = s.split("<channel|>")[-1]
-    if "<|channel>thought" in s:
-        s = re.sub(r"<\|channel>thought\s*\r?\n?", "", s)
+    s_stripped = re.sub(r"<\|channel>thought.*?<channel\|>", "", s, flags=re.DOTALL)
+    if "<channel|>" in s_stripped:
+        s_stripped = s_stripped.split("<channel|>")[-1]
+    if "<|channel>thought" in s_stripped:
+        s_stripped = re.sub(r"<\|channel>thought\s*\r?\n?", "", s_stripped)
+    if s_stripped.strip():
+        s = s_stripped
+    else:
+        s = re.sub(r"(?:<\|channel>thought\s*\r?\n?|<channel\|>)", "", s)
     # Strip <|think|>...<|think|> and <think>...</think> blocks
     s = re.sub(r"<\|think\|>.*?<\|think\|>", "", s, flags=re.DOTALL)
     s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
@@ -2076,16 +2080,24 @@ def _get_lm_eval_gen_kwargs(
     task_name: str,
     model_key_prefix: str = "e4b",
 ) -> Optional[Dict[str, Any]]:
-    """Return standardized `generation_kwargs` overrides for built-in `lm_eval` generative tasks (`mmlu_pro`, `gsm8k`)."""
+    """Return standardized `generation_kwargs` overrides for `lm_eval` generative tasks (`mmlu_pro`, `gsm8k`, `humaneval`)."""
     clean = task_name.strip().lower()
-    if clean in ("mmlu_pro", "gsm8k"):
-        max_toks = (
-            8192
-            if (model_key_prefix == "26b_a4b" and clean == "mmlu_pro")
-            else 4096
-        )
+    if clean == "mmlu_pro":
+        if model_key_prefix == "26b_a4b":
+            return {
+                "max_gen_toks": 8192,
+                "until": [
+                    "<turn|>",
+                    "<end_of_turn>",
+                    "<eos>",
+                    "</s>",
+                    "<|im_end|>",
+                ],
+                "do_sample": False,
+                "temperature": 0.0,
+            }
         return {
-            "max_gen_toks": max_toks,
+            "max_gen_toks": 4096,
             "until": [
                 "\nQuestion:",
                 "<turn|>",
@@ -2094,6 +2106,48 @@ def _get_lm_eval_gen_kwargs(
                 "</s>",
                 "<|im_end|>",
             ],
+            "do_sample": False,
+            "temperature": 0.0,
+        }
+    if clean == "gsm8k":
+        if model_key_prefix == "26b_a4b":
+            return {
+                "max_gen_toks": 4096,
+                "until": [
+                    "\nQuestion:",
+                    "<end_of_turn>",
+                    "<eos>",
+                    "</s>",
+                    "<|im_end|>",
+                ],
+                "ignore_eos": True,
+                "do_sample": False,
+                "temperature": 0.0,
+            }
+        return {
+            "max_gen_toks": 4096,
+            "until": [
+                "\nQuestion:",
+                "<turn|>",
+                "<end_of_turn>",
+                "<eos>",
+                "</s>",
+                "<|im_end|>",
+            ],
+            "do_sample": False,
+            "temperature": 0.0,
+        }
+    if clean == "humaneval" and model_key_prefix == "26b_a4b":
+        return {
+            "max_gen_toks": 4096,
+            "until": [
+                "\nif __name__",
+                "<end_of_turn>",
+                "<eos>",
+                "</s>",
+                "<|im_end|>",
+            ],
+            "ignore_eos": True,
             "do_sample": False,
             "temperature": 0.0,
         }
@@ -2106,9 +2160,8 @@ def _should_apply_chat_template_for_task(
     model_key_prefix: str = "e4b",
 ) -> bool:
     """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`) and `False` for standard completion/log-likelihood benchmarks."""
+    _ = model_key_prefix
     clean = task_name.strip().lower()
-    if model_key_prefix == "26b_a4b" and clean in ("humaneval", "arc_challenge"):
-        return bool(apply_chat_template)
     if clean in (
         "arc_challenge",
         "arc_easy",
@@ -2133,30 +2186,38 @@ def _configure_lm_eval_thinking_for_task(
     task_name: str = "",
     model_key_prefix: str = "e4b",
 ) -> None:
-    """Configure `enable_thinking` and `chat_template_args` per task on `VLLM` or `HFLM`.
+    """Configure `enable_thinking`, `think_end_token`, and `eos_token` per task on `VLLM` or `HFLM`.
 
     - `mmlu_pro` runs with `enable_thinking=True` (matching Google's official Gemma 4 Model Card table).
-    - `arc_challenge_chat`, `gsm8k`, `mgsm_ar`, and `humaneval_instruct` run with `apply_chat_template=True`
-      and `enable_thinking=False` (matching standard non-thinking benchmark methodology).
-    - Log-likelihood tasks run with `apply_chat_template=False` and `enable_thinking=False`.
+    - `arc_challenge`, `gsm8k`, and `humaneval` run with `apply_chat_template=False` and `enable_thinking=False`.
+    - On `26b_a4b` when `apply_chat_template=False`, `tokenizer.eos_token` is set to `<eos>` (`1`) so
+      `lm_eval`'s `eot_token_id` does not inject `<turn|>` (`106`) as a token-0 stop sequence.
     """
     use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
+    if model_key_prefix == "26b_a4b":
+        tok = getattr(lm_obj, "tokenizer", None)
+        if tok is not None:
+            try:
+                if task_chat_tpl:
+                    tok.eos_token = "<turn|>"
+                    tok.eos_token_id = 106
+                else:
+                    tok.eos_token = "<eos>"
+                    tok.eos_token_id = 1
+            except Exception:
+                pass
     if effective_use_vllm:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = use_thinking
         if hasattr(lm_obj, "think_end_token"):
-            lm_obj.think_end_token = (
-                "<channel|>" if (use_thinking and model_key_prefix == "26b_a4b") else None
-            )
+            lm_obj.think_end_token = None
         if hasattr(lm_obj, "chat_template_args"):
             lm_obj.chat_template_args = {}
     else:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = False
         if hasattr(lm_obj, "think_end_token"):
-            lm_obj.think_end_token = (
-                "<channel|>" if (use_thinking and model_key_prefix == "26b_a4b") else None
-            )
+            lm_obj.think_end_token = None
         if hasattr(lm_obj, "chat_template_args"):
             lm_obj.chat_template_args = {"enable_thinking": True} if use_thinking else {}
 
@@ -2421,6 +2482,7 @@ def _evaluate_checkpoint_with_lm_eval(
             from lm_eval.models.vllm_causallms import VLLM
 
             model_dir = pathlib.Path(model_path)
+            vllm_add_bos = True if model_key_prefix == "26b_a4b" else None
             if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
                 adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
                 base_model_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
@@ -2432,6 +2494,7 @@ def _evaluate_checkpoint_with_lm_eval(
                     gpu_memory_utilization=0.85,
                     max_model_len=max_seq_len,
                     batch_size="auto",
+                    add_bos_token=vllm_add_bos,
                 )
             else:
                 lm_obj = VLLM(
@@ -2441,6 +2504,7 @@ def _evaluate_checkpoint_with_lm_eval(
                     gpu_memory_utilization=0.85,
                     max_model_len=max_seq_len,
                     batch_size="auto",
+                    add_bos_token=vllm_add_bos,
                 )
             # Default enable_thinking=False; _configure_lm_eval_thinking_for_task enables it per-task for mmlu_pro
             lm_obj.enable_thinking = False
@@ -2587,6 +2651,7 @@ def _evaluate_checkpoint_with_lm_eval(
                 torch_random_seed=42,
                 confirm_run_unsafe_code=True,
                 apply_chat_template=task_chat_tpl,
+                fewshot_as_multiturn=bool(task_chat_tpl),
                 log_samples=True,
                 bootstrap_iters=0,
                 task_manager=task_manager,

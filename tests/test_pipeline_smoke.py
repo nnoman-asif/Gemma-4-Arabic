@@ -149,8 +149,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(dpo_cfg["training"]["learning_rate"], 5.0e-7)
         self.assertEqual(dpo_cfg["dpo"]["max_length"], 1536)
 
-        self.assertEqual(len(eval_cfg["arabic_benchmarks"]), 7)
-        self.assertIn("MGSM-Ar", eval_cfg["arabic_benchmarks"])
+        self.assertEqual(len(eval_cfg["arabic_benchmarks"]), 6)
+        self.assertNotIn("MGSM-Ar", eval_cfg["arabic_benchmarks"])
         self.assertEqual(len(eval_cfg["retention_anchors"]), 4)
 
     def test_02_gemma4_chat_template_thinking_tokens(self) -> None:
@@ -589,7 +589,27 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             _get_lm_eval_gen_kwargs("mmlu_pro", model_key_prefix="26b_a4b"),
             {
                 "max_gen_toks": 8192,
-                "until": ["\nQuestion:", "<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "do_sample": False,
+                "temperature": 0.0,
+            },
+        )
+        self.assertEqual(
+            _get_lm_eval_gen_kwargs("gsm8k", model_key_prefix="26b_a4b"),
+            {
+                "max_gen_toks": 4096,
+                "until": ["\nQuestion:", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "ignore_eos": True,
+                "do_sample": False,
+                "temperature": 0.0,
+            },
+        )
+        self.assertEqual(
+            _get_lm_eval_gen_kwargs("humaneval", model_key_prefix="26b_a4b"),
+            {
+                "max_gen_toks": 4096,
+                "until": ["\nif __name__", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "ignore_eos": True,
                 "do_sample": False,
                 "temperature": 0.0,
             },
@@ -599,10 +619,10 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertFalse(_should_apply_chat_template_for_task("humaneval", True))
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True))
-        self.assertTrue(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
+        self.assertFalse(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True, model_key_prefix="26b_a4b"))
-        self.assertTrue(_should_apply_chat_template_for_task("humaneval", True, model_key_prefix="26b_a4b"))
+        self.assertFalse(_should_apply_chat_template_for_task("humaneval", True, model_key_prefix="26b_a4b"))
         self.assertTrue(_should_apply_chat_template_for_task("arc_challenge_chat", True))
         self.assertTrue(_should_apply_chat_template_for_task("mmlu_pro", True))
         self.assertTrue(_should_apply_chat_template_for_task("humaneval_instruct", True))
@@ -621,10 +641,15 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertNotIn("\n```", he_base_spec["generation_kwargs"]["until"])
         self.assertNotIn("\ndef", he_base_spec["generation_kwargs"]["until"])
 
+        class _MockTok:
+            eos_token = "<turn|>"
+            eos_token_id = 106
+
         class _MockLMObj:
             enable_thinking = True
             think_end_token: Any = None
             chat_template_args: Dict[str, Any] = {}
+            tokenizer = _MockTok()
 
         mock_vllm = _MockLMObj()
         _configure_lm_eval_thinking_for_task(
@@ -641,13 +666,18 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             model_key_prefix="26b_a4b",
         )
         self.assertTrue(mock_vllm.enable_thinking)
-        self.assertEqual(mock_vllm.think_end_token, "<channel|>")
+        self.assertIsNone(mock_vllm.think_end_token)
+        self.assertEqual(mock_vllm.tokenizer.eos_token_id, 106)
         _configure_lm_eval_thinking_for_task(
-            mock_vllm, effective_use_vllm=True, task_chat_tpl=True, task_name="gsm8k"
+            mock_vllm,
+            effective_use_vllm=True,
+            task_chat_tpl=False,
+            task_name="gsm8k",
+            model_key_prefix="26b_a4b",
         )
         self.assertFalse(mock_vllm.enable_thinking)
-        self.assertIsNone(mock_vllm.think_end_token)
-        self.assertEqual(mock_vllm.chat_template_args, {})
+        self.assertEqual(mock_vllm.tokenizer.eos_token, "<eos>")
+        self.assertEqual(mock_vllm.tokenizer.eos_token_id, 1)
         _configure_lm_eval_thinking_for_task(
             mock_vllm, effective_use_vllm=True, task_chat_tpl=False, task_name="arc_challenge"
         )
@@ -898,7 +928,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                 eval_cfg["retention_anchors"][anchor_name]["max_regression_pct"],
                 8.50,
             )
-        self.assertEqual(eval_cfg["arabic_benchmarks"]["MGSM-Ar"]["num_fewshot"], 5)
+        self.assertNotIn("MGSM-Ar", eval_cfg["arabic_benchmarks"])
         self.assertEqual(eval_cfg["evaluation"]["base_model_id"], "unsloth/gemma-4-E4B-it")
         self.assertEqual(eval_cfg["evaluation"]["batch_size"], 32)
 

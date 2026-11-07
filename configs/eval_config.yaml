@@ -110,16 +110,6 @@ arabic_benchmarks:
     num_fewshot: 0
     description: "Arabic safety, truthfulness, and trustworthiness evaluation"
 
-  MGSM-Ar:
-    runner: "lm_eval"
-    lm_eval_task: "mgsm_ar"
-    lighteval_task: "community|mgsm_ar|5"
-    helm_task: "mgsm_ar"
-    qimma_task: "Omartificial-Intelligence-Space/Arabic-gsm8k-v2"
-    metric: "exact_match"
-    num_fewshot: 5
-    description: "Generative Arabic multi-step mathematical Chain-of-Thought reasoning benchmark"
-
 retention_anchors:
   MMLU-Pro:
     runner: "lm_eval"
