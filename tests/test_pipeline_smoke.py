@@ -598,8 +598,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             _get_lm_eval_gen_kwargs("gsm8k", model_key_prefix="26b_a4b"),
             {
                 "max_gen_toks": 4096,
-                "until": ["\nQuestion:", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
-                "ignore_eos": True,
+                "until": ["\nQuestion:", "<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
             },
@@ -608,8 +607,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             _get_lm_eval_gen_kwargs("humaneval", model_key_prefix="26b_a4b"),
             {
                 "max_gen_toks": 4096,
-                "until": ["\nif __name__", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
-                "ignore_eos": True,
+                "until": ["\nif __name__", "<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
                 "do_sample": False,
                 "temperature": 0.0,
             },
@@ -620,10 +618,19 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True))
         self.assertTrue(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
-        self.assertEqual(
-            resolve_lm_eval_task_specs("arc_challenge", num_fewshot=25, limit=200, model_key_prefix="26b_a4b"),
-            (["arc_challenge"], "arc_challenge", 200),
+        moe_arc_tasks, moe_arc_key, moe_arc_lim = resolve_lm_eval_task_specs(
+            "arc_challenge", num_fewshot=25, limit=200, model_key_prefix="26b_a4b"
         )
+        self.assertIsInstance(moe_arc_tasks[0], dict)
+        self.assertEqual(moe_arc_key, "arc_challenge")
+        self.assertEqual(moe_arc_lim, 200)
+        moe_mmlu_tasks, moe_mmlu_key, moe_mmlu_lim = resolve_lm_eval_task_specs(
+            "mmlu_pro", num_fewshot=5, limit=200, model_key_prefix="26b_a4b"
+        )
+        self.assertIsInstance(moe_mmlu_tasks[0], dict)
+        self.assertEqual(moe_mmlu_tasks[0]["num_fewshot"], 0)
+        self.assertEqual(moe_mmlu_key, "mmlu_pro")
+        self.assertEqual(moe_mmlu_lim, 210)
         e4b_arc_tasks, e4b_arc_key, e4b_arc_lim = resolve_lm_eval_task_specs(
             "arc_challenge", num_fewshot=25, limit=200, model_key_prefix="e4b"
         )
@@ -651,15 +658,10 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertNotIn("\n```", he_base_spec["generation_kwargs"]["until"])
         self.assertNotIn("\ndef", he_base_spec["generation_kwargs"]["until"])
 
-        class _MockTok:
-            eos_token = "<turn|>"
-            eos_token_id = 106
-
         class _MockLMObj:
             enable_thinking = True
             think_end_token: Any = None
             chat_template_args: Dict[str, Any] = {}
-            tokenizer = _MockTok()
 
         mock_vllm = _MockLMObj()
         _configure_lm_eval_thinking_for_task(
@@ -677,7 +679,6 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         self.assertTrue(mock_vllm.enable_thinking)
         self.assertIsNone(mock_vllm.think_end_token)
-        self.assertEqual(mock_vllm.tokenizer.eos_token_id, 106)
         _configure_lm_eval_thinking_for_task(
             mock_vllm,
             effective_use_vllm=True,
@@ -686,8 +687,6 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             model_key_prefix="26b_a4b",
         )
         self.assertFalse(mock_vllm.enable_thinking)
-        self.assertEqual(mock_vllm.tokenizer.eos_token, "<eos>")
-        self.assertEqual(mock_vllm.tokenizer.eos_token_id, 1)
         _configure_lm_eval_thinking_for_task(
             mock_vllm, effective_use_vllm=True, task_chat_tpl=False, task_name="arc_challenge"
         )

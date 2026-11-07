@@ -673,6 +673,25 @@ def _process_mmlu_pro_docs(dataset: Any) -> Any:
     """Format `TIGER-Lab/MMLU-Pro` rows with `A-J` option letters for `<|think|>`-aware generative evaluation."""
     letters = "ABCDEFGHIJ"
 
+    try:
+        col_names = list(getattr(dataset, "column_names", []) or [])
+        if "category" in col_names and hasattr(dataset, "select") and len(dataset) > 0:
+            cats = dataset["category"]
+            by_cat: Dict[str, List[int]] = {}
+            for idx, c in enumerate(cats):
+                by_cat.setdefault(str(c), []).append(idx)
+            if len(by_cat) > 1:
+                ordered_cats = sorted(by_cat.keys())
+                interleaved: List[int] = []
+                max_len = max(len(v) for v in by_cat.values())
+                for pos in range(max_len):
+                    for c in ordered_cats:
+                        if pos < len(by_cat[c]):
+                            interleaved.append(by_cat[c][pos])
+                dataset = dataset.select(interleaved)
+    except Exception:
+        pass
+
     def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
         options = list(doc.get("options") or [])
         choice_lines = [
@@ -963,6 +982,10 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
                 cleaned,
                 flags=re.DOTALL,
             )
+
+        if not first_fence_is_opening_lang and prefix_has_code and prefix_before_fence.strip():
+            candidates.append(_assemble_from_body(prefix_before_fence))
+            candidates.append(_assemble_from_full_def(prefix_before_fence))
 
         if tagged_blocks:
             # Prefer blocks containing `def <entry_str>` or `return`/`yield`, ordered from last to first
@@ -1381,8 +1404,14 @@ def resolve_lm_eval_task_specs(
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
 
-    if model_key_prefix == "26b_a4b" and clean_name.lower() == "arc_challenge":
-        return ([clean_name], clean_name, eff_limit)
+    if model_key_prefix == "26b_a4b" and clean_name.lower() == "mmlu_pro":
+        custom_dict = build_custom_lm_eval_task_dict("mmlu_pro", num_fewshot=0)
+        mmlu_limit = (
+            eff_limit * GROUP_SUBTASK_COUNTS.get("mmlu_pro", 14)
+            if eff_limit is not None
+            else None
+        )
+        return ([custom_dict], str(custom_dict["task"]), mmlu_limit)
 
     if clean_name.lower() in (
         "mgsm_ar",
@@ -2121,20 +2150,6 @@ def _get_lm_eval_gen_kwargs(
             "temperature": 0.0,
         }
     if clean == "gsm8k":
-        if model_key_prefix == "26b_a4b":
-            return {
-                "max_gen_toks": 4096,
-                "until": [
-                    "\nQuestion:",
-                    "<end_of_turn>",
-                    "<eos>",
-                    "</s>",
-                    "<|im_end|>",
-                ],
-                "ignore_eos": True,
-                "do_sample": False,
-                "temperature": 0.0,
-            }
         return {
             "max_gen_toks": 4096,
             "until": [
@@ -2153,12 +2168,12 @@ def _get_lm_eval_gen_kwargs(
             "max_gen_toks": 4096,
             "until": [
                 "\nif __name__",
+                "<turn|>",
                 "<end_of_turn>",
                 "<eos>",
                 "</s>",
                 "<|im_end|>",
             ],
-            "ignore_eos": True,
             "do_sample": False,
             "temperature": 0.0,
         }
@@ -2198,26 +2213,13 @@ def _configure_lm_eval_thinking_for_task(
     task_name: str = "",
     model_key_prefix: str = "e4b",
 ) -> None:
-    """Configure `enable_thinking`, `think_end_token`, and `eos_token` per task on `VLLM` or `HFLM`.
+    """Configure `enable_thinking` and `think_end_token` per task on `VLLM` or `HFLM`.
 
     - `mmlu_pro` runs with `enable_thinking=True` (matching Google's official Gemma 4 Model Card table).
-    - `arc_challenge`, `gsm8k`, and `humaneval` run with `apply_chat_template=False` and `enable_thinking=False`.
-    - On `26b_a4b` when `apply_chat_template=False`, `tokenizer.eos_token` is set to `<eos>` (`1`) so
-      `lm_eval`'s `eot_token_id` does not inject `<turn|>` (`106`) as a token-0 stop sequence.
+    - `arc_challenge`, `gsm8k`, and `humaneval` run with `enable_thinking=False`.
     """
+    _ = model_key_prefix
     use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
-    if model_key_prefix == "26b_a4b":
-        tok = getattr(lm_obj, "tokenizer", None)
-        if tok is not None:
-            try:
-                if task_chat_tpl:
-                    tok.eos_token = "<turn|>"
-                    tok.eos_token_id = 106
-                else:
-                    tok.eos_token = "<eos>"
-                    tok.eos_token_id = 1
-            except Exception:
-                pass
     if effective_use_vllm:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = use_thinking
@@ -2493,6 +2495,7 @@ def _evaluate_checkpoint_with_lm_eval(
         try:
             from lm_eval.models.vllm_causallms import VLLM
 
+            vllm_add_bos = True if model_key_prefix == "26b_a4b" else None
             model_dir = pathlib.Path(model_path)
             if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
                 adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
@@ -2505,6 +2508,7 @@ def _evaluate_checkpoint_with_lm_eval(
                     gpu_memory_utilization=0.85,
                     max_model_len=max_seq_len,
                     batch_size="auto",
+                    add_bos_token=vllm_add_bos,
                 )
             else:
                 lm_obj = VLLM(
@@ -2514,6 +2518,7 @@ def _evaluate_checkpoint_with_lm_eval(
                     gpu_memory_utilization=0.85,
                     max_model_len=max_seq_len,
                     batch_size="auto",
+                    add_bos_token=vllm_add_bos,
                 )
             # Default enable_thinking=False; _configure_lm_eval_thinking_for_task enables it per-task for mmlu_pro
             lm_obj.enable_thinking = False
@@ -2613,6 +2618,8 @@ def _evaluate_checkpoint_with_lm_eval(
 
             task_name = str(spec["lm_eval_task"])
             num_fewshot = int(spec.get("num_fewshot", 0))
+            if model_key_prefix == "26b_a4b" and task_name.strip().lower() == "mmlu_pro":
+                num_fewshot = 0
             metric_hint = str(spec.get("metric", "acc_norm"))
             if model_key_prefix == "26b_a4b" and task_name.strip().lower() == "gsm8k":
                 metric_hint = "exact_match,flexible-extract"
