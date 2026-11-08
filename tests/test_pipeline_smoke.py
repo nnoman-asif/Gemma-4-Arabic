@@ -687,10 +687,6 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertTrue(mock_vllm.enable_thinking)
         self.assertIsNone(mock_vllm.think_end_token)
         self.assertEqual(mock_vllm.tokenizer.eos_token_id, 106)
-        self.assertIn(
-            "<|channel>thought\nLet's carefully analyze",
-            mock_vllm.apply_chat_template([{"role": "user", "content": "Q"}], add_generation_prompt=True),
-        )
         _configure_lm_eval_thinking_for_task(
             mock_vllm,
             effective_use_vllm=True,
@@ -701,11 +697,6 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertFalse(mock_vllm.enable_thinking)
         self.assertEqual(mock_vllm.tokenizer.eos_token, "<eos>")
         self.assertEqual(mock_vllm.tokenizer.eos_token_id, 1)
-        self.assertTrue(
-            mock_vllm.apply_chat_template([{"role": "user", "content": "Q"}], add_generation_prompt=True).endswith(
-                "<|turn>model\n"
-            )
-        )
         _configure_lm_eval_thinking_for_task(
             mock_vllm, effective_use_vllm=True, task_chat_tpl=False, task_name="arc_challenge"
         )

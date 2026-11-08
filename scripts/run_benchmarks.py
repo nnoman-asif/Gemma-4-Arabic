@@ -533,8 +533,6 @@ def _process_arc_challenge_mc_docs(dataset: Any) -> Any:
 def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
     """Strip thinking blocks and extract the final selected option letter (`A`-`D` or `A`-`J`)."""
     cleaned = _strip_thinking_blocks(text).strip()
-    if "\nQuestion:" in cleaned:
-        cleaned = cleaned.split("\nQuestion:", 1)[0].strip()
     if not cleaned:
         return ""
     upper_letters = valid_letters.upper()
@@ -1076,6 +1074,39 @@ def _build_humaneval_completion_predictions(
     return out
 
 
+def _safe_humaneval_pass_at_k(
+    references: List[str],
+    predictions: List[Any],
+    k: Optional[List[int]] = None,
+) -> Dict[str, float]:
+    """Execute HumanEval candidate code + unit tests in an isolated `subprocess.run` child process with a strict 3s timeout (never calls `fork()` inside `vLLM`)."""
+    _ = k
+    if not references or not predictions:
+        return {"pass@1": 0.0}
+    scores: List[float] = []
+    for ref, pred_item in zip(references, predictions):
+        cand_list = pred_item if isinstance(pred_item, (list, tuple)) else [pred_item]
+        passed = False
+        for cand in cand_list[:1]:
+            full_program = f"{cand}\n\n{ref}\n"
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-I", "-c", full_program],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3.0,
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    passed = True
+                    break
+            except Exception:
+                passed = False
+        scores.append(1.0 if passed else 0.0)
+    return {"pass@1": sum(scores) / float(len(scores)) if scores else 0.0}
+
+
 def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict[str, Any]:
     """Return task configuration dictionary for `mgsm_ar`, `arc_challenge`, `humaneval`, and metadata stubs."""
     key = task_name.strip().lower()
@@ -1269,14 +1300,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "metadata": {"version": 1.0},
         }
     if key == "humaneval":
-        try:
-            from lm_eval.tasks.humaneval.utils import pass_at_k
-        except Exception:
-
-            def pass_at_k(references: List[str], predictions: List[List[str]], k: Optional[List[int]] = None) -> Dict[str, float]:  # type: ignore
-                _ = (references, predictions, k)
-                return {"pass@1": 0.0}
-
+        pass_at_k = _safe_humaneval_pass_at_k
         return {
             "task": "humaneval",
             "dataset_path": "openai/openai_humaneval",
@@ -1325,14 +1349,7 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "metadata": {"version": 1.0},
         }
     if key == "humaneval_instruct":
-        try:
-            from lm_eval.tasks.humaneval.utils import pass_at_k
-        except Exception:
-
-            def pass_at_k(references: List[str], predictions: List[List[str]], k: Optional[List[int]] = None) -> Dict[str, float]:  # type: ignore
-                _ = (references, predictions, k)
-                return {"pass@1": 0.0}
-
+        pass_at_k = _safe_humaneval_pass_at_k
         return {
             "task": "humaneval_instruct",
             "dataset_path": "openai/openai_humaneval",
@@ -2207,11 +2224,10 @@ def _configure_lm_eval_thinking_for_task(
     task_name: str = "",
     model_key_prefix: str = "e4b",
 ) -> None:
-    """Configure `enable_thinking`, `think_end_token`, `eos_token`, and `<|channel>thought` prefill per task.
+    """Configure `enable_thinking`, `think_end_token`, and `eos_token` per task on `VLLM` or `HFLM`.
 
     - `mmlu_pro` runs with `enable_thinking=True` (matching Google's official Gemma 4 Model Card table).
-    - On `26b_a4b`, `mmlu_pro` prefills `<|channel>thought\\nLet's carefully analyze...` after `<|turn>model\\n`
-      so the model never emits an empty `<|channel>thought\\n<channel|>` block on 5-shot CoT prompts.
+    - `arc_challenge`, `gsm8k`, and `humaneval` run with `enable_thinking=False`.
     - On `26b_a4b` when `apply_chat_template=False`, `tokenizer.eos_token` is set to `<eos>` (`1`) so
       `lm_eval`'s `eot_token_id` does not inject `<turn|>` (`106`) as a token-0 stop sequence.
     """
@@ -2228,29 +2244,6 @@ def _configure_lm_eval_thinking_for_task(
                     tok.eos_token_id = 1
             except Exception:
                 pass
-        if hasattr(lm_obj, "apply_chat_template"):
-            orig_apply = getattr(lm_obj, "_orig_apply_chat_template", None)
-            if orig_apply is None:
-                orig_apply = lm_obj.apply_chat_template
-                setattr(lm_obj, "_orig_apply_chat_template", orig_apply)
-            if use_thinking:
-
-                def _thinking_prefilled_chat_template(
-                    chat_history: Any, add_generation_prompt: bool = True
-                ) -> str:
-                    rendered = str(
-                        orig_apply(chat_history, add_generation_prompt=add_generation_prompt)
-                    )
-                    if add_generation_prompt and rendered.endswith("<|turn>model\n"):
-                        return (
-                            rendered
-                            + "<|channel>thought\nLet's carefully analyze the question and verify each option step by step:\n"
-                        )
-                    return rendered
-
-                lm_obj.apply_chat_template = _thinking_prefilled_chat_template
-            else:
-                lm_obj.apply_chat_template = orig_apply
     if effective_use_vllm:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = use_thinking
