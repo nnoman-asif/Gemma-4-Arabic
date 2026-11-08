@@ -606,7 +606,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(
             _get_lm_eval_gen_kwargs("humaneval", model_key_prefix="26b_a4b"),
             {
-                "max_gen_toks": 1024,
+                "max_gen_toks": 4096,
                 "until": ["\nif __name__", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
                 "ignore_eos": True,
                 "do_sample": False,
@@ -780,12 +780,6 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(
             _strip_thinking_blocks("<turn|>\n<|turn>model\n<|channel>thought\nLet's think\n<channel|>    return a + b"),
             "    return a + b",
-        )
-        self.assertEqual(
-            _strip_thinking_blocks(
-                "    pass\n```\n<turn|>\n<|turn>model\n<|channel>thought\n<channel|>```python\ndef foo(a, b):\n    return a + b\n```<turn|>"
-            ),
-            "```python\ndef foo(a, b):\n    return a + b\n```",
         )
         self.assertEqual(
             _strip_thinking_blocks("<|channel>thought\nUnclosed thought with The answer is (D)"),

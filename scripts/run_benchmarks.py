@@ -364,12 +364,6 @@ _EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
 def _strip_thinking_blocks(text: str) -> str:
     """Remove Gemma 4 `<|think|>`, `<think>`, and `<|channel>thought...<channel|>` blocks and post-`<turn|>` babble without stripping line-1 indentation."""
     s = str(text or "")
-    # Strip any short prompt-closing stub (e.g. `pass\n```\n<turn|>\n<|turn>model\n`) emitted before starting a model turn
-    s = re.sub(
-        r"^(?:[ \t]*(?:#[^\r\n]*|pass|\.\.\.)?[ \t]*\r?\n)*[ \t]*```[ \t]*\r?\n?\s*<turn\|>\s*(?:(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?)?(?=\S)",
-        "",
-        s,
-    )
     # Strip any leading turn-transition prefix or bare leading <turn|> at token 0 before splitting on end-of-turn markers
     s = re.sub(
         r"^\s*(?:<turn\|>\s*)*(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?",
@@ -982,10 +976,6 @@ def _extract_humaneval_code(raw_resp: str, prompt: str, entry_point: str) -> str
                 cleaned,
                 flags=re.DOTALL,
             )
-
-        if not first_fence_is_opening_lang and prefix_has_code and prefix_before_fence.strip():
-            candidates.append(_assemble_from_body(prefix_before_fence))
-            candidates.append(_assemble_from_full_def(prefix_before_fence))
 
         if tagged_blocks:
             # Prefer blocks containing `def <entry_str>` or `return`/`yield`, ordered from last to first
@@ -2176,7 +2166,7 @@ def _get_lm_eval_gen_kwargs(
         }
     if clean == "humaneval" and model_key_prefix == "26b_a4b":
         return {
-            "max_gen_toks": 1024,
+            "max_gen_toks": 4096,
             "until": [
                 "\nif __name__",
                 "<end_of_turn>",
