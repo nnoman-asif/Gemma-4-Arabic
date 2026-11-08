@@ -598,7 +598,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             _get_lm_eval_gen_kwargs("gsm8k", model_key_prefix="26b_a4b"),
             {
                 "max_gen_toks": 4096,
-                "until": ["\nQuestion:", "<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["\nQuestion:", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "ignore_eos": True,
                 "do_sample": False,
                 "temperature": 0.0,
             },
@@ -619,22 +620,6 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True))
         self.assertTrue(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
-        moe_arc_tasks, moe_arc_key, moe_arc_lim = resolve_lm_eval_task_specs(
-            "arc_challenge", num_fewshot=25, limit=200, model_key_prefix="26b_a4b"
-        )
-        self.assertIsInstance(moe_arc_tasks[0], dict)
-        self.assertEqual(moe_arc_key, "arc_challenge")
-        self.assertEqual(moe_arc_lim, 200)
-        self.assertEqual(
-            resolve_lm_eval_task_specs("mmlu_pro", num_fewshot=5, limit=200, model_key_prefix="26b_a4b"),
-            (["mmlu_pro"], "mmlu_pro", 15),
-        )
-        e4b_arc_tasks, e4b_arc_key, e4b_arc_lim = resolve_lm_eval_task_specs(
-            "arc_challenge", num_fewshot=25, limit=200, model_key_prefix="e4b"
-        )
-        self.assertIsInstance(e4b_arc_tasks[0], dict)
-        self.assertEqual(e4b_arc_key, "arc_challenge")
-        self.assertEqual(e4b_arc_lim, 200)
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("humaneval", True, model_key_prefix="26b_a4b"))
@@ -665,10 +650,6 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             think_end_token: Any = None
             chat_template_args: Dict[str, Any] = {}
             tokenizer = _MockTok()
-
-            def apply_chat_template(self, chat_history: Any, add_generation_prompt: bool = True) -> str:
-                _ = chat_history
-                return "<bos><|turn>user\nQ<turn|>\n<|turn>model\n" if add_generation_prompt else "<bos>"
 
         mock_vllm = _MockLMObj()
         _configure_lm_eval_thinking_for_task(

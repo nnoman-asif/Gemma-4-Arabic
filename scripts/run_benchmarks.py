@@ -364,13 +364,12 @@ _EASTERN_ARABIC_DIGIT_MAP = str.maketrans(
 def _strip_thinking_blocks(text: str) -> str:
     """Remove Gemma 4 `<|think|>`, `<think>`, and `<|channel>thought...<channel|>` blocks and post-`<turn|>` babble without stripping line-1 indentation."""
     s = str(text or "")
-    # Strip any leading turn-transition prefix or bare leading <turn|> at token 0 before splitting on end-of-turn markers
+    # Strip any leading turn-transition prefix before splitting on end-of-turn markers
     s = re.sub(
         r"^\s*(?:<turn\|>\s*)*(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?",
         "",
         s,
     )
-    s = re.sub(r"^\s*(?:<turn\|>\s*)+", "", s)
     # Truncate at the first end-of-turn / EOS marker so post-turn babble is never parsed
     for eot in ("<turn|>", "<eos>", "<end_of_turn>", "<|im_end|>", "</s>"):
         if eot in s:
@@ -666,25 +665,6 @@ def _extract_arc_mcq_filter(
 def _process_mmlu_pro_docs(dataset: Any) -> Any:
     """Format `TIGER-Lab/MMLU-Pro` rows with `A-J` option letters for `<|think|>`-aware generative evaluation."""
     letters = "ABCDEFGHIJ"
-
-    try:
-        col_names = list(getattr(dataset, "column_names", []) or [])
-        if "category" in col_names and hasattr(dataset, "select") and len(dataset) > 0:
-            cats = dataset["category"]
-            by_cat: Dict[str, List[int]] = {}
-            for idx, c in enumerate(cats):
-                by_cat.setdefault(str(c), []).append(idx)
-            if len(by_cat) > 1:
-                ordered_cats = sorted(by_cat.keys())
-                interleaved: List[int] = []
-                max_len = max(len(v) for v in by_cat.values())
-                for pos in range(max_len):
-                    for c in ordered_cats:
-                        if pos < len(by_cat[c]):
-                            interleaved.append(by_cat[c][pos])
-                dataset = dataset.select(interleaved)
-    except Exception:
-        pass
 
     def _map_row(doc: Dict[str, Any]) -> Dict[str, Any]:
         options = list(doc.get("options") or [])
@@ -1064,39 +1044,6 @@ def _build_humaneval_completion_predictions(
     return out
 
 
-def _safe_humaneval_pass_at_k(
-    references: List[str],
-    predictions: List[Any],
-    k: Optional[List[int]] = None,
-) -> Dict[str, float]:
-    """Execute HumanEval candidate code + unit tests in an isolated `subprocess.run` child process with a strict 3s timeout (never calls `fork()` inside `vLLM`)."""
-    _ = k
-    if not references or not predictions:
-        return {"pass@1": 0.0}
-    scores: List[float] = []
-    for ref, pred_item in zip(references, predictions):
-        cand_list = pred_item if isinstance(pred_item, (list, tuple)) else [pred_item]
-        passed = False
-        for cand in cand_list[:1]:
-            full_program = f"{cand}\n\n{ref}\n"
-            try:
-                proc = subprocess.run(
-                    [sys.executable, "-I", "-c", full_program],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3.0,
-                    check=False,
-                )
-                if proc.returncode == 0:
-                    passed = True
-                    break
-            except Exception:
-                passed = False
-        scores.append(1.0 if passed else 0.0)
-    return {"pass@1": sum(scores) / float(len(scores)) if scores else 0.0}
-
-
 def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict[str, Any]:
     """Return task configuration dictionary for `mgsm_ar`, `arc_challenge`, `humaneval`, and metadata stubs."""
     key = task_name.strip().lower()
@@ -1290,7 +1237,14 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "metadata": {"version": 1.0},
         }
     if key == "humaneval":
-        pass_at_k = _safe_humaneval_pass_at_k
+        try:
+            from lm_eval.tasks.humaneval.utils import pass_at_k
+        except Exception:
+
+            def pass_at_k(references: List[str], predictions: List[List[str]], k: Optional[List[int]] = None) -> Dict[str, float]:  # type: ignore
+                _ = (references, predictions, k)
+                return {"pass@1": 0.0}
+
         return {
             "task": "humaneval",
             "dataset_path": "openai/openai_humaneval",
@@ -1339,7 +1293,14 @@ def build_custom_lm_eval_task_dict(task_name: str, num_fewshot: int = 0) -> Dict
             "metadata": {"version": 1.0},
         }
     if key == "humaneval_instruct":
-        pass_at_k = _safe_humaneval_pass_at_k
+        try:
+            from lm_eval.tasks.humaneval.utils import pass_at_k
+        except Exception:
+
+            def pass_at_k(references: List[str], predictions: List[List[str]], k: Optional[List[int]] = None) -> Dict[str, float]:  # type: ignore
+                _ = (references, predictions, k)
+                return {"pass@1": 0.0}
+
         return {
             "task": "humaneval_instruct",
             "dataset_path": "openai/openai_humaneval",
@@ -1407,10 +1368,8 @@ def resolve_lm_eval_task_specs(
     task_name: str,
     num_fewshot: int = 0,
     limit: Optional[int] = None,
-    model_key_prefix: str = "e4b",
 ) -> Tuple[List[Union[str, Dict[str, Any]]], str, Optional[int]]:
     """Resolve a benchmark's `lm_eval_task` into `(tasks_arg, primary_result_key, effective_limit)`."""
-    _ = model_key_prefix
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
 
@@ -2151,6 +2110,20 @@ def _get_lm_eval_gen_kwargs(
             "temperature": 0.0,
         }
     if clean == "gsm8k":
+        if model_key_prefix == "26b_a4b":
+            return {
+                "max_gen_toks": 4096,
+                "until": [
+                    "\nQuestion:",
+                    "<end_of_turn>",
+                    "<eos>",
+                    "</s>",
+                    "<|im_end|>",
+                ],
+                "ignore_eos": True,
+                "do_sample": False,
+                "temperature": 0.0,
+            }
         return {
             "max_gen_toks": 4096,
             "until": [
@@ -2186,7 +2159,7 @@ def _should_apply_chat_template_for_task(
     apply_chat_template: bool,
     model_key_prefix: str = "e4b",
 ) -> bool:
-    """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`, plus `arc_challenge` on `26b_a4b`) and `False` for raw completion benchmarks."""
+    """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`) and `False` for standard completion/log-likelihood benchmarks."""
     clean = task_name.strip().lower()
     if model_key_prefix == "26b_a4b" and clean == "arc_challenge":
         return bool(apply_chat_template)
@@ -2217,7 +2190,7 @@ def _configure_lm_eval_thinking_for_task(
     """Configure `enable_thinking`, `think_end_token`, and `eos_token` per task on `VLLM` or `HFLM`.
 
     - `mmlu_pro` runs with `enable_thinking=True` (matching Google's official Gemma 4 Model Card table).
-    - `arc_challenge`, `gsm8k`, and `humaneval` run with `enable_thinking=False`.
+    - `arc_challenge`, `gsm8k`, and `humaneval` run with `apply_chat_template=False` and `enable_thinking=False`.
     - On `26b_a4b` when `apply_chat_template=False`, `tokenizer.eos_token` is set to `<eos>` (`1`) so
       `lm_eval`'s `eot_token_id` does not inject `<turn|>` (`106`) as a token-0 stop sequence.
     """
@@ -2509,8 +2482,8 @@ def _evaluate_checkpoint_with_lm_eval(
         try:
             from lm_eval.models.vllm_causallms import VLLM
 
-            vllm_add_bos = True if model_key_prefix == "26b_a4b" else None
             model_dir = pathlib.Path(model_path)
+            vllm_add_bos = True if model_key_prefix == "26b_a4b" else None
             if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
                 adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
                 base_model_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
@@ -2639,7 +2612,6 @@ def _evaluate_checkpoint_with_lm_eval(
                 task_name=task_name,
                 num_fewshot=num_fewshot,
                 limit=limit,
-                model_key_prefix=model_key_prefix,
             )
             task_chat_tpl = _should_apply_chat_template_for_task(
                 task_name,
