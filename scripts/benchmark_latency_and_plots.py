@@ -405,8 +405,8 @@ def generate_all_family_plots(
     except ImportError:
         logger.warning("matplotlib not found; using pure-Python SVG/PNG fallback generator.")
         for stem, title, sub in [
-            ("oall_v2_arabic_comparison", "Gemma-4-Arabic Family: 7 Arabic & Saudi Benchmarks", "E4B Base vs E4B Arabic-It vs 26B-A4B Base vs 26B-A4B Arabic-It"),
-            ("zero_forgetting_retention_shield", "Zero-Forgetting Retention Gate (English / Math / Code)", f"Min Retention Ratio >= {gate_pct:.1f}% across MMLU-Pro, GSM8K, HumanEval, ARC-C"),
+            ("oall_v2_arabic_comparison", "Gemma-4-Arabic Family: 6 Arabic & Saudi Benchmarks", "E4B Base vs E4B Arabic-It vs 26B-A4B Base vs 26B-A4B Arabic-It"),
+            ("zero_forgetting_retention_shield", "Zero-Forgetting Retention Shield (English / Math / Code)", "Retention Ratios across MMLU-Pro, GSM8K, HumanEval, ARC-Challenge"),
             ("iso_active_latency_vram_pareto", "Iso-Active Inference Efficiency: Decode Throughput vs VRAM", "E4B (4.0B Active) vs 26B-A4B MoE (3.8B Active)"),
             ("sft_dpo_training_curves", "Stage 1 rsLoRA SFT Loss & Stage 2 Trust-Region DPO Reward Margin", "Dual-Model Training Convergence on 2x A100 80GB"),
         ]:
@@ -423,7 +423,7 @@ def generate_all_family_plots(
     )
 
     # -------------------------------------------------------------------------
-    # Plot 1: 4-Bar Grouped Arabic & Saudi Benchmark Comparison (7 Suites)
+    # Plot 1: 4-Bar Grouped Arabic & Saudi Benchmark Comparison (6 Suites)
     # -------------------------------------------------------------------------
     labels = list(ar_benchmarks.keys())
     e4b_ar_real = real_e4b.get("arabic_benchmarks", {})
@@ -462,7 +462,7 @@ def generate_all_family_plots(
 
     ax1.set_ylabel("Benchmark Score (%)", fontsize=12, fontweight="bold", color="#0f172a")
     ax1.set_title(
-        "Gemma-4-Arabic Iso-Active Family: Arabic & Saudi Benchmark Progression (7 Suites)",
+        f"Gemma-4-Arabic Iso-Active Family: Arabic & Saudi Benchmark Progression ({len(labels)} Suites)",
         fontsize=14,
         fontweight="bold",
         color="#0f172a",
@@ -565,13 +565,12 @@ def generate_all_family_plots(
     ratios_moe = [100.0 * (t / max(1e-6, b)) for t, b in zip(r_moe_tuned, r_moe_base)]
     rr1 = ax2_right.bar(rx - 0.15, ratios_e4b, 0.28, label="Gemma-4-E4B-Arabic-It Retention (%)", color="#0284c7")
     rr2 = ax2_right.bar(rx + 0.15, ratios_moe, 0.28, label="Gemma-4-26B-A4B-Arabic-It Retention (%)", color="#16a34a")
-    ax2_right.axhline(gate_pct, color="#dc2626", linestyle="--", linewidth=2.0, label=f"Zero-Forgetting Gate ({gate_pct:.2f}%)")
     ax2_right.set_xticks(rx)
     ax2_right.set_xticklabels(ret_labels, fontsize=10.5, fontweight="bold")
-    all_ratios = ratios_e4b + ratios_moe + [gate_pct]
+    all_ratios = ratios_e4b + ratios_moe
     ax2_right.set_ylim(max(0.0, min(all_ratios) - 5.0), max(all_ratios) + 3.5)
     ax2_right.set_ylabel("Retention Ratio (%)", fontsize=11, fontweight="bold")
-    ax2_right.set_title(f"Zero-Forgetting Retention Shield (>= {gate_pct:.1f}% Required)", fontsize=12.5, fontweight="bold")
+    ax2_right.set_title("Zero-Forgetting Retention Shield", fontsize=12.5, fontweight="bold")
     ax2_right.legend(loc="lower right", fontsize=8.5)
 
     for rect_group, col in [(rr1, "#0369a1"), (rr2, "#15803d")]:

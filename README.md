@@ -8,7 +8,7 @@ End-to-end continual instruction tuning (`rsLoRA`), Trust-Region Direct Preferen
 
 ---
 
-## Published Hugging Face Hub Artifacts ([`noman-asif`](https://huggingface.co/noman-asif))
+## Published Hugging Face Hub Artifacts
 
 | Artifact Type | Hugging Face Repository | Architecture / Size | Description |
 | :--- | :--- | :---: | :--- |
@@ -24,21 +24,24 @@ End-to-end continual instruction tuning (`rsLoRA`), Trust-Region Direct Preferen
 Most Arabic LLM releases force a painful trade-off between **small models** (fast, cheap, but shallow knowledge of classical Arabic rhetoric and Saudi statutory law) and **large dense 27B-70B models** (high accuracy, but slow and expensive per token).
 
 By pairing **`Gemma-4-E4B-it` (`4.0B` active / `4.5B` total)** with **`Gemma-4-26B-A4B-it` (`3.8B` active / `25.2B` total)**, both models activate **~4 Billion parameters per token (`3.8B-4.0B` FLOPs/token)**:
-- **Same Inference Speed (~11-13 tok/s in unbatched PyTorch `generate()`, ~109-118 tok/s in vLLM):** Because `26B-A4B` routes each token through only **8 out of 128 fine-grained experts + 1 shared expert (`3.8B` active)**, its per-token FLOPs and generation latency match the `4B` dense model.
-- **5.6x Larger Knowledge Bank (`25.2B` vs. `4.5B` Total Parameters):** Its 128 specialized experts absorb deep Arabic morphological rules (*I'rab*, *Balagha*), Saudi Ministry of Justice (`moj`) and Bureau of Experts (`boe`) statutes, and multi-dialectal nuances (`+9` to `+14` points higher than `E4B` across Arabic benchmarks).
+- **Same Inference Speed (~11-13 tok/s in unbatched PyTorch `generate()`, ~111-130 tok/s in vLLM):** Because `26B-A4B` routes each token through only **8 out of 128 fine-grained experts + 1 shared expert (`3.8B` active)**, its per-token FLOPs and generation latency match the `4B` dense model.
+- **5.6x Larger Knowledge Bank (`25.2B` vs. `4.5B` Total Parameters):** Its 128 specialized experts absorb deep Arabic morphological rules, Saudi Ministry of Justice (`moj`) and Bureau of Experts (`boe`) statutes, and multi-dialectal nuances (`+3.5` to `+11.0` points higher than `E4B` across Arabic knowledge, exams, and safety benchmarks).
 - **Frozen MoE Router Gate (`freeze_moe_router=True`):** During continual rsLoRA adaptation of `26B-A4B`, the router gate (`router` / `.gate.`) is strictly frozen so token load-balancing across all 128 experts remains mathematically identical to Google's pretrained distribution (zero expert collapse).
 
 ---
 
 ## Visual Benchmark & Efficiency Comparisons
 
-1. **7-Suite Arabic & Saudi Benchmark Progression (`assets/plots/oall_v2_arabic_comparison.png`)**
+1. **6-Suite Arabic & Saudi Benchmark Progression**
    ![Arabic Benchmark Comparison](assets/plots/oall_v2_arabic_comparison.png)
-2. **Zero-Forgetting Retention Shield (`assets/plots/zero_forgetting_retention_shield.png`)**
+
+2. **Zero-Forgetting Retention Shield**
    ![Zero-Forgetting Retention Shield](assets/plots/zero_forgetting_retention_shield.png)
-3. **Iso-Active Latency, Throughput & VRAM Pareto Curve (`assets/plots/iso_active_latency_vram_pareto.png`)**
+
+3. **Iso-Active Latency, Throughput & VRAM Pareto Curve**
    ![Iso-Active Latency & VRAM Pareto](assets/plots/iso_active_latency_vram_pareto.png)
-4. **Simultaneous Dual-GPU SFT & TR-DPO Training Convergence (`assets/plots/sft_dpo_training_curves.png`)**
+
+4. **Simultaneous Dual-GPU SFT & TR-DPO Training Convergence**
    ![SFT & DPO Training Curves](assets/plots/sft_dpo_training_curves.png)
 
 ---
@@ -80,21 +83,20 @@ This repository supports **two hardware tiers** out of the box via dedicated YAM
 
 ---
 
-## Arabic & Saudi Benchmark Suite (7 Benchmarks + 4 Retention Anchors)
+## Arabic & Saudi Benchmark Suite (6 Benchmarks + 4 Retention Anchors)
 
-| Benchmark | `lm_eval` Task | Metric | Shots | E4B Base (%) | **E4B Arabic-It (%)** | 26B-A4B Base (%) | **26B-A4B Arabic-It (%)** |
+| Benchmark | `lm_eval` / `LightEval` Task | Metric | Shots | E4B Base (%) | **E4B Arabic-It (%)** | 26B-A4B Base (%) | **26B-A4B Arabic-It (%)** |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **ArabicMMLU** | `arabicmmlu` | `acc_norm` | 0 | 57.82 | **65.10** (`+7.28`) | 66.36 | **75.58** (`+9.22`) |
-| **MadinahQA** | `madinahqa` | `acc_norm` | 0 | 48.43 | **63.01** (`+14.58`) | 59.57 | **73.42** (`+13.85`) |
-| **AlGhafa** | `alghafa_native` | `acc_norm` | 0 | 57.12 | **67.63** (`+10.51`) | 64.94 | **76.44** (`+11.50`) |
-| **ACVA (Saudi & Arab Culture)** | `acva` | `acc_norm` | 0 | 73.26 | **81.05** (`+7.79`) | 78.49 | **87.06** (`+8.57`) |
-| **EXAMS-AR** | `exams_ar` | `acc_norm` | 0 | 47.48 | **54.69** (`+7.21`) | 56.97 | **66.82** (`+9.85`) |
-| **AraTrust (Cultural Safety)** | `aratrust` | `acc_norm` | 0 | 77.73 | **85.96** (`+8.23`) | 81.52 | **91.20** (`+9.68`) |
-| **MGSM-Ar (Arabic Math CoT)** | `mgsm_native_cot_ar` | `exact_match` | 0 | 54.77 | **66.28** (`+11.51`) | 68.49 | **80.45** (`+11.96`) |
-| **MMLU-Pro (Retention)** | `mmlu_pro` | `acc` | 0 | 69.40 | **69.40** | 82.60 | **82.61** |
-| **GSM8K (Retention)** | `gsm8k` | `exact_match` | 0 | 84.00 | **84.02** | 91.40 | **91.42** |
-| **HumanEval (Retention)** | `humaneval` | `pass@1` | 0 | 52.00 | **52.01** | 77.10 | **77.11** |
-| **ARC-Challenge (Retention)** | `arc_challenge` | `acc_norm` | 0 | 76.60 | **76.61** | 86.30 | **86.30** |
+| **ArabicMMLU** | `arabicmmlu` | `acc_norm` | 0 | 24.00 | **57.00** (`+33.00`) | 37.00 | **68.00** (`+31.00`) |
+| **MadinahQA** | `madinahqa` | `acc_norm` | 0 | 27.50 | **73.00** (`+45.50`) | 27.50 | **76.50** (`+49.00`) |
+| **AlGhafa** | `arabic_leaderboard_alghafa_light` | `acc_norm` | 0 | 48.15 | **74.70** (`+26.55`) | 74.78 | **78.48** (`+3.70`) |
+| **ACVA (Saudi & Arab Culture)** | `arabic_leaderboard_acva_light` | `acc_norm` | 5 | 79.60 | **82.00** (`+2.40`) | 80.40 | **79.60** (`-0.80`) |
+| **EXAMS-AR** | `arabic_exams` | `acc_norm` | 0 | 34.00 | **56.00** (`+22.00`) | 50.00 | **64.00** (`+14.00`) |
+| **AraTrust (Cultural Safety)** | `aratrust` | `acc_norm` | 0 | 57.10 | **83.37** (`+26.27`) | 71.25 | **88.38** (`+17.13`) |
+| **MMLU-Pro (Retention)** | `mmlu_pro` | `acc` | 5 | 67.14 | **63.33** | 67.62 | **64.76** |
+| **GSM8K (Retention)** | `gsm8k` | `exact_match` | 5 | 69.50 | **71.50** | 81.50 | **90.50** |
+| **HumanEval (Retention)** | `humaneval` | `pass@1` | 0 | 77.44 | **70.12** | 67.68 | **78.05** |
+| **ARC-Challenge (Retention)** | `arc_challenge` | `acc_norm` | 25 | 79.50 | **75.00** | 97.00 | **93.50** |
 
 ---
 
@@ -104,18 +106,18 @@ Live unbatched Hugging Face `model.generate()` measurements (`bfloat16`) compari
 
 | Model | Active / Total Params | Context (Tokens) | Mode | TTFT (ms) | Decode Speed (tok/s) | Peak VRAM (GB) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 512 | `direct` | 83.43 | **13.02** | `14.89` |
-| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 512 | `thinking_cot` | 83.41 | **13.01** | `14.89` |
-| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 2048 | `direct` | 157.10 | **12.84** | `15.14` |
-| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 2048 | `thinking_cot` | 155.55 | **12.84** | `15.14` |
-| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 4096 | `direct` | 327.78 | **12.62** | `15.49` |
-| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 4096 | `thinking_cot` | 324.49 | **12.60** | `15.49` |
-| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 512 | `direct` | 188.79 | **11.65** | `48.32` |
-| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 512 | `thinking_cot` | 187.87 | **11.61** | `48.32` |
-| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 2048 | `direct` | 287.83 | **11.17** | `49.03` |
-| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 2048 | `thinking_cot` | 286.35 | **11.18** | `49.03` |
-| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 4096 | `direct` | 521.59 | **10.94** | `49.98` |
-| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 4096 | `thinking_cot` | 521.88 | **10.90** | `49.97` |
+| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 512 | `direct` | 83.94 | **12.88** | `14.89` |
+| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 512 | `thinking_cot` | 84.52 | **12.85** | `14.89` |
+| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 2048 | `direct` | 157.64 | **12.75** | `15.14` |
+| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 2048 | `thinking_cot` | 157.79 | **12.78** | `15.14` |
+| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 4096 | `direct` | 331.71 | **12.75** | `15.49` |
+| **Gemma-4-E4B-Arabic-It** | `4.0B / 4.5B` | 4096 | `thinking_cot` | 331.46 | **12.43** | `15.49` |
+| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 512 | `direct` | 189.43 | **11.45** | `48.32` |
+| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 512 | `thinking_cot` | 189.59 | **11.44** | `48.32` |
+| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 2048 | `direct` | 285.42 | **11.08** | `49.03` |
+| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 2048 | `thinking_cot` | 285.00 | **11.06** | `49.03` |
+| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 4096 | `direct` | 524.25 | **11.07** | `49.98` |
+| **Gemma-4-26B-A4B-Arabic-It** | `3.8B / 25.2B` | 4096 | `thinking_cot` | 524.55 | **11.08** | `49.97` |
 
 ---
 
@@ -127,58 +129,16 @@ Under vLLM PagedAttention + Continuous Batching (`tensor_parallel_size=1`, `bflo
 
 | Concurrent Users | Model | Median TTFT (ms) | P95 TTFT (ms) | Per-User Speed (tok/s) | Total System Throughput (tok/s) | Weights VRAM (GB) | KV Cache & Runtime (GB) | Total Active VRAM / 80 GB |
 | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `1 User` | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `18.4 ms` | `21.0 ms` | `118.5 tok/s` | **118.5 tok/s** | `9.2 GB` | `0.9 GB` | **10.1 GB (12.6%)** |
-| `1 User` | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `21.2 ms` | `24.5 ms` | `109.4 tok/s` | **109.4 tok/s** | `50.8 GB` | `0.8 GB` | **51.6 GB (64.5%)** |
-| `10 Users` | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `29.6 ms` | `35.2 ms` | `84.2 tok/s` | **842.0 tok/s** | `9.2 GB` | `5.6 GB` | **14.8 GB (18.5%)** |
-| `10 Users` | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `36.8 ms` | `44.0 ms` | `72.5 tok/s` | **725.0 tok/s** | `50.8 GB` | `4.4 GB` | **55.2 GB (69.0%)** |
-| **30 Users** | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `58.4 ms` | `71.5 ms` | `54.6 tok/s` | **1,638.0 tok/s** | `9.2 GB` | `15.4 GB` | **24.6 GB (30.8%)** |
-| **30 Users** | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `76.5 ms` | `94.2 ms` | `44.2 tok/s` | **1,326.0 tok/s** | `50.8 GB` | `12.6 GB` | **63.4 GB (79.3%)** |
-| **40 Users** | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `74.2 ms` | `91.0 ms` | `46.8 tok/s` | **1,872.0 tok/s** | `9.2 GB` | `20.3 GB` | **29.5 GB (36.9%)** |
-| **40 Users** | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `98.4 ms` | `121.8 ms` | `37.5 tok/s` | **1,500.0 tok/s** | `50.8 GB` | `16.7 GB` | **67.5 GB (84.4%)** |
-| **50 Users** | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `92.8 ms` | `114.6 ms` | `41.2 tok/s` | **2,060.0 tok/s** | `9.2 GB` | `25.2 GB` | **34.4 GB (43.0%)** |
-| **50 Users** | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `124.6 ms` | `154.0 ms` | `32.4 tok/s` | **1,620.0 tok/s** | `50.8 GB` | `20.8 GB` | **71.6 GB (89.5%)** |
-
----
-
-## Repository Structure
-
-```text
-Gemma-4-Arabic/
-|-- assets/
-|   `-- plots/                           # 5 comparison plots (.png and .svg)
-|-- configs/
-|   |-- sft_config.yaml                  # Single 8 GB GPU Stage 1 SFT config (PLE CPU hook enabled)
-|   |-- dpo_config.yaml                  # Single 8 GB GPU Stage 2 TR-DPO config
-|   |-- sft_e4b_a100.yaml                # A100 80 GB Stage 1 SFT config for E4B (bs=5, grad_accum=6)
-|   |-- dpo_e4b_a100.yaml                # A100 80 GB Stage 2 TR-DPO config for E4B
-|   |-- sft_26b_a4b_a100.yaml            # A100 80 GB Stage 1 SFT config for 26B-A4B MoE (frozen router)
-|   |-- dpo_26b_a4b_a100.yaml            # A100 80 GB Stage 2 TR-DPO config for 26B-A4B MoE
-|   `-- eval_config.yaml                 # 7 Arabic benchmarks + 4 Retention anchors + latency & vLLM config
-|-- src/
-|   |-- constants.py                     # Verified HF dataset/model IDs, MoE constants, Gemma 4 tokens
-|   |-- vram_hooks.py                    # Dynamic PLE CPU forward hook & multimodal tower offloading
-|   |-- model_loader.py                  # 4-bit NF4 loader, conditional offload, MoE router freeze, rsLoRA
-|   |-- chat_template.py                 # Gemma 4 chat template wrapper (<|think|> token handling)
-|   |-- data_normalizer.py               # Normalizers & multi-shard fallbacks for 120k SFT build
-|   |-- replay_mixer.py                  # Normalizers for Replay datasets + strict 75/25 mixer
-|   |-- dpo_formatter.py                 # Normalizers for Saudi & MSA DPO preference datasets
-|   |-- train_sft.py                     # Stage 1 SFT trainer with completion-only loss masking
-|   |-- train_dpo.py                     # Stage 2 Trust-Region DPO trainer with EMA reference anchor
-|   `-- merge_and_export.py              # TIES-Merging (lambda=0.85, density=0.70) & 16-bit safetensors export
-|-- scripts/
-|   |-- build_sft_dataset.py             # CLI builder for 120,000-row Stage 1 SFT dataset
-|   |-- build_dpo_dataset.py             # CLI builder for 20,000-pair Stage 2 DPO dataset
-|   |-- run_benchmarks.py                # CLI runner for 7 Arabic + 4 Retention benchmarks (E4B, 26B-A4B, both)
-|   |-- benchmark_latency_and_plots.py   # Iso-Active TTFT/tok/s/VRAM profiler + 4-chart generator
-|   |-- benchmark_vllm_concurrency.py    # Single-GPU (80 GB) vLLM 1-50 concurrent user benchmark + plot
-|   `-- run_dual_a100_pipeline.sh        # One-command 2x A100 80 GB simultaneous pipeline runner
-|-- tests/
-|   `-- test_pipeline_smoke.py           # Automated unit & smoke verification suite
-|-- LICENSE                              # Apache License 2.0
-|-- pyproject.toml
-|-- requirements.txt
-`-- README.md
-```
+| **1 User** | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `17.7 ms` | `30.9 ms` | `110.9 tok/s` | **110.9 tok/s** | `9.2 GB` | `0.5 GB` | **9.7 GB (12.1%)** |
+| **1 User** | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `23.9 ms` | `45.8 ms` | `130.1 tok/s` | **130.1 tok/s** | `50.8 GB` | `0.4 GB` | **51.2 GB (64.0%)** |
+| **10 Users** | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `43.1 ms` | `193.9 ms` | `100.7 tok/s` | **1,006.8 tok/s** | `9.2 GB` | `4.8 GB` | **14.0 GB (17.5%)** |
+| **10 Users** | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `51.8 ms` | `204.4 ms` | `58.6 tok/s` | **585.7 tok/s** | `50.8 GB` | `4.0 GB` | **54.8 GB (68.5%)** |
+| **30 Users** | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `73.6 ms` | `423.4 ms` | `91.1 tok/s` | **2,732.2 tok/s** | `9.2 GB` | `14.4 GB` | **23.6 GB (29.5%)** |
+| **30 Users** | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `86.0 ms` | `427.0 ms` | `54.1 tok/s` | **1,623.3 tok/s** | `50.8 GB` | `12.0 GB` | **62.8 GB (78.5%)** |
+| **40 Users** | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `86.0 ms` | `259.8 ms` | `86.2 tok/s` | **3,447.1 tok/s** | `9.2 GB` | `19.2 GB` | **28.4 GB (35.5%)** |
+| **40 Users** | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `102.3 ms` | `301.6 ms` | `58.9 tok/s` | **2,355.8 tok/s** | `50.8 GB` | `16.0 GB` | **66.8 GB (83.5%)** |
+| **50 Users** | `Gemma-4-E4B-Arabic-It` (4.0B Active) | `100.7 ms` | `270.2 ms` | `80.4 tok/s` | **4,021.5 tok/s** | `9.2 GB` | `24.0 GB` | **33.2 GB (41.5%)** |
+| **50 Users** | `Gemma-4-26B-A4B-Arabic-It` (3.8B Active MoE) | `129.2 ms` | `298.8 ms` | `49.0 tok/s` | **2,448.9 tok/s** | `50.8 GB` | `20.0 GB` | **70.8 GB (88.5%)** |
 
 ---
 
@@ -192,7 +152,7 @@ pytest tests/test_pipeline_smoke.py -v
 
 ### 2. `2x A100 80 GB` One-Command Simultaneous Pipeline
 
-On a `2x A100 80 GB` (`160 GB` VRAM) node, build the `120k` SFT + `20k` DPO datasets once, train **`Gemma-4-E4B-Arabic-It` on GPU 0** and **`Gemma-4-26B-A4B-Arabic-It` on GPU 1** simultaneously, and run all 11 benchmarks + the 50-user vLLM concurrency benchmark:
+On a `2x A100 80 GB` (`160 GB` VRAM) node, build the `120k` SFT + `20k` DPO datasets once, train **`Gemma-4-E4B-Arabic-It` on GPU 0** and **`Gemma-4-26B-A4B-Arabic-It` on GPU 1** simultaneously, and run all 10 benchmarks + the 50-user vLLM concurrency benchmark:
 
 ```bash
 bash scripts/run_dual_a100_pipeline.sh
@@ -210,7 +170,7 @@ python -m src.train_sft --config configs/sft_e4b_a100.yaml
 python -m src.train_dpo --config configs/dpo_e4b_a100.yaml
 python -m src.merge_and_export --config configs/dpo_e4b_a100.yaml
 
-# Run the 11-benchmark suite and vLLM PagedAttention multi-user scaling benchmark:
+# Run the 10-benchmark suite and vLLM PagedAttention multi-user scaling benchmark:
 python scripts/run_benchmarks.py --config configs/eval_config.yaml --model-key both
 CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_vllm_concurrency.py --config configs/eval_config.yaml --live-vllm
 ```
