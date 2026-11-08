@@ -366,7 +366,7 @@ def _strip_thinking_blocks(text: str) -> str:
     s = str(text or "")
     # Strip any short prompt-closing stub (e.g. `pass\n```\n<turn|>\n<|turn>model\n`) emitted before starting a model turn
     s = re.sub(
-        r"^\s*(?:(?:pass|\.\.\.)?[ \t]*\r?\n)?[ \t]*```[ \t]*\r?\n?\s*<turn\|>\s*(?:(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?)?(?=\S)",
+        r"^(?:[ \t]*(?:#[^\r\n]*|pass|\.\.\.)?[ \t]*\r?\n)*[ \t]*```[ \t]*\r?\n?\s*<turn\|>\s*(?:(?:<\|turn>|<start_of_turn>)\s*(?:model|assistant)\s*\r?\n?)?(?=\S)",
         "",
         s,
     )
@@ -533,6 +533,8 @@ def _process_arc_challenge_mc_docs(dataset: Any) -> Any:
 def _extract_arc_mcq_letter(text: str, valid_letters: str = "ABCD") -> str:
     """Strip thinking blocks and extract the final selected option letter (`A`-`D` or `A`-`J`)."""
     cleaned = _strip_thinking_blocks(text).strip()
+    if "\nQuestion:" in cleaned:
+        cleaned = cleaned.split("\nQuestion:", 1)[0].strip()
     if not cleaned:
         return ""
     upper_letters = valid_letters.upper()
@@ -1401,17 +1403,9 @@ def resolve_lm_eval_task_specs(
     model_key_prefix: str = "e4b",
 ) -> Tuple[List[Union[str, Dict[str, Any]]], str, Optional[int]]:
     """Resolve a benchmark's `lm_eval_task` into `(tasks_arg, primary_result_key, effective_limit)`."""
+    _ = model_key_prefix
     clean_name = task_name.strip()
     eff_limit = compute_effective_task_limit(clean_name, limit)
-
-    if model_key_prefix == "26b_a4b" and clean_name.lower() == "mmlu_pro":
-        custom_dict = build_custom_lm_eval_task_dict("mmlu_pro", num_fewshot=0)
-        mmlu_limit = (
-            eff_limit * GROUP_SUBTASK_COUNTS.get("mmlu_pro", 14)
-            if eff_limit is not None
-            else None
-        )
-        return ([custom_dict], str(custom_dict["task"]), mmlu_limit)
 
     if clean_name.lower() in (
         "mgsm_ar",
@@ -2165,15 +2159,15 @@ def _get_lm_eval_gen_kwargs(
         }
     if clean == "humaneval" and model_key_prefix == "26b_a4b":
         return {
-            "max_gen_toks": 4096,
+            "max_gen_toks": 1024,
             "until": [
                 "\nif __name__",
-                "<turn|>",
                 "<end_of_turn>",
                 "<eos>",
                 "</s>",
                 "<|im_end|>",
             ],
+            "ignore_eos": True,
             "do_sample": False,
             "temperature": 0.0,
         }
@@ -2213,13 +2207,50 @@ def _configure_lm_eval_thinking_for_task(
     task_name: str = "",
     model_key_prefix: str = "e4b",
 ) -> None:
-    """Configure `enable_thinking` and `think_end_token` per task on `VLLM` or `HFLM`.
+    """Configure `enable_thinking`, `think_end_token`, `eos_token`, and `<|channel>thought` prefill per task.
 
     - `mmlu_pro` runs with `enable_thinking=True` (matching Google's official Gemma 4 Model Card table).
-    - `arc_challenge`, `gsm8k`, and `humaneval` run with `enable_thinking=False`.
+    - On `26b_a4b`, `mmlu_pro` prefills `<|channel>thought\\nLet's carefully analyze...` after `<|turn>model\\n`
+      so the model never emits an empty `<|channel>thought\\n<channel|>` block on 5-shot CoT prompts.
+    - On `26b_a4b` when `apply_chat_template=False`, `tokenizer.eos_token` is set to `<eos>` (`1`) so
+      `lm_eval`'s `eot_token_id` does not inject `<turn|>` (`106`) as a token-0 stop sequence.
     """
-    _ = model_key_prefix
     use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
+    if model_key_prefix == "26b_a4b":
+        tok = getattr(lm_obj, "tokenizer", None)
+        if tok is not None:
+            try:
+                if task_chat_tpl:
+                    tok.eos_token = "<turn|>"
+                    tok.eos_token_id = 106
+                else:
+                    tok.eos_token = "<eos>"
+                    tok.eos_token_id = 1
+            except Exception:
+                pass
+        if hasattr(lm_obj, "apply_chat_template"):
+            orig_apply = getattr(lm_obj, "_orig_apply_chat_template", None)
+            if orig_apply is None:
+                orig_apply = lm_obj.apply_chat_template
+                setattr(lm_obj, "_orig_apply_chat_template", orig_apply)
+            if use_thinking:
+
+                def _thinking_prefilled_chat_template(
+                    chat_history: Any, add_generation_prompt: bool = True
+                ) -> str:
+                    rendered = str(
+                        orig_apply(chat_history, add_generation_prompt=add_generation_prompt)
+                    )
+                    if add_generation_prompt and rendered.endswith("<|turn>model\n"):
+                        return (
+                            rendered
+                            + "<|channel>thought\nLet's carefully analyze the question and verify each option step by step:\n"
+                        )
+                    return rendered
+
+                lm_obj.apply_chat_template = _thinking_prefilled_chat_template
+            else:
+                lm_obj.apply_chat_template = orig_apply
     if effective_use_vllm:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = use_thinking
@@ -2618,8 +2649,6 @@ def _evaluate_checkpoint_with_lm_eval(
 
             task_name = str(spec["lm_eval_task"])
             num_fewshot = int(spec.get("num_fewshot", 0))
-            if model_key_prefix == "26b_a4b" and task_name.strip().lower() == "mmlu_pro":
-                num_fewshot = 0
             metric_hint = str(spec.get("metric", "acc_norm"))
             if model_key_prefix == "26b_a4b" and task_name.strip().lower() == "gsm8k":
                 metric_hint = "exact_match,flexible-extract"
