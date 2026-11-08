@@ -2,10 +2,6 @@
 
 End-to-end continual instruction tuning (`rsLoRA`), Trust-Region Direct Preference Optimization (`TR-DPO`), TIES-Merging (`lambda=0.85, density=0.70`), and Iso-Active latency profiling pipeline for adapting Google's **Gemma 4** family to **Modern Standard Arabic (MSA)** and **Saudi dialects (Najdi, Hijazi, Khaliji)** with **Zero Catastrophic Forgetting**.
 
-- **GitHub Repository:** [`nnoman-asif/Gemma-4-Arabic`](https://github.com/nnoman-asif/Gemma-4-Arabic)
-- **Hugging Face Namespace:** [`noman-asif`](https://huggingface.co/noman-asif)
-- **License:** [Apache License 2.0](LICENSE) ([`apache-2.0`](https://www.apache.org/licenses/LICENSE-2.0))
-
 ---
 
 ## Published Hugging Face Hub Artifacts
