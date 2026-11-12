@@ -1116,7 +1116,6 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             mock_cache_file.write_text(
                 json.dumps(
                     {
-                        "cache_version": "v24_humaneval_col0_body_fix",
                         "tuned": {
                             "arabic": {
                                 "AlGhafa": {"eval_score_pct": 63.33},

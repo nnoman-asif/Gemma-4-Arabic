@@ -2717,7 +2717,7 @@ def _extract_preserved_lighteval_from_cache(
         tuned_ar = raw.get("tuned", {}).get("arabic", {})
         if not isinstance(base_ar, dict) or not isinstance(tuned_ar, dict):
             return ({}, {})
-        if eval_ver and eval_ver != "v28_linkedin_verified":
+        if eval_ver == EVAL_CACHE_VERSION:
             candidate_suites: Tuple[str, ...] = (
                 ("ArabicMMLU", "MadinahQA")
                 + PRESERVED_LIGHTEVAL_SUITES
@@ -2758,21 +2758,10 @@ def _extract_preserved_retention_from_cache(
     """Return `(preserved_base_retention, preserved_tuned_retention)` for validated retention scores."""
     if not cache_path.exists():
         return ({}, {})
-    if model_key == "26b_a4b":
-        try:
-            raw_check = json.loads(cache_path.read_text(encoding="utf-8"))
-            if str(raw_check.get("eval_version") or "") != EVAL_CACHE_VERSION:
-                return ({}, {})
-        except Exception:
-            return ({}, {})
     try:
         raw = json.loads(cache_path.read_text(encoding="utf-8"))
         eval_ver = str(raw.get("eval_version") or "")
-        if eval_ver not in (
-            "v28_linkedin_verified",
-            "v29_zero_shot_and_non_thinking_fix",
-            EVAL_CACHE_VERSION,
-        ):
+        if eval_ver != EVAL_CACHE_VERSION:
             return ({}, {})
         base_ret = raw.get("base", {}).get("retention", {})
         tuned_ret = raw.get("tuned", {}).get("retention", {})
@@ -2782,7 +2771,7 @@ def _extract_preserved_retention_from_cache(
         pres_tuned: Dict[str, Dict[str, Any]] = {}
         candidate_ret = (
             ("MMLU-Pro", "GSM8K", "ARC-Challenge")
-            if (model_key == "e4b" and eval_ver in ("v29_zero_shot_and_non_thinking_fix", EVAL_CACHE_VERSION))
+            if model_key == "e4b"
             else ("MMLU-Pro",)
         )
         for sname in candidate_ret:
