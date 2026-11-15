@@ -21,8 +21,11 @@ Saves:
 import argparse
 import json
 import logging
+import os
 import pathlib
+import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -217,6 +220,12 @@ def profile_pytorch_batched_live(
         model = AutoModelForImageTextToText.from_pretrained(model_path, **load_kwargs)
     except Exception:
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    try:
+        model.config.use_cache = True
+        if getattr(model.config, "text_config", None) is not None:
+            model.config.text_config.use_cache = True
+    except Exception:
+        pass
     model.eval()
 
     if torch.cuda.is_available():
@@ -232,19 +241,33 @@ def profile_pytorch_batched_live(
         "اشرح بالتفصيل الإجراءات النظامية لحوكمة الشركات المساهمة وحقوق المساهمين في نظام الشركات السعودي الجديد. "
     )
     raw_user_text = (base_prompt * max(1, prompt_tokens // 28))[: prompt_tokens * 3]
-    formatted_prompt = format_gemma4_chat(
-        [{"role": "user", "content": raw_user_text}],
-        enable_thinking=False,
-        add_generation_prompt=True,
-    )
-    if formatted_prompt.endswith("<|turn>model\n<|think|>\n<|think|>\n"):
-        formatted_prompt = formatted_prompt[: -len("<|think|>\n<|think|>\n")]
+    if getattr(tokenizer, "chat_template", None):
+        try:
+            formatted_prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": raw_user_text}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            formatted_prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": raw_user_text}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+    else:
+        formatted_prompt = format_gemma4_chat(
+            [{"role": "user", "content": raw_user_text}],
+            enable_thinking=False,
+            add_generation_prompt=True,
+        )
 
     single_ids = tokenizer(
         formatted_prompt,
         return_tensors="pt",
         truncation=True,
         max_length=min(prompt_tokens, 256),
+        add_special_tokens=not formatted_prompt.lstrip().startswith("<bos>"),
     )["input_ids"].to(target_device)
 
     # Warmup
@@ -354,6 +377,18 @@ def profile_pytorch_batched_live(
     return scaling_results, measured_weights_gb
 
 
+def _measure_checkpoint_safetensors_gb(model_path: str, fallback_gb: float) -> float:
+    """Compute exact bfloat16 safetensors footprint on disk when `model_path` is a local directory."""
+    model_dir = pathlib.Path(model_path)
+    if model_dir.is_dir():
+        shards = list(model_dir.glob("*.safetensors"))
+        if shards:
+            total_bytes = sum(p.stat().st_size for p in shards)
+            if total_bytes > 0:
+                return round(total_bytes / (1024.0 ** 3), 2)
+    return fallback_gb
+
+
 def profile_vllm_model_live(
     model_path: str,
     concurrency_users: List[int],
@@ -362,8 +397,51 @@ def profile_vllm_model_live(
     gpu_memory_utilization: float = 0.90,
     weights_vram_gb: float = 9.2,
     device: str = "cuda:0",
+    _in_isolated_subprocess: bool = False,
 ) -> Tuple[Dict[str, Any], float, str]:
-    """Run live vLLM benchmark if installed, or fallback to live GPU PyTorch batched profiling."""
+    """Run live vLLM benchmark in an isolated GPU-pinned subprocess, or fallback to live GPU PyTorch batched profiling."""
+    if not _in_isolated_subprocess and torch.cuda.is_available():
+        child_env = os.environ.copy()
+        if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
+            child_env["CUDA_VISIBLE_DEVICES"] = str(device.split(":")[1])
+        child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+        with tempfile.TemporaryDirectory(prefix="vllm_conc_") as tmp_dir:
+            out_file = pathlib.Path(tmp_dir) / "vllm_conc_out.json"
+            runner_code = f"""
+import json, logging, pathlib, sys
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+sys.path.insert(0, {repr(str(PROJECT_ROOT))})
+from scripts.benchmark_vllm_concurrency import profile_vllm_model_live
+
+scaling, measured_w_gb, engine_str = profile_vllm_model_live(
+    model_path={repr(str(model_path))},
+    concurrency_users={repr([int(u) for u in concurrency_users])},
+    prompt_tokens={int(prompt_tokens)},
+    max_new_tokens={int(max_new_tokens)},
+    gpu_memory_utilization={float(gpu_memory_utilization)},
+    weights_vram_gb={float(weights_vram_gb)},
+    device="cuda:0",
+    _in_isolated_subprocess=True,
+)
+pathlib.Path({repr(str(out_file))}).write_text(
+    json.dumps({{"scaling": scaling, "weights_vram_gb": measured_w_gb, "engine": engine_str}}, indent=2),
+    encoding="utf-8",
+)
+"""
+            proc = subprocess.run([sys.executable, "-c", runner_code], env=child_env)
+            if proc.returncode != 0 or not out_file.exists():
+                raise RuntimeError(
+                    f"Isolated vLLM concurrency subprocess for {model_path} failed (exit={proc.returncode})."
+                )
+            payload = json.loads(out_file.read_text(encoding="utf-8"))
+            return (
+                payload["scaling"],
+                float(payload["weights_vram_gb"]),
+                str(payload["engine"]),
+            )
+
     try:
         from vllm import LLM, SamplingParams
     except ImportError:
@@ -390,6 +468,8 @@ def profile_vllm_model_live(
     except Exception:
         pass
 
+    measured_weights_gb = _measure_checkpoint_safetensors_gb(model_path, weights_vram_gb)
+
     llm = LLM(
         model=model_path,
         dtype="bfloat16",
@@ -401,22 +481,48 @@ def profile_vllm_model_live(
 
     scaling_results: Dict[str, Any] = {}
     try:
+        tok = llm.get_tokenizer()
         base_prompt = (
             "أنت مستشار قانوني ومالي خبير في الأنظمة السعودية. "
             "اشرح بالتفصيل الإجراءات النظامية لحوكمة الشركات المساهمة وحقوق المساهمين في نظام الشركات السعودي الجديد. "
         )
-        prompt_text = (base_prompt * max(1, prompt_tokens // 24))[: prompt_tokens * 3]
+        repeated_text = base_prompt * max(2, prompt_tokens // 16)
+        try:
+            raw_ids = tok.encode(repeated_text, add_special_tokens=False)[: max(32, prompt_tokens - 24)]
+            prompt_body = tok.decode(raw_ids, skip_special_tokens=True)
+        except Exception:
+            prompt_body = repeated_text[: prompt_tokens * 3]
+
+        def _format_user_prompt(user_idx: int) -> str:
+            user_content = f"[User {user_idx + 1}] {prompt_body}"
+            if getattr(tok, "chat_template", None):
+                try:
+                    rendered = tok.apply_chat_template(
+                        [{"role": "user", "content": user_content}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                except TypeError:
+                    rendered = tok.apply_chat_template(
+                        [{"role": "user", "content": user_content}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                if getattr(tok, "add_bos_token", False) and rendered.startswith("<bos>"):
+                    rendered = rendered[len("<bos>") :]
+                return rendered
+            return user_content
 
         # Warmup single request
         warmup_params = SamplingParams(temperature=0.0, max_tokens=8)
-        _ = llm.generate([prompt_text], warmup_params)
+        _ = llm.generate([_format_user_prompt(0)], warmup_params)
 
         for num_users in concurrency_users:
-            batch_prompts = [f"[User {i + 1}] {prompt_text}" for i in range(num_users)]
+            batch_prompts = [_format_user_prompt(i) for i in range(num_users)]
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
 
             # 1. Measure Prefill / Time-To-First-Token (TTFT) across 3 timed runs
             ttft_params = SamplingParams(temperature=0.0, max_tokens=1)
@@ -434,7 +540,17 @@ def profile_vllm_model_live(
             ttft_p95_ms = ttft_samples_ms[-1]
 
             # 2. Measure Continuous-Batched Decode Throughput across N concurrent requests
-            gen_params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
+            try:
+                gen_params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=max_new_tokens,
+                    min_tokens=max_new_tokens,
+                )
+            except TypeError:
+                gen_params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             t_start = time.perf_counter()
             outputs = llm.generate(batch_prompts, gen_params)
             if torch.cuda.is_available():
@@ -445,16 +561,15 @@ def profile_vllm_model_live(
             total_system_tps = total_generated_tokens / elapsed
             per_user_tps = total_system_tps / max(1, num_users)
 
-            vram_used_gb = (
-                torch.cuda.max_memory_allocated() / (1024.0 ** 3)
-                if torch.cuda.is_available()
-                else weights_vram_gb + (0.42 * num_users)
-            )
-            if vram_used_gb < weights_vram_gb:
-                vram_used_gb = weights_vram_gb + round(
-                    (0.48 if weights_vram_gb < 20.0 else 0.40) * num_users, 2
-                )
-            kv_gb = max(0.4, round(vram_used_gb - weights_vram_gb, 2))
+            if torch.cuda.is_available():
+                free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+                vram_used_gb = (total_bytes - free_bytes) / (1024.0 ** 3)
+                total_hbm_gb = max(1.0, total_bytes / (1024.0 ** 3))
+            else:
+                vram_used_gb = measured_weights_gb
+                total_hbm_gb = 80.0
+
+            kv_gb = max(0.0, round(vram_used_gb - measured_weights_gb, 2))
 
             scaling_results[str(num_users)] = {
                 "concurrent_users": num_users,
@@ -464,14 +579,24 @@ def profile_vllm_model_live(
                 "total_system_tokens_per_sec": round(total_system_tps, 2),
                 "kv_cache_and_runtime_gb": kv_gb,
                 "vram_used_gb": round(vram_used_gb, 2),
-                "vram_utilization_pct": round((vram_used_gb / 80.0) * 100.0, 1),
+                "vram_utilization_pct": round((vram_used_gb / total_hbm_gb) * 100.0, 1),
             }
+            logger.info(
+                "[vLLM] Users=%d -> TTFT=%.1f ms (P95=%.1f ms) | PerUser=%.1f tok/s | Sys=%.1f tok/s | DeviceVRAM=%.2f/%.1f GB",
+                num_users,
+                ttft_median_ms,
+                ttft_p95_ms,
+                per_user_tps,
+                total_system_tps,
+                vram_used_gb,
+                total_hbm_gb,
+            )
     finally:
         _destroy_vllm_and_free_vram(model_obj=llm)
 
     return (
         scaling_results,
-        weights_vram_gb,
+        measured_weights_gb,
         "vLLM (PagedAttention + Continuous Batching + Prefix Caching)",
     )
 

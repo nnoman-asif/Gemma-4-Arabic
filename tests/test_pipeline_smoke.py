@@ -37,6 +37,9 @@ from scripts.benchmark_vllm_concurrency import (
     render_vllm_markdown_report,
 )
 from scripts.run_benchmarks import (
+    ACVA_ALL_58_SUBSETS,
+    ARABIC_MMLU_40_SUBSETS,
+    _atomic_write_json,
     _build_child_eval_cmd,
     _configure_lm_eval_thinking_for_task,
     _ensure_gemma4_tied_lm_head,
@@ -44,22 +47,27 @@ from scripts.run_benchmarks import (
     _extract_humaneval_code,
     _extract_mcq_letter_with_doc,
     _extract_mgsm_ar_target_number,
-    _extract_preserved_lighteval_from_cache,
     _get_lm_eval_gen_kwargs,
+    _load_stage_checkpoint,
     _normalize_arabic_digits,
     _normalize_arabic_digits_filter,
     _patch_gemma4_config_for_lm_eval,
+    _patch_local_checkpoint_config_json,
+    _resolve_selected_suites,
     _should_apply_chat_template_for_task,
     _strip_thinking_blocks,
     _truncate_math_continuation,
     build_custom_lm_eval_task_dict,
+    clean_gemma4_completion,
     compute_effective_task_limit,
     evaluate_retention_gate,
     extract_lm_eval_detailed_metrics,
+    generate_family_markdown_report,
     generate_markdown_report,
     parse_args as parse_bench_args,
     parse_lighteval_results_json,
     parse_lm_eval_results_json,
+    resolve_lighteval_arabic_tasks,
     resolve_lm_eval_task_specs,
 )
 from src.chat_template import (
@@ -458,6 +466,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         self.assertIn("ArabicMMLU", md)
         self.assertIn("PASSED", md)
+        self.assertIn("Base (%) | Arabic-Tuned (%)", md)
+        self.assertNotIn("Google Official", md)
 
     def test_09_dual_model_a100_configs_and_router_freeze(self) -> None:
         """Verify A100 80 GB configs for E4B and 26B-A4B, MoE router freeze, and lm_eval JSON parser."""
@@ -567,64 +577,43 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertIn("\nQuestion:", arc_spec["generation_kwargs"]["until"])
         self.assertNotIn("Question:", arc_spec["generation_kwargs"]["until"])
         self.assertEqual(arc_spec["generation_kwargs"]["max_gen_toks"], 4096)
-        self.assertEqual(
-            _get_lm_eval_gen_kwargs("gsm8k"),
-            {
-                "max_gen_toks": 4096,
-                "until": ["\nQuestion:", "<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
-                "do_sample": False,
-                "temperature": 0.0,
-            },
-        )
-        self.assertEqual(
-            _get_lm_eval_gen_kwargs("mmlu_pro"),
-            {
-                "max_gen_toks": 4096,
-                "until": ["\nQuestion:", "<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
-                "do_sample": False,
-                "temperature": 0.0,
-            },
-        )
-        self.assertEqual(
-            _get_lm_eval_gen_kwargs("mmlu_pro", model_key_prefix="26b_a4b"),
-            {
-                "max_gen_toks": 8192,
-                "until": ["<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
-                "do_sample": False,
-                "temperature": 0.0,
-            },
-        )
-        self.assertEqual(
-            _get_lm_eval_gen_kwargs("gsm8k", model_key_prefix="26b_a4b"),
-            {
-                "max_gen_toks": 4096,
-                "until": ["\nQuestion:", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
-                "ignore_eos": True,
-                "do_sample": False,
-                "temperature": 0.0,
-            },
-        )
-        self.assertEqual(
-            _get_lm_eval_gen_kwargs("humaneval", model_key_prefix="26b_a4b"),
-            {
-                "max_gen_toks": 4096,
-                "until": ["\nif __name__", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
-                "ignore_eos": True,
-                "do_sample": False,
-                "temperature": 0.0,
-            },
-        )
+        self.assertIsNone(_get_lm_eval_gen_kwargs("gsm8k"))
+        self.assertIsNone(_get_lm_eval_gen_kwargs("humaneval"))
         self.assertIsNone(_get_lm_eval_gen_kwargs("arc_challenge"))
+        self.assertEqual(
+            _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=True),
+            {
+                "max_gen_toks": 16384,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 64,
+                "do_sample": True,
+                "until": ["<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "skip_special_tokens": False,
+            },
+        )
+        self.assertEqual(
+            _get_lm_eval_gen_kwargs("mmlu_pro", model_key_prefix="26b_a4b", use_vllm=False),
+            {
+                "max_gen_toks": 16384,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 64,
+                "do_sample": True,
+                "until": ["<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+            },
+        )
         self.assertFalse(_should_apply_chat_template_for_task("arc_challenge", True))
         self.assertFalse(_should_apply_chat_template_for_task("humaneval", True))
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True))
-        self.assertTrue(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
+        self.assertFalse(_should_apply_chat_template_for_task("arc_challenge", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("gsm8k", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("mgsm_ar", True, model_key_prefix="26b_a4b"))
         self.assertFalse(_should_apply_chat_template_for_task("humaneval", True, model_key_prefix="26b_a4b"))
         self.assertTrue(_should_apply_chat_template_for_task("arc_challenge_chat", True))
         self.assertTrue(_should_apply_chat_template_for_task("mmlu_pro", True))
+        self.assertTrue(_should_apply_chat_template_for_task("mmlu_pro", True, model_key_prefix="26b_a4b"))
         self.assertTrue(_should_apply_chat_template_for_task("humaneval_instruct", True))
 
         arc_mc_spec = build_custom_lm_eval_task_dict("arc_challenge", num_fewshot=25)
@@ -656,7 +645,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             mock_vllm, effective_use_vllm=True, task_chat_tpl=True, task_name="mmlu_pro"
         )
         self.assertTrue(mock_vllm.enable_thinking)
-        self.assertIsNone(mock_vllm.think_end_token)
+        self.assertEqual(mock_vllm.think_end_token, "<channel|>")
         self.assertEqual(mock_vllm.chat_template_args, {})
         _configure_lm_eval_thinking_for_task(
             mock_vllm,
@@ -666,7 +655,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             model_key_prefix="26b_a4b",
         )
         self.assertTrue(mock_vllm.enable_thinking)
-        self.assertIsNone(mock_vllm.think_end_token)
+        self.assertEqual(mock_vllm.think_end_token, "<channel|>")
         self.assertEqual(mock_vllm.tokenizer.eos_token_id, 106)
         _configure_lm_eval_thinking_for_task(
             mock_vllm,
@@ -676,24 +665,28 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             model_key_prefix="26b_a4b",
         )
         self.assertFalse(mock_vllm.enable_thinking)
+        self.assertIsNone(mock_vllm.think_end_token)
         self.assertEqual(mock_vllm.tokenizer.eos_token, "<eos>")
         self.assertEqual(mock_vllm.tokenizer.eos_token_id, 1)
         _configure_lm_eval_thinking_for_task(
             mock_vllm, effective_use_vllm=True, task_chat_tpl=False, task_name="arc_challenge"
         )
         self.assertFalse(mock_vllm.enable_thinking)
+        self.assertIsNone(mock_vllm.think_end_token)
         self.assertEqual(mock_vllm.chat_template_args, {})
 
         mock_hflm = _MockLMObj()
         _configure_lm_eval_thinking_for_task(
             mock_hflm, effective_use_vllm=False, task_chat_tpl=True, task_name="mmlu_pro"
         )
-        self.assertFalse(mock_hflm.enable_thinking)
+        self.assertTrue(mock_hflm.enable_thinking)
+        self.assertEqual(mock_hflm.think_end_token, "<channel|>")
         self.assertEqual(mock_hflm.chat_template_args, {"enable_thinking": True})
         _configure_lm_eval_thinking_for_task(
             mock_hflm, effective_use_vllm=False, task_chat_tpl=True, task_name="gsm8k"
         )
         self.assertFalse(mock_hflm.enable_thinking)
+        self.assertIsNone(mock_hflm.think_end_token)
         self.assertEqual(mock_hflm.chat_template_args, {})
         self.assertEqual(
             mgsm_spec["metric_list"][0]["regexes_to_ignore"],
@@ -923,11 +916,14 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         self.assertEqual(eval_cfg["retention_gate"]["min_retention_ratio"], 0.90)
         self.assertEqual(eval_cfg["retention_gate"]["max_allowed_drop_pct"], 8.50)
-        for anchor_name in ("MMLU-Pro", "GSM8K", "HumanEval", "ARC-Challenge"):
+        for anchor_name in ("MMLU-Pro", "GPQA-Diamond", "AIME-2026", "LiveCodeBench-v6"):
             self.assertEqual(
                 eval_cfg["retention_anchors"][anchor_name]["max_regression_pct"],
                 8.50,
             )
+            self.assertTrue(eval_cfg["retention_anchors"][anchor_name]["enable_thinking"])
+        for removed_anchor in ("GSM8K", "HumanEval", "ARC-Challenge"):
+            self.assertNotIn(removed_anchor, eval_cfg["retention_anchors"])
         self.assertNotIn("MGSM-Ar", eval_cfg["arabic_benchmarks"])
         self.assertEqual(eval_cfg["evaluation"]["base_model_id"], "unsloth/gemma-4-E4B-it")
         self.assertEqual(eval_cfg["evaluation"]["batch_size"], 32)
@@ -971,15 +967,19 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                 json.dumps(
                     {
                         "tie_word_embeddings": False,
-                        "text_config": {"tie_word_embeddings": False},
+                        "use_cache": False,
+                        "text_config": {"tie_word_embeddings": False, "use_cache": False},
                     }
                 ),
                 encoding="utf-8",
             )
             self.assertTrue(_patch_exported_gemma4_config_tie_embeddings(tmp_p))
+            _patch_local_checkpoint_config_json(tmp_p)
             patched_cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
             self.assertTrue(patched_cfg["tie_word_embeddings"])
+            self.assertTrue(patched_cfg["use_cache"])
             self.assertTrue(patched_cfg["text_config"]["tie_word_embeddings"])
+            self.assertTrue(patched_cfg["text_config"]["use_cache"])
 
         self.assertEqual(compute_effective_task_limit("arabicmmlu", 200), 5)
         self.assertEqual(compute_effective_task_limit("arabic_leaderboard_alghafa_light", 180), 20)
@@ -1007,14 +1007,42 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(eval_cfg["arabic_benchmarks"]["EXAMS-AR"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["AraTrust"]["runner"], "lighteval")
         self.assertEqual(eval_cfg["arabic_benchmarks"]["ACVA"]["num_fewshot"], 5)
+
+        self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["runner"], "lm_eval")
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["lm_eval_task"], "mmlu_pro")
         self.assertEqual(eval_cfg["retention_anchors"]["MMLU-Pro"]["num_fewshot"], 5)
-        self.assertEqual(eval_cfg["retention_anchors"]["GSM8K"]["lm_eval_task"], "gsm8k")
-        self.assertEqual(eval_cfg["retention_anchors"]["GSM8K"]["metric"], "exact_match,strict-match")
-        self.assertEqual(eval_cfg["retention_anchors"]["HumanEval"]["lm_eval_task"], "humaneval")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["lm_eval_task"], "arc_challenge")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["metric"], "acc_norm")
-        self.assertEqual(eval_cfg["retention_anchors"]["ARC-Challenge"]["num_fewshot"], 25)
+        self.assertEqual(
+            eval_cfg["retention_anchors"]["MMLU-Pro"]["metric"], "exact_match,custom-extract"
+        )
+        self.assertEqual(eval_cfg["retention_anchors"]["GPQA-Diamond"]["runner"], "inspect_evals")
+        self.assertEqual(
+            eval_cfg["retention_anchors"]["GPQA-Diamond"]["lm_eval_task"],
+            "inspect_evals/gpqa_diamond",
+        )
+        self.assertEqual(eval_cfg["retention_anchors"]["GPQA-Diamond"]["epochs"], 1)
+        self.assertEqual(eval_cfg["retention_anchors"]["AIME-2026"]["runner"], "inspect_evals")
+        self.assertEqual(
+            eval_cfg["retention_anchors"]["AIME-2026"]["lm_eval_task"],
+            "inspect_evals/aime2026",
+        )
+        self.assertEqual(eval_cfg["retention_anchors"]["AIME-2026"]["epochs"], 4)
+        self.assertEqual(
+            eval_cfg["retention_anchors"]["LiveCodeBench-v6"]["runner"], "lighteval_lcb"
+        )
+        self.assertEqual(
+            eval_cfg["retention_anchors"]["LiveCodeBench-v6"]["lighteval_task"],
+            "lcb:codegeneration_v6|0",
+        )
+        self.assertEqual(eval_cfg["retention_anchors"]["LiveCodeBench-v6"]["num_samples"], 1)
+
+        # Verify full 40-subject ArabicMMLU + 58-subtask ACVA expansion when limit=None vs smoke limit
+        self.assertEqual(len(ARABIC_MMLU_40_SUBSETS), 40)
+        self.assertEqual(len(ACVA_ALL_58_SUBSETS), 58)
+        full_ar_tasks = resolve_lighteval_arabic_tasks(["ArabicMMLU", "ACVA"], limit=None)
+        self.assertEqual(len(full_ar_tasks), 98)
+        limited_ar_tasks = resolve_lighteval_arabic_tasks(["ArabicMMLU", "ACVA"], limit=200)
+        self.assertEqual(len(limited_ar_tasks), 6)
+        self.assertEqual(limited_ar_tasks[0], "arabic_mmlu:All|0")
 
         le_payload = {
             "results": {
@@ -1027,7 +1055,15 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                 "community:arabic_exams:default:0": {"acc_norm": 0.565},
                 "madinah_qa:_average|5": {"acc_norm": 0.725},
                 "aratrust:_average|0": {"acc_norm": 0.815},
-            }
+                "lcb:codegeneration_v6|0": {
+                    "codegen_pass@1:16": 0.2857,
+                    "codegen_pass@1:16_stderr": 0.034,
+                },
+            },
+            "doc_counts": {
+                "lcb:codegeneration_v6|0": 175,
+                "arabic_exams|0": 537,
+            },
         }
         self.assertAlmostEqual(
             parse_lighteval_results_json(le_payload, "ArabicMMLU")["eval_score_pct"],
@@ -1044,11 +1080,9 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             78.40,
             places=2,
         )
-        self.assertAlmostEqual(
-            parse_lighteval_results_json(le_payload, "EXAMS-AR")["eval_score_pct"],
-            56.50,
-            places=2,
-        )
+        exams_parsed = parse_lighteval_results_json(le_payload, "EXAMS-AR")
+        self.assertAlmostEqual(exams_parsed["eval_score_pct"], 56.50, places=2)
+        self.assertEqual(exams_parsed["n_samples"], 537)
         self.assertAlmostEqual(
             parse_lighteval_results_json(le_payload, "MadinahQA")["eval_score_pct"],
             72.50,
@@ -1059,7 +1093,23 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             81.50,
             places=2,
         )
-        mmlu_pro_mock_payload = {
+        lcb_parsed = parse_lighteval_results_json(le_payload, "LiveCodeBench-v6")
+        self.assertAlmostEqual(lcb_parsed["eval_score_pct"], 28.57, places=2)
+        self.assertEqual(lcb_parsed["n_samples"], 175)
+
+        # Verify 58-subtask unweighted macro-average on ACVA when individual subtasks are returned
+        acva_58_payload = {
+            "results": {
+                f"custom|acva:{sub}|5": {"acc_norm": 0.80} for sub in ACVA_ALL_58_SUBSETS
+            },
+            "doc_counts": {f"custom|acva:{sub}|5": 150 for sub in ACVA_ALL_58_SUBSETS},
+        }
+        acva_58_parsed = parse_lighteval_results_json(acva_58_payload, "ACVA")
+        self.assertAlmostEqual(acva_58_parsed["eval_score_pct"], 80.00, places=2)
+        self.assertEqual(acva_58_parsed["n_samples"], 58 * 150)
+
+        # Verify extract_lm_eval_detailed_metrics reports raw unmodified lm_eval score (zero post-hoc max() override)
+        mmlu_pro_zero_payload = {
             "results": {"mmlu_pro": {"exact_match,custom-extract": 0.0}},
             "samples": {
                 "mmlu_pro_biology": [
@@ -1070,26 +1120,35 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                 ]
             },
         }
-        mmlu_pro_detailed = extract_lm_eval_detailed_metrics(
-            mmlu_pro_mock_payload, task_name="mmlu_pro", metric_hint="exact_match,custom-extract"
+        mmlu_pro_zero = extract_lm_eval_detailed_metrics(
+            mmlu_pro_zero_payload, task_name="mmlu_pro", metric_hint="exact_match,custom-extract"
         )
-        self.assertAlmostEqual(mmlu_pro_detailed["eval_score_pct"], 100.0, places=2)
-        mmlu_pro_native_em_payload = {
-            "results": {"mmlu_pro": {"exact_match,custom-extract": 0.0}},
-            "samples": {
-                "mmlu_pro_biology": [
-                    {
-                        "target": "(C)",
-                        "exact_match,custom-extract": 1.0,
-                        "resps": [["unparsed response"]],
-                    }
-                ]
-            },
+        self.assertAlmostEqual(mmlu_pro_zero["eval_score_pct"], 0.0, places=2)
+
+        mmlu_pro_live_payload = {
+            "results": {"mmlu_pro": {"exact_match,custom-extract": 0.725}},
+            "samples": {"mmlu_pro_biology": [{"target": "(C)", "resps": [["The answer is (C)"]]}]},
         }
-        mmlu_pro_native_em_detailed = extract_lm_eval_detailed_metrics(
-            mmlu_pro_native_em_payload, task_name="mmlu_pro", metric_hint="exact_match,custom-extract"
+        mmlu_pro_live = extract_lm_eval_detailed_metrics(
+            mmlu_pro_live_payload, task_name="mmlu_pro", metric_hint="exact_match,custom-extract"
         )
-        self.assertAlmostEqual(mmlu_pro_native_em_detailed["eval_score_pct"], 100.0, places=2)
+        self.assertAlmostEqual(mmlu_pro_live["eval_score_pct"], 72.50, places=2)
+
+        # Verify clean_gemma4_completion handles closed thoughts and drops unclosed mid-thought truncations
+        self.assertEqual(
+            clean_gemma4_completion(
+                "<|channel>thought\nStep 1: check options.\n<channel|>The answer is (D)<turn|>extra"
+            ),
+            "The answer is (D)",
+        )
+        self.assertEqual(
+            clean_gemma4_completion(
+                "<|channel>thought\nUnfinished reasoning hitting max_tokens with (D)",
+                drop_unclosed_thought=True,
+            ),
+            "",
+        )
+
         le_payload_colon = {
             "results": {
                 "madinah_qa:_average:5": {"acc_norm": 0.742},
@@ -1111,48 +1170,87 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertIn("--use-vllm", child_cmd)
         self.assertIn("--apply-chat-template", child_cmd)
 
-        with tempfile.TemporaryDirectory(prefix="gemma4_cache_preserve_") as tmp_cache_dir:
-            mock_cache_file = pathlib.Path(tmp_cache_dir) / "live_raw_e4b.json"
-            mock_cache_file.write_text(
-                json.dumps(
-                    {
-                        "tuned": {
-                            "arabic": {
-                                "AlGhafa": {"eval_score_pct": 63.33},
-                                "ACVA": {"eval_score_pct": 85.46},
-                                "EXAMS-AR": {"eval_score_pct": 53.65},
-                                "AraTrust": {"eval_score_pct": 87.31},
-                                "ArabicMMLU": {"eval_score_pct": 25.63},
-                                "MadinahQA": {"eval_score_pct": 24.48},
-                            },
-                            "anchors": {},
+        # Verify interrupt-safe atomic stage checkpointing and resume invariants
+        with tempfile.TemporaryDirectory(prefix="gemma4_stage_ckpt_") as tmp_cache_dir:
+            ckpt_file = pathlib.Path(tmp_cache_dir) / "live_raw_e4b.json"
+            _atomic_write_json(
+                ckpt_file,
+                {
+                    "model_key": "e4b",
+                    "base_model_id": "unsloth/gemma-4-E4B-it",
+                    "tuned_model_path": "outputs/merged_gemma4_e4b_arabic/merged_16bit",
+                    "limit": None,
+                    "base": {
+                        "arabic": {"ArabicMMLU": {"eval_score_pct": 66.40}},
+                        "retention": {
+                            "MMLU-Pro": {"eval_score_pct": 69.40},
+                            "AIME-2026": {"eval_score_pct": 0.0},
+                            "GPQA-Diamond": {"_skipped": True},
                         },
-                        "base": {
-                            "arabic": {
-                                "AlGhafa": {"eval_score_pct": 56.51},
-                                "ACVA": {"eval_score_pct": 78.69},
-                                "EXAMS-AR": {"eval_score_pct": 43.39},
-                                "AraTrust": {"eval_score_pct": 82.84},
-                                "ArabicMMLU": {"eval_score_pct": 25.66},
-                                "MadinahQA": {"eval_score_pct": 24.30},
-                            },
-                            "anchors": {},
-                        },
-                    }
-                ),
-                encoding="utf-8",
+                    },
+                    "tuned": {
+                        "arabic": {},
+                        "retention": {},
+                    },
+                },
             )
-            preserved_t, preserved_b = _extract_preserved_lighteval_from_cache(mock_cache_file)
-            self.assertEqual(
-                set(preserved_t.keys()),
-                {"AlGhafa", "ACVA", "EXAMS-AR", "AraTrust"},
+            b_ar, b_ret, t_ar, t_ret = _load_stage_checkpoint(
+                cache_path=ckpt_file,
+                limit=None,
+                base_model_id="unsloth/gemma-4-E4B-it",
+                tuned_model_path="outputs/merged_gemma4_e4b_arabic/merged_16bit",
             )
-            self.assertEqual(
-                set(preserved_b.keys()),
-                {"AlGhafa", "ACVA", "EXAMS-AR", "AraTrust"},
+            self.assertEqual(set(b_ar.keys()), {"ArabicMMLU"})
+            self.assertEqual(set(b_ret.keys()), {"MMLU-Pro", "AIME-2026"})
+            self.assertEqual(b_ret["AIME-2026"]["eval_score_pct"], 0.0)
+            self.assertEqual(t_ar, {})
+            self.assertEqual(t_ret, {})
+
+            # Limit mismatch must reject the checkpoint cleanly
+            mismatch = _load_stage_checkpoint(
+                cache_path=ckpt_file,
+                limit=200,
+                base_model_id="unsloth/gemma-4-E4B-it",
+                tuned_model_path="outputs/merged_gemma4_e4b_arabic/merged_16bit",
             )
-            self.assertNotIn("ArabicMMLU", preserved_t)
-            self.assertNotIn("MadinahQA", preserved_t)
+            self.assertEqual(mismatch, ({}, {}, {}, {}))
+
+        sel_ar, sel_ret = _resolve_selected_suites(
+            eval_cfg, "arabicmmlu,acva,mmlu,gpqa,aime,lcb"
+        ) or ([], [])
+        self.assertEqual(sel_ar, ["ArabicMMLU", "ACVA"])
+        self.assertEqual(
+            sel_ret, ["MMLU-Pro", "GPQA-Diamond", "AIME-2026", "LiveCodeBench-v6"]
+        )
+
+        # Verify family Markdown report uses strictly Base | Arabic-Tuned columns
+        mock_family_item = {
+            "model_path": "outputs/merged_gemma4_e4b_arabic/merged_16bit",
+            "average_arabic_gain": 2.15,
+            "retention_gate": {"gate_passed": True, "min_observed_retention_ratio": 0.992},
+            "arabic_benchmarks": {
+                "ArabicMMLU": {
+                    "metric": "acc_norm",
+                    "num_fewshot": 0,
+                    "baseline_score": 66.40,
+                    "evaluated_score": 68.55,
+                }
+            },
+            "retention_anchors": {
+                "GPQA-Diamond": {
+                    "domain": "graduate_science_reasoning",
+                    "num_fewshot": 0,
+                    "baseline_score": 58.60,
+                    "evaluated_score": 58.10,
+                }
+            },
+        }
+        family_md = generate_family_markdown_report(mock_family_item, mock_family_item)
+        self.assertIn(
+            "E4B Base (%) | E4B Arabic-Tuned (%) | E4B Gain (% pts) | 26B-A4B Base (%) | 26B-A4B Arabic-Tuned (%)",
+            family_md,
+        )
+        self.assertNotIn("Google Official", family_md)
 
         tasks_acva, primary_acva, eff_acva = resolve_lm_eval_task_specs(
             "arabic_leaderboard_acva_light", num_fewshot=0, limit=200

@@ -21,11 +21,13 @@ numpy>=1.26.0
 scipy>=1.11.0
 tqdm>=4.66.0
 
-# Evaluation (vLLM 0.30.0 + LM Eval + LightEval), Plotting, and Testing
+# Evaluation (vLLM 0.30.0 + LM Eval >=0.4.13 + LightEval + Inspect Evals), Plotting, and Testing
 vllm>=0.30.0
-lm-eval>=0.4.8
+lm-eval>=0.4.13
 lighteval @ git+https://github.com/huggingface/lighteval.git@main
-inspect-ai
+inspect-ai>=0.3.290
+inspect-evals>=0.29.0
+ray
 aenum==3.1.15
 termcolor==2.3.0
 colorlog

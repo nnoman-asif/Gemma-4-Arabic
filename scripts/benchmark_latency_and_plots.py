@@ -8,8 +8,8 @@ Implements:
      for `Gemma-4-E4B-Arabic-It` (4.0B active / 4.5B total) and `Gemma-4-26B-A4B-Arabic-It`
      (3.8B active / 25.2B total).
 2. Publication-Grade Visual Comparison Suite (`generate_all_family_plots`):
-   - `oall_v2_arabic_comparison.png` & `.svg`: 4-Bar Grouped Chart across all 7 Arabic & Saudi benchmarks.
-   - `zero_forgetting_retention_shield.png` & `.svg`: 4-Anchor Retention Shield with 99.8% threshold line.
+   - `oall_v2_arabic_comparison.png` & `.svg`: 4-Bar Grouped Chart across all 6 OALL v2 Arabic benchmarks.
+   - `zero_forgetting_retention_shield.png` & `.svg`: 4 Official Gemma 4 Retention Benchmarks (`MMLU-Pro`, `GPQA-Diamond`, `AIME-2026`, `LiveCodeBench-v6`).
    - `iso_active_latency_vram_pareto.png` & `.svg`: 2-Panel Iso-Active Decode Speed (tok/s) vs VRAM (GB) Pareto plot.
    - `sft_dpo_training_curves.png` & `.svg`: Dual-model Stage 1 SFT Loss and Stage 2 TR-DPO Reward Margin curves.
 """
@@ -141,6 +141,12 @@ def profile_single_model_live(
             trust_remote_code=True,
         )
     _ensure_gemma4_tied_lm_head(model, tag="latency_profile")
+    try:
+        model.config.use_cache = True
+        if getattr(model.config, "text_config", None) is not None:
+            model.config.text_config.use_cache = True
+    except Exception:
+        pass
     model.eval()
 
     from src.chat_template import format_gemma4_chat
@@ -153,22 +159,39 @@ def profile_single_model_live(
         for mode_name in ("direct", "thinking_cot"):
             repeat_factor = max(1, (ctx_len // 12))
             raw_prompt = (base_unit * repeat_factor)[: ctx_len * 3]
-            formatted_prompt = format_gemma4_chat(
-                [{"role": "user", "content": raw_prompt}],
-                add_generation_prompt=True,
-                enable_thinking=(mode_name == "thinking_cot"),
-            )
+            enable_thinking_flag = mode_name == "thinking_cot"
+            if getattr(tokenizer, "chat_template", None):
+                try:
+                    formatted_prompt = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": raw_prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=enable_thinking_flag,
+                    )
+                except TypeError:
+                    formatted_prompt = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": raw_prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+            else:
+                formatted_prompt = format_gemma4_chat(
+                    [{"role": "user", "content": raw_prompt}],
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking_flag,
+                )
             inputs = tokenizer(
                 formatted_prompt,
                 return_tensors="pt",
                 truncation=True,
                 max_length=ctx_len,
+                add_special_tokens=not formatted_prompt.lstrip().startswith("<bos>"),
             ).to(target_device)
 
             # Warmup
             with torch.no_grad():
                 for _ in range(warmup_runs):
-                    _ = model.generate(**inputs, max_new_tokens=4, do_sample=False)
+                    _ = model.generate(**inputs, max_new_tokens=4, do_sample=False, use_cache=True)
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize(target_device)
@@ -301,6 +324,8 @@ def _load_real_eval_scores(eval_cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Di
         if cand.exists():
             try:
                 data = json.loads(cand.read_text(encoding="utf-8"))
+                if data.get("mode") == "dry_run":
+                    continue
                 models_block = data.get("models", {})
                 if isinstance(models_block, dict) and ("e4b" in models_block or "26b_a4b" in models_block):
                     if "e4b" in models_block and not e4b_data:
@@ -355,7 +380,7 @@ def render_latency_markdown_report(latency_profile: Dict[str, Any]) -> str:
         f"- **Hardware Profiled:** `{hw}`",
         f"- **Context Lengths Tested:** `{latency_profile.get('context_lengths', [512, 2048, 4096])}`",
         "",
-        "## 1. Direct vs Native `<|think|>` CoT Latency & Throughput",
+        "## 1. Direct vs Native Thinking CoT Latency & Throughput",
         "",
         "| Model | Active / Total Params | Context (Tokens) | Mode | TTFT (ms) | Decode Speed (tok/s) | Peak VRAM (GB) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
@@ -405,8 +430,8 @@ def generate_all_family_plots(
     except ImportError:
         logger.warning("matplotlib not found; using pure-Python SVG/PNG fallback generator.")
         for stem, title, sub in [
-            ("oall_v2_arabic_comparison", "Gemma-4-Arabic Family: 6 Arabic & Saudi Benchmarks", "E4B Base vs E4B Arabic-It vs 26B-A4B Base vs 26B-A4B Arabic-It"),
-            ("zero_forgetting_retention_shield", "Zero-Forgetting Retention Shield (English / Math / Code)", "Retention Ratios across MMLU-Pro, GSM8K, HumanEval, ARC-Challenge"),
+            ("oall_v2_arabic_comparison", "Gemma-4-Arabic Family: 6 OALL v2 Arabic Benchmarks", "Base | Arabic-Tuned across E4B and 26B-A4B"),
+            ("zero_forgetting_retention_shield", "Official Gemma 4 Retention Benchmarks (Reasoning / Math / Code)", "Base | Arabic-Tuned across MMLU-Pro, GPQA-Diamond, AIME-2026, LiveCodeBench-v6"),
             ("iso_active_latency_vram_pareto", "Iso-Active Inference Efficiency: Decode Throughput vs VRAM", "E4B (4.0B Active) vs 26B-A4B MoE (3.8B Active)"),
             ("sft_dpo_training_curves", "Stage 1 rsLoRA SFT Loss & Stage 2 Trust-Region DPO Reward Margin", "Dual-Model Training Convergence on 2x A100 80GB"),
         ]:
@@ -451,10 +476,10 @@ def generate_all_family_plots(
 
     fig1, ax1 = plt.subplots(figsize=(14.5, 7.0), facecolor="#ffffff")
     ax1.set_facecolor("#f8fafc")
-    rects1 = ax1.bar(x - 1.5 * width, e4b_base, width, label="Gemma-4-E4B-it (Base)", color="#94a3b8", edgecolor="#475569")
-    rects2 = ax1.bar(x - 0.5 * width, e4b_tuned, width, label="Gemma-4-E4B-Arabic-It (Ours, 4.0B Active)", color="#0284c7", edgecolor="#0369a1")
-    rects3 = ax1.bar(x + 0.5 * width, moe_base, width, label="Gemma-4-26B-A4B-it (Base MoE)", color="#c084fc", edgecolor="#7e22ce")
-    rects4 = ax1.bar(x + 1.5 * width, moe_tuned, width, label="Gemma-4-26B-A4B-Arabic-It (Ours, 3.8B Active)", color="#16a34a", edgecolor="#15803d")
+    rects1 = ax1.bar(x - 1.5 * width, e4b_base, width, label="E4B Base", color="#94a3b8", edgecolor="#475569")
+    rects2 = ax1.bar(x - 0.5 * width, e4b_tuned, width, label="E4B Arabic-Tuned (4.0B Active)", color="#0284c7", edgecolor="#0369a1")
+    rects3 = ax1.bar(x + 0.5 * width, moe_base, width, label="26B-A4B Base", color="#c084fc", edgecolor="#7e22ce")
+    rects4 = ax1.bar(x + 1.5 * width, moe_tuned, width, label="26B-A4B Arabic-Tuned (3.8B Active)", color="#16a34a", edgecolor="#15803d")
 
     all_ar_vals = e4b_base + e4b_tuned + moe_base + moe_tuned
     y_min_ar = max(0.0, min(all_ar_vals) - 10.0)
@@ -462,7 +487,7 @@ def generate_all_family_plots(
 
     ax1.set_ylabel("Benchmark Score (%)", fontsize=12, fontweight="bold", color="#0f172a")
     ax1.set_title(
-        f"Gemma-4-Arabic Iso-Active Family: Arabic & Saudi Benchmark Progression ({len(labels)} Suites)",
+        f"Gemma-4-Arabic Family: OALL v2 Arabic Benchmark Comparison ({len(labels)} Suites)",
         fontsize=14,
         fontweight="bold",
         color="#0f172a",
@@ -530,15 +555,15 @@ def generate_all_family_plots(
         ax.grid(axis="y", linestyle="--", alpha=0.5, color="#cbd5e1")
 
     b_r1 = ax2_left.bar(rx - 0.18, r_e4b_base, 0.17, label="E4B Base", color="#94a3b8")
-    b_r2 = ax2_left.bar(rx - 0.01, r_e4b_tuned, 0.17, label="E4B Arabic-It (TIES 0.85)", color="#0284c7")
+    b_r2 = ax2_left.bar(rx - 0.01, r_e4b_tuned, 0.17, label="E4B Arabic-Tuned", color="#0284c7")
     b_r3 = ax2_left.bar(rx + 0.17, r_moe_base, 0.17, label="26B-A4B Base", color="#c084fc")
-    b_r4 = ax2_left.bar(rx + 0.34, r_moe_tuned, 0.17, label="26B-A4B Arabic-It (TIES 0.85)", color="#16a34a")
+    b_r4 = ax2_left.bar(rx + 0.34, r_moe_tuned, 0.17, label="26B-A4B Arabic-Tuned", color="#16a34a")
     all_ret_vals = r_e4b_base + r_e4b_tuned + r_moe_base + r_moe_tuned
     ax2_left.set_xticks(rx + 0.08)
     ax2_left.set_xticklabels(ret_labels, fontsize=10.5, fontweight="bold")
     ax2_left.set_ylim(max(0.0, min(all_ret_vals) - 10.0), min(105.0, max(all_ret_vals) + 12.0))
     ax2_left.set_ylabel("Score (%)", fontsize=11, fontweight="bold")
-    ax2_left.set_title("Core English / Math / Code Benchmark Scores", fontsize=12.5, fontweight="bold")
+    ax2_left.set_title("Official Gemma 4 Retention Benchmarks (Base | Arabic-Tuned)", fontsize=12.0, fontweight="bold")
     ax2_left.legend(loc="lower right", fontsize=8.5)
 
     for rect_group, col in [

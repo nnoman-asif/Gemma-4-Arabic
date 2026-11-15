@@ -79,20 +79,22 @@ This repository supports **two hardware tiers** out of the box via dedicated YAM
 
 ---
 
-## Arabic & Saudi Benchmark Suite (6 Benchmarks + 4 Retention Anchors)
+## Benchmark Evaluation Suite (6 OALL v2 Arabic + 4 Official Gemma 4 Retention Benchmarks)
 
-| Benchmark | `lm_eval` / `LightEval` Task | Metric | Shots | E4B Base (%) | **E4B Arabic-It (%)** | 26B-A4B Base (%) | **26B-A4B Arabic-It (%)** |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **ArabicMMLU** | `arabicmmlu` | `acc_norm` | 0 | 24.00 | **57.00** (`+33.00`) | 37.00 | **68.00** (`+31.00`) |
-| **MadinahQA** | `madinahqa` | `acc_norm` | 0 | 27.50 | **73.00** (`+45.50`) | 27.50 | **76.50** (`+49.00`) |
-| **AlGhafa** | `arabic_leaderboard_alghafa_light` | `acc_norm` | 0 | 48.15 | **74.70** (`+26.55`) | 74.78 | **78.48** (`+3.70`) |
-| **ACVA (Saudi & Arab Culture)** | `arabic_leaderboard_acva_light` | `acc_norm` | 5 | 79.60 | **82.00** (`+2.40`) | 80.40 | **79.60** (`-0.80`) |
-| **EXAMS-AR** | `arabic_exams` | `acc_norm` | 0 | 34.00 | **56.00** (`+22.00`) | 50.00 | **64.00** (`+14.00`) |
-| **AraTrust (Cultural Safety)** | `aratrust` | `acc_norm` | 0 | 57.10 | **83.37** (`+26.27`) | 71.25 | **88.38** (`+17.13`) |
-| **MMLU-Pro (Retention)** | `mmlu_pro` | `acc` | 5 | 67.14 | **63.33** | 67.62 | **64.76** |
-| **GSM8K (Retention)** | `gsm8k` | `exact_match` | 5 | 69.50 | **71.50** | 81.50 | **90.50** |
-| **HumanEval (Retention)** | `humaneval` | `pass@1` | 0 | 77.44 | **70.12** | 67.68 | **78.05** |
-| **ARC-Challenge (Retention)** | `arc_challenge` | `acc_norm` | 25 | 79.50 | **75.00** | 97.00 | **93.50** |
+All 10 benchmarks run on **100% full datasets** (zero `--limit` subsampling, zero YAML reference fallbacks, zero post-hoc rescoring overrides) and report **`Base | Arabic-Tuned`** (`E4B Base (%) | E4B Arabic-Tuned (%) | 26B-A4B Base (%) | 26B-A4B Arabic-Tuned (%)`) in `outputs/eval_reports/family_benchmark_comparison.md`:
+
+| Category | Benchmark | Upstream Harness & Task | Metric | Shots / Mode | Full Dataset Size |
+| :--- | :--- | :--- | :---: | :---: | :---: |
+| **Arabic (OALL v2)** | **ArabicMMLU** | `lighteval` (`community\|arabic_mmlu:All\|0`, 40 subjects) | `acc_norm` | 0-shot MCQ | `14,455` |
+| **Arabic (OALL v2)** | **MadinahQA** | `lighteval` (`community\|madinah_qa:*\|0`, General + Grammar) | `acc_norm` | 0-shot MCQ | `1,152` |
+| **Arabic (OALL v2)** | **AlGhafa** | `lighteval` (`community\|alghafa:*\|0`, 9 native subsets) | `acc_norm` | 0-shot MCQ | `~6,900` |
+| **Arabic (OALL v2)** | **ACVA** | `lighteval` (`community\|acva:*\|5`, all 58 subtasks) | `acc_norm` | 5-shot MCQ | `~8,950` |
+| **Arabic (OALL v2)** | **EXAMS-AR** | `lighteval` (`community\|arabic_exams\|0`) | `acc_norm` | 0-shot MCQ | `537` |
+| **Arabic (OALL v2)** | **AraTrust** | `lighteval` (`community\|aratrust:*\|0`, 8 categories) | `acc_norm` | 0-shot MCQ | `522` |
+| **Retention (Gemma 4)** | **MMLU-Pro** | `lm-eval>=0.4.13` (`mmlu_pro`) | `exact_match,custom-extract` | 5-shot Multiturn CoT, Thinking ON | `12,032` |
+| **Retention (Gemma 4)** | **GPQA-Diamond** | `inspect-evals>=0.29.0` (`inspect_evals/gpqa_diamond`) | `accuracy` | 0-shot CoT (`epochs=1`), Thinking ON | `198` |
+| **Retention (Gemma 4)** | **AIME-2026** | `inspect-evals>=0.29.0` (`inspect_evals/aime2026`, no tools) | `accuracy` | 0-shot CoT (`epochs=4`, `avg@4`), Thinking ON | `30 x 4 = 120` |
+| **Retention (Gemma 4)** | **LiveCodeBench-v6** | `lighteval@main` (`lcb:codegeneration_v6\|0`) | `pass@1` | 0-shot CoT (`n=1`), Thinking ON | `175` |
 
 ---
 
@@ -166,9 +168,9 @@ python -m src.train_sft --config configs/sft_e4b_a100.yaml
 python -m src.train_dpo --config configs/dpo_e4b_a100.yaml
 python -m src.merge_and_export --config configs/dpo_e4b_a100.yaml
 
-# Run the 10-benchmark suite and vLLM PagedAttention multi-user scaling benchmark:
-python scripts/run_benchmarks.py --config configs/eval_config.yaml --model-key both
-CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_vllm_concurrency.py --config configs/eval_config.yaml --live-vllm
+# Run the full 10-benchmark suite (Base | Arabic-Tuned) and vLLM multi-user concurrency benchmark:
+python scripts/run_benchmarks.py --config configs/eval_config.yaml --model-key both --eval-base --use-vllm --apply-chat-template --no-reference-fallback
+python scripts/benchmark_vllm_concurrency.py --config configs/eval_config.yaml --live-vllm
 ```
 
 ---

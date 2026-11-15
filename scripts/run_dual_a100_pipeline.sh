@@ -23,125 +23,137 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 mkdir -p logs outputs/eval_reports assets/plots
 
-echo "======================================================================"
-echo "[Phase 1/4] Building 120k SFT (75/25) & 20k DPO Datasets Once on Disk"
-echo "======================================================================"
-if [[ -f "data/sft_mixed/dataset_info.json" || -f "data/sft_mixed/state.json" ]]; then
-  echo "[Skip] data/sft_mixed already built on disk."
+if [[ -f "outputs/merged_gemma4_e4b_arabic/merged_16bit/config.json" && -f "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit/config.json" ]]; then
+  echo "======================================================================"
+  echo "[Skip] Both merged_16bit checkpoints found on disk:"
+  echo "  - outputs/merged_gemma4_e4b_arabic/merged_16bit/config.json"
+  echo "  - outputs/merged_gemma4_26b_a4b_arabic/merged_16bit/config.json"
+  echo "Skipping Phase 1 (Dataset Build) and Phase 2 (SFT / DPO / TIES-Merge)."
+  echo "======================================================================"
 else
-  "${PYTHON_BIN}" scripts/build_sft_dataset.py \
-    --config configs/sft_26b_a4b_a100.yaml \
-    --output-dir data/sft_mixed \
-    --max-samples 120000
-fi
-
-if [[ -f "data/dpo_mixed/dataset_info.json" || -f "data/dpo_mixed/state.json" ]]; then
-  echo "[Skip] data/dpo_mixed already built on disk."
-else
-  "${PYTHON_BIN}" scripts/build_dpo_dataset.py \
-    --config configs/dpo_26b_a4b_a100.yaml \
-    --output-dir data/dpo_mixed
-fi
-
-echo "======================================================================"
-echo "[Phase 2/4] Launching Simultaneous Dual-GPU Training (GPU 0 + GPU 1)"
-echo "  - GPU 0: Gemma-4-E4B-Arabic-It      -> logs/gpu0_e4b.log"
-echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  -> logs/gpu1_26b_a4b.log"
-echo "======================================================================"
-
-rm -rf unsloth_compiled_cache unsloth_compiled_cache_gpu0 unsloth_compiled_cache_gpu1
-
-(
-  export CUDA_VISIBLE_DEVICES=0
-  export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu0"
-  if [[ -f "outputs/sft_e4b_a100/adapter_config.json" ]]; then
-    echo "[GPU 0] [Skip] Stage 1 SFT adapter already exists at outputs/sft_e4b_a100."
+  echo "======================================================================"
+  echo "[Phase 1/4] Building 120k SFT (75/25) & 20k DPO Datasets Once on Disk"
+  echo "======================================================================"
+  if [[ -f "data/sft_mixed/dataset_info.json" || -f "data/sft_mixed/state.json" ]]; then
+    echo "[Skip] data/sft_mixed already built on disk."
   else
-    echo "[GPU 0] Starting Stage 1 rsLoRA SFT for Gemma-4-E4B-Arabic-It..."
-    "${PYTHON_BIN}" src/train_sft.py \
-      --config configs/sft_e4b_a100.yaml \
-      --dataset-dir data/sft_mixed \
-      --output-dir outputs/sft_e4b_a100
-  fi
-
-  if [[ -f "outputs/dpo_e4b_a100/adapter_config.json" ]]; then
-    echo "[GPU 0] [Skip] Stage 2 DPO adapter already exists at outputs/dpo_e4b_a100."
-  else
-    echo "[GPU 0] Starting Stage 2 Trust-Region DPO for Gemma-4-E4B-Arabic-It..."
-    "${PYTHON_BIN}" src/train_dpo.py \
-      --config configs/dpo_e4b_a100.yaml \
-      --dataset-dir data/dpo_mixed \
-      --sft-adapter-dir outputs/sft_e4b_a100 \
-      --output-dir outputs/dpo_e4b_a100
-  fi
-
-  echo "[GPU 0] Running lossless 16-bit TIES-Merging (lambda=0.50, density=0.70, SFT+DPO 65/35 full-delta) -> merged_16bit..."
-  "${PYTHON_BIN}" src/merge_and_export.py \
-    --base-model unsloth/gemma-4-E4B-it \
-    --sft-adapter-dir outputs/sft_e4b_a100 \
-    --adapter-dir outputs/dpo_e4b_a100 \
-    --output-dir outputs/merged_gemma4_e4b_arabic \
-    --lambda-scale 0.50 \
-    --export-format merged_16bit \
-    --force
-) 2>&1 | tee -a logs/gpu0_e4b.log &
-PID_GPU0=$!
-
-(
-  export CUDA_VISIBLE_DEVICES=1
-  export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu1"
-  if [[ -f "outputs/sft_26b_a4b_a100/adapter_config.json" ]]; then
-    echo "[GPU 1] [Skip] Stage 1 SFT adapter already exists at outputs/sft_26b_a4b_a100."
-  else
-    echo "[GPU 1] Starting Stage 1 rsLoRA SFT for Gemma-4-26B-A4B-Arabic-It (Frozen MoE Router)..."
-    "${PYTHON_BIN}" src/train_sft.py \
+    "${PYTHON_BIN}" scripts/build_sft_dataset.py \
       --config configs/sft_26b_a4b_a100.yaml \
-      --dataset-dir data/sft_mixed \
-      --output-dir outputs/sft_26b_a4b_a100
+      --output-dir data/sft_mixed \
+      --max-samples 120000
   fi
 
-  if [[ -f "outputs/dpo_26b_a4b_a100/adapter_config.json" ]]; then
-    echo "[GPU 1] [Skip] Stage 2 DPO adapter already exists at outputs/dpo_26b_a4b_a100."
+  if [[ -f "data/dpo_mixed/dataset_info.json" || -f "data/dpo_mixed/state.json" ]]; then
+    echo "[Skip] data/dpo_mixed already built on disk."
   else
-    echo "[GPU 1] Starting Stage 2 Trust-Region DPO for Gemma-4-26B-A4B-Arabic-It..."
-    "${PYTHON_BIN}" src/train_dpo.py \
+    "${PYTHON_BIN}" scripts/build_dpo_dataset.py \
       --config configs/dpo_26b_a4b_a100.yaml \
-      --dataset-dir data/dpo_mixed \
-      --sft-adapter-dir outputs/sft_26b_a4b_a100 \
-      --output-dir outputs/dpo_26b_a4b_a100
+      --output-dir data/dpo_mixed
   fi
 
-  if [[ -f "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit/config.json" ]]; then
-    echo "[GPU 1] [Skip] Merged 16-bit checkpoint already exists at outputs/merged_gemma4_26b_a4b_arabic/merged_16bit."
-  else
-    echo "[GPU 1] Running TIES-Merging (lambda=0.85, density=0.70) -> merged_16bit..."
-    "${PYTHON_BIN}" src/merge_and_export.py \
-      --base-model unsloth/gemma-4-26B-A4B-it \
-      --sft-adapter-dir outputs/sft_26b_a4b_a100 \
-      --adapter-dir outputs/dpo_26b_a4b_a100 \
-      --output-dir outputs/merged_gemma4_26b_a4b_arabic \
-      --lambda-scale 0.85 \
-      --export-format merged_16bit
-  fi
-) 2>&1 | tee -a logs/gpu1_26b_a4b.log &
-PID_GPU1=$!
+  echo "======================================================================"
+  echo "[Phase 2/4] Launching Simultaneous Dual-GPU Training (GPU 0 + GPU 1)"
+  echo "  - GPU 0: Gemma-4-E4B-Arabic-It      -> logs/gpu0_e4b.log"
+  echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  -> logs/gpu1_26b_a4b.log"
+  echo "======================================================================"
 
-echo "Waiting for GPU 0 (PID ${PID_GPU0}) and GPU 1 (PID ${PID_GPU1}) to complete..."
-wait "${PID_GPU0}"
-wait "${PID_GPU1}"
+  rm -rf unsloth_compiled_cache unsloth_compiled_cache_gpu0 unsloth_compiled_cache_gpu1
 
-echo "======================================================================"
-echo "[Phase 3/4] Evaluating Both Models on 7 Arabic + 4 Retention Benchmarks"
-echo "======================================================================"
-if ! "${PYTHON_BIN}" -c "import lm_eval, evaluate, sqlitedict, pytablewriter, sacrebleu, rouge_score" >/dev/null 2>&1; then
-  echo "[Setup] Installing lm-eval and evaluation dependencies..."
-  "${PYTHON_BIN}" -m pip install -q "lm-eval>=0.4.8" "evaluate>=0.4.3" "sqlitedict>=2.1.0" "pytablewriter>=1.2.0" "sacrebleu>=2.4.0" "rouge-score>=0.1.2"
+  (
+    export CUDA_VISIBLE_DEVICES=0
+    export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu0"
+    if [[ -f "outputs/sft_e4b_a100/adapter_config.json" ]]; then
+      echo "[GPU 0] [Skip] Stage 1 SFT adapter already exists at outputs/sft_e4b_a100."
+    else
+      echo "[GPU 0] Starting Stage 1 rsLoRA SFT for Gemma-4-E4B-Arabic-It..."
+      "${PYTHON_BIN}" src/train_sft.py \
+        --config configs/sft_e4b_a100.yaml \
+        --dataset-dir data/sft_mixed \
+        --output-dir outputs/sft_e4b_a100
+    fi
+
+    if [[ -f "outputs/dpo_e4b_a100/adapter_config.json" ]]; then
+      echo "[GPU 0] [Skip] Stage 2 DPO adapter already exists at outputs/dpo_e4b_a100."
+    else
+      echo "[GPU 0] Starting Stage 2 Trust-Region DPO for Gemma-4-E4B-Arabic-It..."
+      "${PYTHON_BIN}" src/train_dpo.py \
+        --config configs/dpo_e4b_a100.yaml \
+        --dataset-dir data/dpo_mixed \
+        --sft-adapter-dir outputs/sft_e4b_a100 \
+        --output-dir outputs/dpo_e4b_a100
+    fi
+
+    if [[ -f "outputs/merged_gemma4_e4b_arabic/merged_16bit/config.json" ]]; then
+      echo "[GPU 0] [Skip] Merged 16-bit checkpoint already exists at outputs/merged_gemma4_e4b_arabic/merged_16bit."
+    else
+      echo "[GPU 0] Running lossless 16-bit TIES-Merging (lambda=0.50, density=0.70, SFT+DPO 65/35 full-delta) -> merged_16bit..."
+      "${PYTHON_BIN}" src/merge_and_export.py \
+        --base-model unsloth/gemma-4-E4B-it \
+        --sft-adapter-dir outputs/sft_e4b_a100 \
+        --adapter-dir outputs/dpo_e4b_a100 \
+        --output-dir outputs/merged_gemma4_e4b_arabic \
+        --lambda-scale 0.50 \
+        --export-format merged_16bit
+    fi
+  ) 2>&1 | tee -a logs/gpu0_e4b.log &
+  PID_GPU0=$!
+
+  (
+    export CUDA_VISIBLE_DEVICES=1
+    export UNSLOTH_COMPILE_LOCATION="unsloth_compiled_cache_gpu1"
+    if [[ -f "outputs/sft_26b_a4b_a100/adapter_config.json" ]]; then
+      echo "[GPU 1] [Skip] Stage 1 SFT adapter already exists at outputs/sft_26b_a4b_a100."
+    else
+      echo "[GPU 1] Starting Stage 1 rsLoRA SFT for Gemma-4-26B-A4B-Arabic-It (Frozen MoE Router)..."
+      "${PYTHON_BIN}" src/train_sft.py \
+        --config configs/sft_26b_a4b_a100.yaml \
+        --dataset-dir data/sft_mixed \
+        --output-dir outputs/sft_26b_a4b_a100
+    fi
+
+    if [[ -f "outputs/dpo_26b_a4b_a100/adapter_config.json" ]]; then
+      echo "[GPU 1] [Skip] Stage 2 DPO adapter already exists at outputs/dpo_26b_a4b_a100."
+    else
+      echo "[GPU 1] Starting Stage 2 Trust-Region DPO for Gemma-4-26B-A4B-Arabic-It..."
+      "${PYTHON_BIN}" src/train_dpo.py \
+        --config configs/dpo_26b_a4b_a100.yaml \
+        --dataset-dir data/dpo_mixed \
+        --sft-adapter-dir outputs/sft_26b_a4b_a100 \
+        --output-dir outputs/dpo_26b_a4b_a100
+    fi
+
+    if [[ -f "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit/config.json" ]]; then
+      echo "[GPU 1] [Skip] Merged 16-bit checkpoint already exists at outputs/merged_gemma4_26b_a4b_arabic/merged_16bit."
+    else
+      echo "[GPU 1] Running TIES-Merging (lambda=0.85, density=0.70) -> merged_16bit..."
+      "${PYTHON_BIN}" src/merge_and_export.py \
+        --base-model unsloth/gemma-4-26B-A4B-it \
+        --sft-adapter-dir outputs/sft_26b_a4b_a100 \
+        --adapter-dir outputs/dpo_26b_a4b_a100 \
+        --output-dir outputs/merged_gemma4_26b_a4b_arabic \
+        --lambda-scale 0.85 \
+        --export-format merged_16bit
+    fi
+  ) 2>&1 | tee -a logs/gpu1_26b_a4b.log &
+  PID_GPU1=$!
+
+  echo "Waiting for GPU 0 (PID ${PID_GPU0}) and GPU 1 (PID ${PID_GPU1}) to complete..."
+  wait "${PID_GPU0}"
+  wait "${PID_GPU1}"
 fi
 
-if ! "${PYTHON_BIN}" -c "import lighteval, inspect_ai" >/dev/null 2>&1; then
-  echo "[Setup] Installing lighteval (main branch) and helper dependencies..."
-  "${PYTHON_BIN}" -m pip install -q "inspect-ai" "aenum==3.1.15" "termcolor==2.3.0" "colorlog" "pycountry" "langcodes" "latex2sympy2_extended==1.0.6" "more_itertools" "nltk" "scikit-learn" "GitPython>=3.1.41" "typer>=0.12.0"
-  "${PYTHON_BIN}" -m pip install -q --no-deps "git+https://github.com/huggingface/lighteval.git@main"
+echo "======================================================================"
+echo "[Phase 3/4] Evaluating Both Models on 6 OALL v2 Arabic + 4 Official Gemma 4 Retention Benchmarks (Full Datasets)"
+echo "======================================================================"
+if ! "${PYTHON_BIN}" -c "import lm_eval, evaluate, sqlitedict, pytablewriter, sacrebleu, rouge_score; from packaging.version import Version; assert Version(lm_eval.__version__) >= Version('0.4.13')" >/dev/null 2>&1; then
+  echo "[Setup] Installing lm-eval>=0.4.13 and evaluation dependencies..."
+  "${PYTHON_BIN}" -m pip install -q "lm-eval>=0.4.13" "evaluate>=0.4.3" "sqlitedict>=2.1.0" "pytablewriter>=1.2.0" "sacrebleu>=2.4.0" "rouge-score>=0.1.2"
+fi
+
+if ! "${PYTHON_BIN}" -c "import lighteval, inspect_ai, inspect_evals, ray, more_itertools; from lighteval.tasks.tasks.lcb import main as _lcb; from packaging.version import Version; assert Version(inspect_ai.__version__) >= Version('0.3.290')" >/dev/null 2>&1; then
+  echo "[Setup] Installing inspect-ai>=0.3.290, inspect-evals>=0.29.0, ray, and lighteval (main branch)..."
+  "${PYTHON_BIN}" -m pip install -q "inspect-ai>=0.3.290" "inspect-evals>=0.29.0" "ray" "aenum==3.1.15" "termcolor>=2.3.0" "colorlog" "pycountry" "langcodes" "latex2sympy2_extended==1.0.6" "more_itertools" "nltk" "scikit-learn" "GitPython>=3.1.41" "typer>=0.12.0"
+  "${PYTHON_BIN}" -m pip install -q --no-deps --force-reinstall "git+https://github.com/huggingface/lighteval.git@main"
 fi
 
 if ! "${PYTHON_BIN}" -c "import vllm" >/dev/null 2>&1; then
@@ -159,7 +171,7 @@ fi
   --config configs/eval_config.yaml \
   --model-key both \
   --eval-base \
-  --limit 200 \
+  --use-cached-eval \
   --use-vllm \
   --apply-chat-template \
   --no-reference-fallback
