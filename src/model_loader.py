@@ -874,7 +874,11 @@ def load_gemma4_8gb_model_and_tokenizer(
         }
         if "load_in_16bit" in inspect.signature(loader_cls.from_pretrained).parameters and not load_in_4bit:
             unsloth_kwargs["load_in_16bit"] = True
-        if hf_config is not None and adapter_checkpoint is None:
+        # IMPORTANT: Never pass `config=hf_config` (from the 16-bit repo) into Unsloth's
+        # `from_pretrained` when `load_in_4bit=True`, because Unsloth remaps `unsloth/gemma-4-E4B-it`
+        # to `unsloth/gemma-4-E4B-it-unsloth-bnb-4bit` (pre-quantized Dynamic 4-bit) and passing an
+        # unquantized `config` wipes out `quantization_config`, discarding `quant_state` tensors!
+        if hf_config is not None and adapter_checkpoint is None and not load_in_4bit:
             unsloth_kwargs["config"] = hf_config
         try:
             model, raw_proc_or_tok = loader_cls.from_pretrained(**unsloth_kwargs)
