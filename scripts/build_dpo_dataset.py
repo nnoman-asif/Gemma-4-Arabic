@@ -1,19 +1,21 @@
-"""CLI script to build, validate, and save the Stage 2 DPO dataset to disk.
+"""CLI script to build, decontaminate, validate, or pull the Stage 2 DPO dataset (20,000 pairs).
 
 Supports:
-1. `HeshamHaroon/arabic-dialect-dpo` (`name="saudi"`, explicitly validated).
-2. `arcee-globe/arabic-orpo-dpo-mix-40k-filtered` (unifying `rejected[0]["content"]`
-   from `chosen[0]["content"]` so both preference branches share the exact same prompt).
-3. Gemma 4 thinking-block preservation check on all `chosen` and `rejected` completions.
-4. `--dry-run` and `--max-samples` flags for fast validation and smoke testing.
+1. `HeshamHaroon/arabic-dialect-dpo` (`name="saudi"`, strictly filtered against truncation and English leaks — 20%).
+2. `arcee-globe/arabic-orpo-dpo-mix-40k-filtered` (unified user prompt, length-ratio guarded — 65%).
+3. `argilla/ultrafeedback-binarized-preferences-cleaned` (`split="train"`, `chosen-rating >= 4.5`
+   and margin `>= 1.0` English retention anchor — 15%).
+4. `--pull-from-hub` fast path to download the pre-built verified preference corpus from
+   `noman-asif/Arabic-Preference-DPO-20k` in seconds on rented GPU instances.
 """
 
 import argparse
 import json
 import logging
 import pathlib
+import shutil
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import yaml
 
@@ -22,20 +24,38 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.chat_template import verify_thinking_block_preserved
-from src.constants import ARABIC_DIALECT_DPO_REPO, DPO_DATASETS
+from src.constants import (
+    ARABIC_DIALECT_DPO_REPO,
+    DPO_DATASETS,
+    PRIMARY_MODEL_ID,
+    PUBLISHED_DPO_DATASET_REPO,
+    load_dotenv_if_present,
+)
+from src.data_normalizer import BenchmarkDecontaminator
 from src.dpo_formatter import (
     load_and_normalize_dpo_source,
     mix_dpo_preference_datasets,
     normalize_arabic_dialect_dpo_row,
     normalize_arcee_arabic_dpo_row,
+    normalize_ultrafeedback_dpo_row,
     validate_dpo_load_config,
 )
 
 logger = logging.getLogger(__name__)
 
 
+def _load_optional_gemma4_tokenizer(model_id: str = PRIMARY_MODEL_ID) -> Optional[Any]:
+    """Load the Gemma 4 tokenizer for exact token-length filtering when available."""
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(model_id)
+    except Exception:
+        return None
+
+
 def build_synthetic_dpo_dry_run_pools() -> Dict[str, List[Dict[str, Any]]]:
-    """Generate deterministic schema-accurate preference pairs for Stage 2 DPO dry-run."""
+    """Generate deterministic schema-accurate preference pairs for all 3 Stage 2 DPO sources."""
     validated_cfg = validate_dpo_load_config(ARABIC_DIALECT_DPO_REPO, "saudi")
     assert validated_cfg == "saudi"
 
@@ -43,7 +63,7 @@ def build_synthetic_dpo_dry_run_pools() -> Dict[str, List[Dict[str, Any]]]:
         normalize_arabic_dialect_dpo_row(
             {
                 "prompt": "وش الإجراءات المطلوبة لإصدار رخصة قيادة في السعودية؟",
-                "chosen": "تبدأ بحجز موعد في مدرسة القيادة عبر منصة أبشر، وإجراء الفحص الطبي، ثم اجتياز التدريب النظري والعملي.",
+                "chosen": "تبدأ بحجز موعد في مدرسة القيادة عبر منصة أبشر، وإجراء الفحص الطبي المعتمد، ثم اجتياز التدريب النظري والعملي.",
                 "rejected": "ما عندي فكرة عن الموضوع.",
                 "dialect": "saudi",
             }
@@ -78,7 +98,7 @@ def build_synthetic_dpo_dry_run_pools() -> Dict[str, List[Dict[str, Any]]]:
                     },
                     {
                         "role": "assistant",
-                        "content": "التوازن البيئي غير مهم.",
+                        "content": "التوازن البيئي غير مهم في الطبيعة.",
                     },
                 ],
             }
@@ -92,7 +112,7 @@ def build_synthetic_dpo_dry_run_pools() -> Dict[str, List[Dict[str, Any]]]:
                     },
                     {
                         "role": "assistant",
-                        "content": "نجمع الحدود المتشابهة، ثم ننقل الثوابت إلى طرف والمتغيرات إلى الطرف الآخر، وأخيرا نقسم على معامل المتغير.",
+                        "content": "نجمع الحدود المتشابهة، ثم ننقل الثوابت إلى طرف والمتغيرات إلى الطرف الآخر، وأخيراً نقسم على معامل المتغير.",
                     },
                 ],
                 "rejected": [
@@ -102,55 +122,62 @@ def build_synthetic_dpo_dry_run_pools() -> Dict[str, List[Dict[str, Any]]]:
                     },
                     {
                         "role": "assistant",
-                        "content": "نخمن الرقم مباشرة.",
-                    },
-                ],
-            }
-        ),
-        normalize_arcee_arabic_dpo_row(
-            {
-                "chosen": [
-                    {
-                        "role": "user",
-                        "content": "ما دور هيئة البيانات والذكاء الاصطناعي (سدايا)؟",
-                    },
-                    {
-                        "role": "assistant",
-                        "content": "تتولى سدايا قيادة الأجندة الوطنية للبيانات والذكاء الاصطناعي في المملكة وتطوير المنصات الحكومية الذكية.",
-                    },
-                ],
-                "rejected": [
-                    {
-                        "role": "user",
-                        "content": "نص سؤال غير مطابق في الفرع المرفوض.",
-                    },
-                    {
-                        "role": "assistant",
-                        "content": "لا أعلم.",
+                        "content": "نخمن الرقم مباشرة دون خطوات.",
                     },
                 ],
             }
         ),
     ]
 
+    english_samples = [
+        normalize_ultrafeedback_dpo_row(
+            {
+                "prompt": "Explain the time and space complexity of merge sort on an array of n elements.",
+                "chosen-rating": 5.0,
+                "rejected-rating": 3.0,
+                "chosen": [
+                    {
+                        "role": "user",
+                        "content": "Explain the time and space complexity of merge sort on an array of n elements.",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Merge sort runs in O(n log n) time in the best, average, and worst cases because it halves the array log2(n) times and merges n elements per level, using O(n) auxiliary space.",
+                    },
+                ],
+                "rejected": [
+                    {
+                        "role": "user",
+                        "content": "Explain the time and space complexity of merge sort on an array of n elements.",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Merge sort takes O(n^2) time and uses no extra memory.",
+                    },
+                ],
+            }
+        )
+    ]
+
     return {
         "saudi": [s for s in saudi_samples if s is not None],
         "arcee": [s for s in arcee_samples if s is not None],
+        "english": [s for s in english_samples if s is not None],
     }
 
 
 def validate_dpo_pairs(pairs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Verify prompt unification and Gemma 4 thinking-block preservation on DPO pairs."""
+    """Verify prompt unification, uniform message schema, and Gemma 4 native token invariants on DPO pairs."""
     unified_prompt_matches = 0
     for idx, pair in enumerate(pairs):
         enable_thinking = bool(pair.get("enable_thinking", False))
-        chosen_str = pair.get("chosen", "")
-        rejected_str = pair.get("rejected", "")
+        chosen_str = str(pair.get("chosen") or "")
+        rejected_str = str(pair.get("rejected") or "")
 
         if not verify_thinking_block_preserved(chosen_str, enable_thinking=enable_thinking):
-            raise ValueError(f"DPO pair {idx} chosen completion missing thinking block.")
+            raise ValueError(f"DPO pair {idx} chosen completion failed Gemma 4 token verification.")
         if not verify_thinking_block_preserved(rejected_str, enable_thinking=enable_thinking):
-            raise ValueError(f"DPO pair {idx} rejected completion missing thinking block.")
+            raise ValueError(f"DPO pair {idx} rejected completion failed Gemma 4 token verification.")
 
         c_msgs = pair.get("chosen_messages", [])
         r_msgs = pair.get("rejected_messages", [])
@@ -158,6 +185,13 @@ def validate_dpo_pairs(pairs: List[Dict[str, Any]]) -> Dict[str, Any]:
             raise ValueError(
                 f"DPO pair {idx} failed prompt unification between chosen[0] and rejected[0]."
             )
+
+        p_msgs = pair.get("prompt_messages", [])
+        co_msgs = pair.get("chosen_only_messages", [])
+        ro_msgs = pair.get("rejected_only_messages", [])
+        if not p_msgs or not co_msgs or not ro_msgs:
+            raise ValueError(f"DPO pair {idx} missing conversational TRL message lists.")
+
         unified_prompt_matches += 1
 
     return {
@@ -167,9 +201,9 @@ def validate_dpo_pairs(pairs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    """Parse CLI arguments for building the Stage 2 DPO dataset."""
+    """Parse CLI arguments for building or pulling the Stage 2 DPO dataset."""
     parser = argparse.ArgumentParser(
-        description="Build, validate, and save the Stage 2 DPO preference dataset."
+        description="Build, decontaminate, validate, or pull the Stage 2 DPO preference dataset."
     )
     parser.add_argument(
         "--config",
@@ -188,6 +222,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Maximum total preference pairs to build.",
+    )
+    parser.add_argument(
+        "--pull-from-hub",
+        action="store_true",
+        help=f"Pull pre-built verified DPO dataset directly from `{PUBLISHED_DPO_DATASET_REPO}`.",
+    )
+    parser.add_argument(
+        "--hub-repo",
+        type=str,
+        default=PUBLISHED_DPO_DATASET_REPO,
+        help="Hugging Face dataset repository ID when using --pull-from-hub.",
+    )
+    parser.add_argument(
+        "--skip-decontamination",
+        action="store_true",
+        help="Skip live benchmark test-set loading for 13-gram decontamination.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild or re-download even if output-dir already exists.",
     )
     parser.add_argument(
         "--dry-run",
@@ -209,10 +264,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Entry point for Stage 2 DPO dataset construction and verification."""
+    """Entry point for Stage 2 DPO dataset construction, decontamination, and verification."""
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
+    load_dotenv_if_present()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -227,11 +283,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     pref_sources = ds_cfg.get("preference_sources", {})
 
     saudi_weight = float(
-        pref_sources.get("arabic_dialect_dpo_saudi", {}).get("weight", 0.35)
+        pref_sources.get("arabic_dialect_dpo_saudi", {}).get("weight", 0.20)
     )
     arcee_weight = float(
         pref_sources.get("arabic_orpo_dpo_mix_40k", {}).get("weight", 0.65)
     )
+    english_weight = float(
+        pref_sources.get("ultrafeedback_english_dpo", {}).get(
+            "weight", max(0.0, round(1.0 - saudi_weight - arcee_weight, 4))
+        )
+    )
+
     total_target = int(
         args.max_samples
         if args.max_samples is not None
@@ -241,14 +303,57 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.output_dir or ds_cfg.get("output_dataset_dir", "data/dpo_mixed")
     )
 
+    if not args.dry_run and not args.force and (output_dir / "dataset_info.json").exists():
+        logger.info("Stage 2 DPO dataset already exists at %s; skipping (pass --force to rebuild).", output_dir)
+        return 0
+
+    if args.pull_from_hub and not args.dry_run:
+        from datasets import load_dataset
+
+        logger.info("Pulling pre-built verified DPO dataset from Hugging Face Hub: %s ...", args.hub_repo)
+        hf_ds = load_dataset(args.hub_repo, split="train")
+        if args.max_samples is not None and args.max_samples < len(hf_ds):
+            hf_ds = hf_ds.select(range(args.max_samples))
+        rows_for_check = [hf_ds[i] for i in range(len(hf_ds))]
+        validation_stats = validate_dpo_pairs(rows_for_check)
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        hf_ds.save_to_disk(str(output_dir))
+        summary = {
+            "mode": "pulled_from_hub",
+            "hub_repo": args.hub_repo,
+            "total_pairs": len(hf_ds),
+            "validation_stats": validation_stats,
+            "output_dir": str(output_dir),
+        }
+        (output_dir / "manifest.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        logger.info("Saved %d verified DPO pairs from '%s' to %s", len(hf_ds), args.hub_repo, output_dir)
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
     saudi_target = max(1, int(round(total_target * saudi_weight)))
-    arcee_target = max(1, total_target - saudi_target)
+    english_target = (
+        max(1, int(round(total_target * english_weight))) if english_weight > 0 else 0
+    )
+    arcee_target = max(1, total_target - saudi_target - english_target)
 
     if args.dry_run and not args.live_stream:
         pools = build_synthetic_dpo_dry_run_pools()
         saudi_samples = pools["saudi"][:saudi_target]
         arcee_samples = pools["arcee"][:arcee_target]
+        english_samples = pools["english"][: max(1, english_target)]
+        decontam_summary: Dict[str, int] = {}
     else:
+        tokenizer = _load_optional_gemma4_tokenizer(PRIMARY_MODEL_ID)
+        decontaminator = BenchmarkDecontaminator.from_eval_benchmarks(
+            load_live=not (args.skip_decontamination or args.dry_run)
+        )
+        decontam_summary = dict(decontaminator.loaded_benchmarks)
+        seen_prompts: Set[bytes] = set()
+
         logger.info(
             "Streaming %d samples from DPO source 'arabic_dialect_dpo_saudi'...",
             saudi_target,
@@ -257,9 +362,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             source_key="arabic_dialect_dpo_saudi",
             max_samples=saudi_target,
             streaming=True,
+            tokenizer=tokenizer,
+            decontaminator=decontaminator,
+            seen_prompts=seen_prompts,
         )
+
+        # Absorb any strict-hygiene Saudi shortfall into high-quality Arcee MSA pairs
+        arabic_target_sum = total_target - english_target
         effective_arcee_target = (
-            max(arcee_target, total_target - len(saudi_samples))
+            max(arcee_target, arabic_target_sum - len(saudi_samples))
             if not args.dry_run
             else arcee_target
         )
@@ -271,13 +382,38 @@ def main(argv: Optional[List[str]] = None) -> int:
             source_key="arabic_orpo_dpo_mix_40k",
             max_samples=effective_arcee_target,
             streaming=True,
+            tokenizer=tokenizer,
+            decontaminator=decontaminator,
+            seen_prompts=seen_prompts,
         )
+
+        english_samples = []
+        if english_target > 0:
+            effective_eng_target = (
+                max(english_target, total_target - len(saudi_samples) - len(arcee_samples))
+                if not args.dry_run
+                else english_target
+            )
+            logger.info(
+                "Streaming %d samples from DPO source 'ultrafeedback_english_dpo'...",
+                effective_eng_target,
+            )
+            english_samples = load_and_normalize_dpo_source(
+                source_key="ultrafeedback_english_dpo",
+                max_samples=effective_eng_target,
+                streaming=True,
+                tokenizer=tokenizer,
+                decontaminator=decontaminator,
+                seen_prompts=seen_prompts,
+            )
 
     mixed_pairs, mix_stats = mix_dpo_preference_datasets(
         saudi_dpo_samples=saudi_samples,
         arcee_dpo_samples=arcee_samples,
+        english_dpo_samples=english_samples,
         saudi_weight=saudi_weight,
         arcee_weight=arcee_weight,
+        english_weight=english_weight,
         seed=args.seed,
     )
     validation_stats = validate_dpo_pairs(mixed_pairs)
@@ -286,6 +422,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "mode": "dry_run" if args.dry_run else "production",
         "dpo_sources_configured": list(DPO_DATASETS.keys()),
         "saudi_config_verified": validate_dpo_load_config(ARABIC_DIALECT_DPO_REPO, "saudi"),
+        "decontaminated_benchmarks": decontam_summary,
         "mix_stats": mix_stats,
         "validation_stats": validation_stats,
         "output_dir": str(output_dir),
@@ -294,6 +431,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.dry_run:
         from datasets import Dataset
 
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         hf_dataset = Dataset.from_list(mixed_pairs)
         hf_dataset.save_to_disk(str(output_dir))

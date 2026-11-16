@@ -1,21 +1,25 @@
-"""Unsloth 4-bit NF4 model loader and rsLoRA adapter injector for Gemma-4-Arabic.
+"""Unsloth 4-bit NF4 model loader and QLoRA adapter injector for Gemma-4-Arabic (E4B & 26B-A4B MoE).
 
-Integrates `src/vram_hooks.py` to enforce the 8.0 GB GPU VRAM budget by:
-1. Mapping `embed_tokens_per_layer`, `audio_tower`, and `vision_tower` to CPU RAM during load.
+Supports both the dual-A100 80 GB production tier (zero CPU offload) and the 8.0 GB single-GPU tier:
+1. Mapping `embed_tokens_per_layer`, `audio_tower`, and `vision_tower` to CPU RAM when `offload_ple_to_cpu=True`.
 2. Registering the non-blocking CPU lookup forward hook on `embed_tokens_per_layer` (5.637 GB).
-3. Offloading `audio_tower` (0.618 GB) and `vision_tower` (0.339 GB) to CPU RAM.
-4. Freezing token embeddings (`embed_tokens`, `lm_head`, `embed_tokens_per_layer`) to preserve
-   Gemma 4's 262,144 vocabulary (including 8,460 native Arabic tokens).
-5. Attaching rsLoRA (`use_rslora=True`, `r=32`, `lora_alpha=64`, `lora_dropout=0.0`, `bias="none"`)
-   across all 7 linear projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`,
-   `up_proj`, `down_proj`) with `use_gradient_checkpointing="unsloth"`.
+3. Offloading `audio_tower` (0.618 GB) and `vision_tower` (0.339 GB) to CPU RAM when configured.
+4. Freezing token embeddings (`embed_tokens`, `lm_head`, `embed_tokens_per_layer`) and MoE `router` gates
+   to preserve Gemma 4's 262,144 vocabulary (including 8,460 native Arabic tokens) and routing balance.
+5. Attaching QLoRA (`use_rslora=False`, `r=32, lora_alpha=32` on Dense E4B; `r=16, lora_alpha=16` across
+   attention, shared MLP, and all 128 3D expert projections via `target_modules=None` on Sparse 26B-A4B MoE)
+   with `use_gradient_checkpointing="unsloth"`.
 """
 
 import builtins
 import gc
 import inspect
+import json
 import logging
 import os
+import pathlib
+import re
+import shutil
 import sys
 import types
 import warnings
@@ -330,6 +334,7 @@ from src.constants import (
     MULTIMODAL_TOWER_PATTERNS,
     PLE_MODULE_PATTERN,
     USE_RSLORA,
+    load_dotenv_if_present,
 )
 from src.vram_hooks import (
     OffloadState,
@@ -339,7 +344,20 @@ from src.vram_hooks import (
     register_ple_cpu_offload_hook,
 )
 
+load_dotenv_if_present()
 logger = logging.getLogger(__name__)
+
+
+def _get_unsloth_loader_cls() -> Any:
+    """Prefer Unsloth `FastModel` (native Gemma 4 VLM + 3D MoE support), falling back to `FastLanguageModel`."""
+    try:
+        from unsloth import FastModel  # type: ignore
+
+        return FastModel
+    except Exception:
+        from unsloth import FastLanguageModel  # type: ignore
+
+        return FastLanguageModel
 
 
 def resolve_torch_dtype(dtype_spec: Union[str, torch.dtype]) -> torch.dtype:
@@ -417,21 +435,31 @@ def freeze_embeddings_and_towers(
     model: nn.Module,
     freeze_moe_router: bool = True,
 ) -> List[str]:
-    """Freeze input/output token embeddings, PLE tables, multimodal towers, and MoE routers."""
+    """Freeze input/output token embeddings, PLE tables, multimodal towers, and MoE routers.
+
+    Never freezes language/expert LoRA adapter weights (`lora_A`, `lora_B`, `lora_embedding`),
+    while guaranteeing `router`, `vision_tower`, `audio_tower`, and embeddings remain frozen.
+    """
     frozen_names: List[str] = []
     freeze_tokens: List[str] = [
         "embed_tokens",
         "lm_head",
         PLE_MODULE_PATTERN,
         *MULTIMODAL_TOWER_PATTERNS,
+        "embed_audio",
+        "embed_vision",
         "multi_modal_projector",
     ]
     if freeze_moe_router:
         freeze_tokens.extend(MOE_ROUTER_KEYWORDS)
     for name, param in model.named_parameters():
-        if any(tok in name for tok in freeze_tokens):
+        is_lora_param = "lora_" in name
+        matches_freeze = any(tok in name for tok in freeze_tokens) or (".ref." in name)
+        if matches_freeze:
             param.requires_grad_(False)
             frozen_names.append(name)
+        elif is_lora_param and not param.requires_grad:
+            param.requires_grad_(True)
     return frozen_names
 
 
@@ -608,17 +636,28 @@ def inject_rslora_adapters(
     lora_dropout: float = LORA_DROPOUT,
     bias: str = LORA_BIAS,
     use_rslora: bool = USE_RSLORA,
-    target_modules: Sequence[str] = LORA_TARGET_MODULES,
+    target_modules: Optional[Sequence[str]] = None,
     exclude_modules: Sequence[str] = LORA_EXCLUDE_MODULES,
     use_gradient_checkpointing: Union[str, bool] = "unsloth",
     random_state: int = 3407,
+    is_moe: bool = False,
 ) -> nn.Module:
-    """Attach rsLoRA adapters across the 7 language linear projections.
+    """Attach LoRA/rsLoRA adapters across language attention, shared MLP, and (on 26B MoE) all 128 3D experts.
 
-    Uses Unsloth's `FastLanguageModel.get_peft_model` when available, with a
-    clean fallback to Hugging Face PEFT `get_peft_model` + `LoraConfig`.
+    When `target_modules is None` or `is_moe=True`, delegates target discovery to Unsloth's
+    `FastModel.get_peft_model` (`finetune_vision_layers=False, finetune_language_layers=True,
+    finetune_attention_modules=True, finetune_mlp_modules=True`) so Gemma-4-26B-A4B trains
+    both 2D attention/shared-MLP projections AND 3D `ParamWrapper` routed experts
+    (`experts.gate_up_proj`, `experts.down_proj`, ~498.5M params at `r=16`) while keeping
+    `router`, `vision_tower`, `audio_tower`, and embeddings frozen.
     """
-    target_list = list(target_modules)
+    # Sanitize any legacy "mlp.gate_proj" prefixes into bare leaf names if target_modules was supplied
+    sanitized_targets: Optional[List[str]] = None
+    if target_modules is not None and not is_moe:
+        sanitized_targets = [
+            m.split(".")[-1] if m.startswith("mlp.") else m for m in target_modules
+        ]
+    fallback_target_list = sanitized_targets if sanitized_targets else list(LORA_TARGET_MODULES)
     exclude_list = list(dict.fromkeys([*LORA_EXCLUDE_MODULES, *exclude_modules]))
     exclude_regex = (
         r".*(" + "|".join(exclude_list) + r").*"
@@ -627,15 +666,17 @@ def inject_rslora_adapters(
     )
 
     try:
-        from unsloth import FastLanguageModel  # type: ignore
+        loader_cls = _get_unsloth_loader_cls()
 
         logger.info(
-            "Attaching rsLoRA via Unsloth FastLanguageModel.get_peft_model "
-            "(r=%d, alpha=%d, use_rslora=%s, targets=%s).",
+            "Attaching LoRA via Unsloth %s.get_peft_model "
+            "(r=%d, alpha=%d, use_rslora=%s, is_moe=%s, targets=%s).",
+            loader_cls.__name__,
             r,
             lora_alpha,
             use_rslora,
-            target_list,
+            is_moe,
+            "auto_language_and_experts" if sanitized_targets is None else sanitized_targets,
         )
         unsloth_peft_kwargs: Dict[str, Any] = {
             "r": r,
@@ -643,27 +684,33 @@ def inject_rslora_adapters(
             "use_rslora": use_rslora,
             "lora_dropout": lora_dropout,
             "bias": bias,
-            "target_modules": target_list,
             "use_gradient_checkpointing": use_gradient_checkpointing,
             "random_state": random_state,
         }
-        try:
-            sig = inspect.signature(FastLanguageModel.get_peft_model)
-            if "finetune_vision_layers" in sig.parameters:
-                unsloth_peft_kwargs["finetune_vision_layers"] = False
-            if "finetune_language_layers" in sig.parameters:
-                unsloth_peft_kwargs["finetune_language_layers"] = True
-        except Exception:
-            pass
+        sig = inspect.signature(loader_cls.get_peft_model)
+        supports_auto_flags = "finetune_mlp_modules" in sig.parameters
+        if "finetune_vision_layers" in sig.parameters:
+            unsloth_peft_kwargs["finetune_vision_layers"] = False
+        if "finetune_language_layers" in sig.parameters:
+            unsloth_peft_kwargs["finetune_language_layers"] = True
+        if "finetune_attention_modules" in sig.parameters:
+            unsloth_peft_kwargs["finetune_attention_modules"] = True
+        if "finetune_mlp_modules" in sig.parameters:
+            unsloth_peft_kwargs["finetune_mlp_modules"] = True
+
+        if sanitized_targets is not None and not is_moe:
+            unsloth_peft_kwargs["target_modules"] = sanitized_targets
+        elif not supports_auto_flags:
+            unsloth_peft_kwargs["target_modules"] = fallback_target_list
 
         try:
-            peft_model = FastLanguageModel.get_peft_model(
+            peft_model = loader_cls.get_peft_model(
                 model,
                 exclude_modules=exclude_list,
                 **unsloth_peft_kwargs,
             )
         except TypeError:
-            peft_model = FastLanguageModel.get_peft_model(
+            peft_model = loader_cls.get_peft_model(
                 model,
                 **unsloth_peft_kwargs,
             )
@@ -682,8 +729,8 @@ def inject_rslora_adapters(
         setattr(peft_model, "_is_unsloth_model", True)
         return peft_model
     except Exception as unsloth_exc:
-        logger.info(
-            "Unsloth get_peft_model unavailable or bypassed (%s); falling back to PEFT LoraConfig.",
+        logger.warning(
+            "Unsloth get_peft_model unavailable (%s); falling back to PEFT LoraConfig.",
             unsloth_exc,
         )
         from peft import LoraConfig, get_peft_model
@@ -698,16 +745,26 @@ def inject_rslora_adapters(
             except TypeError:
                 model.gradient_checkpointing_enable()
 
-        lora_cfg = LoraConfig(
-            r=r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            bias=bias,
-            use_rslora=use_rslora,
-            target_modules=target_list,
-            exclude_modules=exclude_regex,
-            task_type="CAUSAL_LM",
-        )
+        lora_kwargs: Dict[str, Any] = {
+            "r": r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "bias": bias,
+            "use_rslora": use_rslora,
+            "target_modules": fallback_target_list,
+            "exclude_modules": exclude_regex,
+            "task_type": "CAUSAL_LM",
+        }
+        if is_moe and "target_parameters" in inspect.signature(LoraConfig.__init__).parameters:
+            has_3d_experts = any(
+                "experts.gate_up_proj" in n for n, _ in model.named_parameters()
+            )
+            if has_3d_experts:
+                lora_kwargs["target_parameters"] = [
+                    "experts.gate_up_proj",
+                    "experts.down_proj",
+                ]
+        lora_cfg = LoraConfig(**lora_kwargs)
         peft_model = get_peft_model(model, lora_cfg)
         if not getattr(model, "_is_unsloth_model", False):
             install_chunked_causal_lm_loss(peft_model)
@@ -749,7 +806,12 @@ def load_gemma4_8gb_model_and_tokenizer(
         offload_ple_to_cpu=offload_ple_to_cpu,
         offload_multimodal_towers_to_cpu=offload_multimodal_towers_to_cpu,
     )
-    resolved_targets = list(target_modules) if target_modules is not None else list(LORA_TARGET_MODULES)
+    is_moe_arch = "26b" in model_name.lower() or "a4b" in model_name.lower()
+    resolved_targets: Optional[List[str]] = (
+        None
+        if (target_modules is None or is_moe_arch)
+        else list(target_modules)
+    )
     resolved_excludes = list(exclude_modules) if exclude_modules is not None else list(LORA_EXCLUDE_MODULES)
     load_path = adapter_checkpoint if adapter_checkpoint is not None else model_name
 
@@ -761,6 +823,10 @@ def load_gemma4_8gb_model_and_tokenizer(
         from transformers import AutoConfig
 
         hf_config = AutoConfig.from_pretrained(model_name)
+        text_subcfg = getattr(hf_config, "text_config", hf_config)
+        if getattr(text_subcfg, "num_local_experts", 0) or getattr(text_subcfg, "enable_moe_block", False):
+            is_moe_arch = True
+            resolved_targets = None
         try:
             hf_config.tie_word_embeddings = True
             if getattr(hf_config, "text_config", None) is not None:
@@ -788,19 +854,15 @@ def load_gemma4_8gb_model_and_tokenizer(
 
     used_unsloth_loader = False
     try:
-        if not load_in_4bit and adapter_checkpoint is not None and not is_trainable:
-            raise RuntimeError(
-                "Bypassing Unsloth FastLanguageModel for 16-bit checkpoint merge so "
-                f"the true BF16 base model '{model_name}' is loaded instead of the 4-bit "
-                "base_model_name_or_path recorded in adapter_config.json."
-            )
-        from unsloth import FastLanguageModel  # type: ignore
+        loader_cls = _get_unsloth_loader_cls()
 
         logger.info(
-            "Loading '%s' via Unsloth FastLanguageModel (max_seq_length=%d, load_in_4bit=%s, cpu_offload=%s).",
+            "Loading '%s' via Unsloth %s (max_seq_length=%d, load_in_4bit=%s, is_moe=%s, cpu_offload=%s).",
             load_path,
+            loader_cls.__name__,
             max_seq_length,
             load_in_4bit,
+            is_moe_arch,
             enable_cpu_offload,
         )
         unsloth_kwargs: Dict[str, Any] = {
@@ -810,32 +872,38 @@ def load_gemma4_8gb_model_and_tokenizer(
             "load_in_4bit": load_in_4bit,
             "device_map": device_map,
         }
+        if "load_in_16bit" in inspect.signature(loader_cls.from_pretrained).parameters and not load_in_4bit:
+            unsloth_kwargs["load_in_16bit"] = True
         if hf_config is not None and adapter_checkpoint is None:
             unsloth_kwargs["config"] = hf_config
         try:
-            model, tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
+            model, raw_proc_or_tok = loader_cls.from_pretrained(**unsloth_kwargs)
         except TypeError:
             unsloth_kwargs.pop("config", None)
-            model, tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
+            unsloth_kwargs.pop("load_in_16bit", None)
+            model, raw_proc_or_tok = loader_cls.from_pretrained(**unsloth_kwargs)
 
-        if hasattr(tokenizer, "tokenizer") and not hasattr(tokenizer, "encode"):
-            inner_tok = tokenizer.tokenizer
+        if hasattr(raw_proc_or_tok, "tokenizer") and not hasattr(raw_proc_or_tok, "encode"):
+            inner_tok = raw_proc_or_tok.tokenizer
             if (
                 getattr(inner_tok, "chat_template", None) is None
-                and getattr(tokenizer, "chat_template", None) is not None
+                and getattr(raw_proc_or_tok, "chat_template", None) is not None
             ):
-                inner_tok.chat_template = tokenizer.chat_template
+                inner_tok.chat_template = raw_proc_or_tok.chat_template
+            setattr(inner_tok, "_gemma4_processor", raw_proc_or_tok)
             tokenizer = inner_tok
+        else:
+            tokenizer = raw_proc_or_tok
 
         if adapter_checkpoint is not None and is_trainable:
-            if hasattr(FastLanguageModel, "for_training"):
+            if hasattr(loader_cls, "for_training"):
                 try:
-                    FastLanguageModel.for_training(
+                    loader_cls.for_training(
                         model,
                         use_gradient_checkpointing=use_gradient_checkpointing,
                     )
                 except TypeError:
-                    FastLanguageModel.for_training(model)
+                    loader_cls.for_training(model)
             if not use_gradient_checkpointing:
                 if hasattr(model, "gradient_checkpointing_disable"):
                     try:
@@ -995,6 +1063,7 @@ def load_gemma4_8gb_model_and_tokenizer(
             exclude_modules=resolved_excludes,
             use_gradient_checkpointing=use_gradient_checkpointing,
             random_state=random_state,
+            is_moe=is_moe_arch,
         )
         # Re-verify PLE, multimodal towers, and MoE routers remain frozen after PEFT wrapping
         freeze_embeddings_and_towers(model, freeze_moe_router=freeze_moe_router)
@@ -1010,3 +1079,171 @@ def load_gemma4_8gb_model_and_tokenizer(
 
 
 load_gemma4_model_and_tokenizer = load_gemma4_8gb_model_and_tokenizer
+
+
+def atomic_write_json(path: Union[str, pathlib.Path], payload: Dict[str, Any]) -> None:
+    """Atomically write `payload` to `path` via temp file + `fsync` + `os.replace`."""
+    target = pathlib.Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        fh.write(serialized)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(str(tmp_path), str(target))
+
+
+def is_adapter_stage_complete(
+    output_dir: Union[str, pathlib.Path],
+    metrics_filename: str,
+    cleanup_partial_root: bool = False,
+) -> bool:
+    """Return `True` iff a PEFT training stage wrote valid adapter weights AND its terminal metrics JSON.
+
+    If `cleanup_partial_root=True` and a crash happened mid-final-save (leaving root `adapter_config.json`
+    without `metrics_filename`), removes the partial root adapter artifacts while keeping `checkpoint-*`
+    intact so `find_latest_valid_checkpoint` resumes cleanly.
+    """
+    out = pathlib.Path(output_dir)
+    if not out.is_dir():
+        return False
+
+    cfg_file = out / "adapter_config.json"
+    metrics_file = out / metrics_filename
+    safetensors_file = out / "adapter_model.safetensors"
+    bin_file = out / "adapter_model.bin"
+
+    has_weights = (
+        (safetensors_file.is_file() and safetensors_file.stat().st_size > 256)
+        or (bin_file.is_file() and bin_file.stat().st_size > 256)
+    )
+    if cfg_file.is_file() and has_weights and metrics_file.is_file():
+        try:
+            json.loads(cfg_file.read_text(encoding="utf-8"))
+            json.loads(metrics_file.read_text(encoding="utf-8"))
+            return True
+        except Exception:
+            pass
+
+    if cleanup_partial_root and (cfg_file.exists() or safetensors_file.exists() or bin_file.exists()):
+        logger.warning(
+            "Detected incomplete final adapter save in %s (missing/corrupt %s); cleaning partial root files to allow checkpoint resume.",
+            out,
+            metrics_filename,
+        )
+        for partial in (cfg_file, safetensors_file, bin_file, metrics_file):
+            try:
+                if partial.is_file():
+                    partial.unlink()
+            except OSError:
+                pass
+    return False
+
+
+def find_latest_valid_checkpoint(
+    output_dir: Union[str, pathlib.Path],
+    require_optimizer_state: bool = True,
+    cleanup_corrupt: bool = True,
+) -> Optional[str]:
+    """Locate the highest-step complete `checkpoint-<N>` directory, skipping/cleaning half-written saves."""
+    out = pathlib.Path(output_dir)
+    if not out.is_dir():
+        return None
+
+    candidates: List[Tuple[int, pathlib.Path]] = []
+    for child in out.iterdir():
+        if not child.is_dir():
+            continue
+        m = re.match(r"^checkpoint-(\d+)$", child.name)
+        if m:
+            candidates.append((int(m.group(1)), child))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    for step_num, ckpt_dir in candidates:
+        reason: Optional[str] = None
+        state_file = ckpt_dir / "trainer_state.json"
+        cfg_file = ckpt_dir / "adapter_config.json"
+        st_file = ckpt_dir / "adapter_model.safetensors"
+        bin_file = ckpt_dir / "adapter_model.bin"
+        opt_pt = ckpt_dir / "optimizer.pt"
+        opt_bin = ckpt_dir / "optimizer.bin"
+
+        if not state_file.is_file():
+            reason = "missing trainer_state.json"
+        else:
+            try:
+                st_data = json.loads(state_file.read_text(encoding="utf-8"))
+                if int(st_data.get("global_step", 0)) <= 0:
+                    reason = "trainer_state.json global_step <= 0"
+            except Exception as exc:
+                reason = f"corrupt trainer_state.json ({exc})"
+
+        if reason is None:
+            if not cfg_file.is_file():
+                reason = "missing adapter_config.json"
+            else:
+                try:
+                    json.loads(cfg_file.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    reason = f"corrupt adapter_config.json ({exc})"
+
+        if reason is None:
+            has_adapter_weights = (
+                (st_file.is_file() and st_file.stat().st_size > 256)
+                or (bin_file.is_file() and bin_file.stat().st_size > 256)
+            )
+            if not has_adapter_weights:
+                reason = "missing or empty adapter_model.safetensors/.bin"
+
+        if reason is None and require_optimizer_state:
+            has_opt = (
+                (opt_pt.is_file() and opt_pt.stat().st_size > 64)
+                or (opt_bin.is_file() and opt_bin.stat().st_size > 64)
+            )
+            if not has_opt:
+                reason = "missing or empty optimizer.pt/.bin"
+
+        ref_subdir = ckpt_dir / "ref"
+        if reason is None and ref_subdir.is_dir():
+            ref_cfg = ref_subdir / "adapter_config.json"
+            ref_st = ref_subdir / "adapter_model.safetensors"
+            ref_bin = ref_subdir / "adapter_model.bin"
+            if not ref_cfg.is_file() or not (
+                (ref_st.is_file() and ref_st.stat().st_size > 256)
+                or (ref_bin.is_file() and ref_bin.stat().st_size > 256)
+            ):
+                reason = "incomplete DPO ref/ adapter subdirectory"
+
+        if reason is None:
+            return str(ckpt_dir)
+
+        logger.warning(
+            "Skipping incomplete checkpoint-%d at %s (%s)%s.",
+            step_num,
+            ckpt_dir,
+            reason,
+            "; removing broken directory" if cleanup_corrupt else "",
+        )
+        if cleanup_corrupt:
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+
+    return None
+
+
+def verify_moe_peft_version() -> None:
+    """Verify `peft >= 0.21.3` on live CUDA runs for Gemma-4-26B-A4B 3D MoE `ParamWrapper` support."""
+    try:
+        import peft
+        from packaging.version import Version
+
+        cur = Version(str(peft.__version__).split("+")[0])
+        req = Version("0.21.3")
+        if cur < req:
+            raise RuntimeError(
+                f"CRITICAL Dependency Error: Gemma-4-26B-A4B 3D MoE LoRA requires `peft>=0.21.3`, "
+                f"found `peft=={peft.__version__}`. Upgrade via `pip install -U 'peft>=0.21.3'`."
+            )
+    except ImportError:
+        pass

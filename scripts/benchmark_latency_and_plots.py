@@ -11,7 +11,7 @@ Implements:
    - `oall_v2_arabic_comparison.png` & `.svg`: 4-Bar Grouped Chart across all 6 OALL v2 Arabic benchmarks.
    - `zero_forgetting_retention_shield.png` & `.svg`: 4 Official Gemma 4 Retention Benchmarks (`MMLU-Pro`, `GPQA-Diamond`, `AIME-2026`, `LiveCodeBench-v6`).
    - `iso_active_latency_vram_pareto.png` & `.svg`: 2-Panel Iso-Active Decode Speed (tok/s) vs VRAM (GB) Pareto plot.
-   - `sft_dpo_training_curves.png` & `.svg`: Dual-model Stage 1 SFT Loss and Stage 2 TR-DPO Reward Margin curves.
+   - `sft_dpo_training_curves.png` & `.svg`: Dual-model Stage 1 QLoRA SFT Loss and Stage 2 Conversational DPO Reward Margin curves.
 """
 
 import argparse
@@ -31,6 +31,11 @@ import yaml
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.constants import load_dotenv_if_present
+from src.model_loader import atomic_write_json
+
+load_dotenv_if_present()
 
 logger = logging.getLogger(__name__)
 
@@ -312,19 +317,21 @@ def _save_fig_pair(fig: Any, stem_path: pathlib.Path, dpi: int = 300) -> Tuple[s
 
 
 def _load_real_eval_scores(eval_cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Load evaluated benchmark scores from outputs/eval_reports if present on disk."""
+    """Load evaluated benchmark scores from `outputs/eval_reports` if present on disk (ignoring `dry_run` / `reference`)."""
     _ = eval_cfg
     e4b_data: Dict[str, Any] = {}
     moe_data: Dict[str, Any] = {}
     for rel_path in (
         "outputs/eval_reports/family_benchmark_comparison.json",
+        "outputs/eval_reports/benchmark_results_e4b.json",
+        "outputs/eval_reports/benchmark_results_26b_a4b.json",
         "outputs/eval_reports/benchmark_results.json",
     ):
         cand = PROJECT_ROOT / rel_path
         if cand.exists():
             try:
                 data = json.loads(cand.read_text(encoding="utf-8"))
-                if data.get("mode") == "dry_run":
+                if data.get("mode") in ("dry_run", "reference"):
                     continue
                 models_block = data.get("models", {})
                 if isinstance(models_block, dict) and ("e4b" in models_block or "26b_a4b" in models_block):
@@ -348,26 +355,40 @@ def _load_training_curve_series(
     metrics_path: pathlib.Path,
     metric_keys: Tuple[str, ...],
 ) -> Optional[Tuple[List[float], List[float]]]:
-    """Extract (steps, values) from Trainer log_history JSON if present on disk."""
-    if not metrics_path.exists():
-        return None
-    try:
-        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-        history = payload.get("log_history", [])
-        steps: List[float] = []
-        vals: List[float] = []
-        for entry in history:
-            if not isinstance(entry, dict) or "step" not in entry:
-                continue
-            for k in metric_keys:
-                if k in entry and isinstance(entry[k], (int, float)):
-                    steps.append(float(entry["step"]))
-                    vals.append(float(entry[k]))
-                    break
-        if len(steps) >= 2:
-            return steps, vals
-    except Exception as exc:
-        logger.warning("Could not load training history from %s: %s", metrics_path, exc)
+    """Extract `(steps, values)` from `training_metrics.json` / `dpo_metrics.json` or latest `checkpoint-*/trainer_state.json`."""
+    candidates: List[pathlib.Path] = [metrics_path]
+    parent_dir = metrics_path.parent
+    if parent_dir.is_dir():
+        candidates.append(parent_dir / "trainer_state.json")
+        ckpt_states = sorted(
+            parent_dir.glob("checkpoint-*/trainer_state.json"),
+            key=lambda p: int(p.parent.name.split("-")[-1]) if p.parent.name.split("-")[-1].isdigit() else -1,
+            reverse=True,
+        )
+        candidates.extend(ckpt_states)
+
+    for cand in candidates:
+        if not cand.is_file():
+            continue
+        try:
+            payload = json.loads(cand.read_text(encoding="utf-8"))
+            history = payload.get("log_history", [])
+            steps: List[float] = []
+            vals: List[float] = []
+            for entry in history:
+                if not isinstance(entry, dict) or "step" not in entry:
+                    continue
+                for k in metric_keys:
+                    if k in entry and isinstance(entry[k], (int, float)):
+                        steps.append(float(entry["step"]))
+                        vals.append(float(entry[k]))
+                        break
+            if len(steps) == 1:
+                return [0.0, steps[0]], [vals[0], vals[0]]
+            if len(steps) >= 2:
+                return steps, vals
+        except Exception as exc:
+            logger.warning("Could not load training history from %s: %s", cand, exc)
     return None
 
 
@@ -406,6 +427,7 @@ def generate_all_family_plots(
     latency_profile: Dict[str, Any],
     output_dir: pathlib.Path,
     dpi: int = 300,
+    require_real_data: bool = False,
 ) -> List[str]:
     """Generate all 4 publication-grade comparison charts in `.png` and `.svg`."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -413,27 +435,38 @@ def generate_all_family_plots(
 
     ar_benchmarks = eval_cfg.get("arabic_benchmarks", {})
     ret_anchors = eval_cfg.get("retention_anchors", {})
-    min_ret_ratio = float(
-        eval_cfg.get("evaluation", {}).get(
-            "min_retention_ratio",
-            eval_cfg.get("retention_gate", {}).get("min_retention_ratio", 0.985),
-        )
-    )
-    gate_pct = min_ret_ratio * 100.0
     real_e4b, real_moe = _load_real_eval_scores(eval_cfg)
+    if require_real_data:
+        if not real_e4b or not real_moe:
+            raise RuntimeError(
+                "Refusing to plot synthetic fallback benchmark bars (`--live-profile` requires real "
+                "`outputs/eval_reports/family_benchmark_comparison.json` for both `e4b` and `26b_a4b`)."
+            )
+        for model_label, m_dict in (("e4b", real_e4b), ("26b_a4b", real_moe)):
+            missing_ar = [k for k in ar_benchmarks if k not in m_dict.get("arabic_benchmarks", {})]
+            missing_ret = [k for k in ret_anchors if k not in m_dict.get("retention_anchors", {})]
+            if missing_ar or missing_ret:
+                raise RuntimeError(
+                    f"Incomplete real evaluation metrics for `{model_label}` when generating publication plots: "
+                    f"missing_arabic={missing_ar}, missing_retention={missing_ret}."
+                )
 
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
-    except ImportError:
+    except ImportError as mpl_exc:
+        if require_real_data:
+            raise RuntimeError(
+                "matplotlib and numpy are required to render publication plots in `--live-profile` mode."
+            ) from mpl_exc
         logger.warning("matplotlib not found; using pure-Python SVG/PNG fallback generator.")
         for stem, title, sub in [
             ("oall_v2_arabic_comparison", "Gemma-4-Arabic Family: 6 OALL v2 Arabic Benchmarks", "Base | Arabic-Tuned across E4B and 26B-A4B"),
             ("zero_forgetting_retention_shield", "Official Gemma 4 Retention Benchmarks (Reasoning / Math / Code)", "Base | Arabic-Tuned across MMLU-Pro, GPQA-Diamond, AIME-2026, LiveCodeBench-v6"),
             ("iso_active_latency_vram_pareto", "Iso-Active Inference Efficiency: Decode Throughput vs VRAM", "E4B (4.0B Active) vs 26B-A4B MoE (3.8B Active)"),
-            ("sft_dpo_training_curves", "Stage 1 rsLoRA SFT Loss & Stage 2 Trust-Region DPO Reward Margin", "Dual-Model Training Convergence on 2x A100 80GB"),
+            ("sft_dpo_training_curves", "Stage 1 QLoRA SFT Loss & Stage 2 Conversational DPO Reward Margin", "Dual-Model Training Convergence on 2x A100 80GB"),
         ]:
             png_f, svg_f = _write_fallback_svg_and_png(output_dir / stem, title, sub)
             generated_files.extend([png_f, svg_f])
@@ -614,7 +647,7 @@ def generate_all_family_plots(
             )
 
     fig2.suptitle(
-        "Catastrophic Forgetting Defense: 25% Replay + Frozen MoE Router + TR-DPO (alpha=0.6) + TIES (lambda=0.85)",
+        "Catastrophic Forgetting Defense: 25% De-Contaminated Replay + Frozen MoE Router + Lossless Merge (lambda=1.0)",
         fontsize=13,
         fontweight="bold",
         y=1.02,
@@ -739,36 +772,32 @@ def generate_all_family_plots(
     generated_files.extend([p3_png, p3_svg])
 
     # -------------------------------------------------------------------------
-    # Plot 4: Dual-Model Stage 1 SFT Loss & Stage 2 TR-DPO Reward Margin Curves
+    # Plot 4: Dual-Model Stage 1 QLoRA SFT Loss & Stage 2 Conversational DPO Curves
     # -------------------------------------------------------------------------
-    sft_e4b_real = _load_training_curve_series(
-        PROJECT_ROOT / "outputs" / "sft_e4b_stage1" / "training_metrics.json",
-        ("loss",),
-    ) or _load_training_curve_series(
-        PROJECT_ROOT / "outputs" / "sft_e4b_a100" / "training_metrics.json",
-        ("loss",),
+    sft_e4b_real = (
+        _load_training_curve_series(PROJECT_ROOT / "outputs" / "sft_e4b_a100" / "training_metrics.json", ("loss",))
+        or _load_training_curve_series(PROJECT_ROOT / "outputs" / "sft_e4b_stage1" / "training_metrics.json", ("loss",))
+        or _load_training_curve_series(PROJECT_ROOT / "outputs" / "sft_stage1" / "training_metrics.json", ("loss",))
     )
-    sft_moe_real = _load_training_curve_series(
-        PROJECT_ROOT / "outputs" / "sft_26b_a4b_stage1" / "training_metrics.json",
-        ("loss",),
-    ) or _load_training_curve_series(
-        PROJECT_ROOT / "outputs" / "sft_26b_a4b_a100" / "training_metrics.json",
-        ("loss",),
+    sft_moe_real = (
+        _load_training_curve_series(PROJECT_ROOT / "outputs" / "sft_26b_a4b_a100" / "training_metrics.json", ("loss",))
+        or _load_training_curve_series(PROJECT_ROOT / "outputs" / "sft_26b_a4b_stage1" / "training_metrics.json", ("loss",))
     )
-    dpo_e4b_real = _load_training_curve_series(
-        PROJECT_ROOT / "outputs" / "dpo_e4b_stage2" / "dpo_metrics.json",
-        ("rewards/margins", "loss"),
-    ) or _load_training_curve_series(
-        PROJECT_ROOT / "outputs" / "dpo_e4b_a100" / "dpo_metrics.json",
-        ("rewards/margins", "loss"),
+    dpo_e4b_real = (
+        _load_training_curve_series(PROJECT_ROOT / "outputs" / "dpo_e4b_a100" / "dpo_metrics.json", ("rewards/margins", "loss"))
+        or _load_training_curve_series(PROJECT_ROOT / "outputs" / "dpo_e4b_stage2" / "dpo_metrics.json", ("rewards/margins", "loss"))
+        or _load_training_curve_series(PROJECT_ROOT / "outputs" / "dpo_stage2" / "dpo_metrics.json", ("rewards/margins", "loss"))
     )
-    dpo_moe_real = _load_training_curve_series(
-        PROJECT_ROOT / "outputs" / "dpo_26b_a4b_stage2" / "dpo_metrics.json",
-        ("rewards/margins", "loss"),
-    ) or _load_training_curve_series(
-        PROJECT_ROOT / "outputs" / "dpo_26b_a4b_a100" / "dpo_metrics.json",
-        ("rewards/margins", "loss"),
+    dpo_moe_real = (
+        _load_training_curve_series(PROJECT_ROOT / "outputs" / "dpo_26b_a4b_a100" / "dpo_metrics.json", ("rewards/margins", "loss"))
+        or _load_training_curve_series(PROJECT_ROOT / "outputs" / "dpo_26b_a4b_stage2" / "dpo_metrics.json", ("rewards/margins", "loss"))
     )
+
+    if require_real_data and not (sft_e4b_real and sft_moe_real and dpo_e4b_real and dpo_moe_real):
+        raise RuntimeError(
+            "Refusing to plot synthetic linear training curves (`--live-profile` requires real "
+            "`training_metrics.json` and `dpo_metrics.json` for both `e4b` and `26b_a4b`)."
+        )
 
     if sft_e4b_real and sft_moe_real:
         steps_sft_e4b, loss_e4b = sft_e4b_real
@@ -797,16 +826,16 @@ def generate_all_family_plots(
 
     ax4_left.plot(steps_sft_e4b, loss_e4b, linewidth=2.3, color="#0284c7", label="Gemma-4-E4B-Arabic-It (SFT Loss)")
     ax4_left.plot(steps_sft_moe, loss_moe, linewidth=2.3, color="#16a34a", label="Gemma-4-26B-A4B-Arabic-It (SFT Loss)")
-    ax4_left.set_xlabel("Stage 1 SFT Training Steps (120k Mix, Effective BS=96)", fontsize=11, fontweight="bold")
+    ax4_left.set_xlabel("Stage 1 QLoRA SFT Steps (120k Mix, Effective BS=32)", fontsize=11, fontweight="bold")
     ax4_left.set_ylabel("Cross-Entropy Completion Loss", fontsize=11, fontweight="bold")
-    ax4_left.set_title("Stage 1 rsLoRA Continual Instruction Tuning Convergence", fontsize=12.5, fontweight="bold")
+    ax4_left.set_title("Stage 1 QLoRA Continual Instruction Tuning Convergence", fontsize=12.5, fontweight="bold")
     ax4_left.legend(loc="upper right", fontsize=9.5)
 
     ax4_right.plot(steps_dpo_e4b, margin_e4b, linewidth=2.3, color="#0284c7", label="E4B-Arabic-It Reward Margin (Chosen - Rejected)")
     ax4_right.plot(steps_dpo_moe, margin_moe, linewidth=2.3, color="#16a34a", label="26B-A4B-Arabic-It Reward Margin (Chosen - Rejected)")
-    ax4_right.set_xlabel("Stage 2 TR-DPO Steps (20k Preference Pairs, Effective BS=24, beta=0.1, tr_alpha=0.6)", fontsize=10.5, fontweight="bold")
+    ax4_right.set_xlabel("Stage 2 Conversational DPO Steps (20k Pairs, Effective BS=16, beta=0.1, lr=5e-6)", fontsize=10.5, fontweight="bold")
     ax4_right.set_ylabel("Implicit Log-Ratio Reward Margin", fontsize=11, fontweight="bold")
-    ax4_right.set_title("Stage 2 Trust-Region DPO Alignment Reward Margin", fontsize=12.5, fontweight="bold")
+    ax4_right.set_title("Stage 2 Conversational DPO Alignment Reward Margin", fontsize=12.5, fontweight="bold")
     ax4_right.legend(loc="lower right", fontsize=9.5)
 
     fig4.suptitle(
@@ -855,6 +884,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Generate reference latency profile and all 4 plots without loading GPU checkpoints.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run live latency profiling even if a completed `live_profile` JSON already exists.",
+    )
     return parser.parse_args(argv)
 
 
@@ -885,42 +919,69 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not profile_path.is_absolute():
         profile_path = PROJECT_ROOT / profile_path
 
+    mode_str = "dry_run" if args.dry_run else ("live_profile" if args.live_profile else "reference")
     latency_profile = build_reference_latency_profile()
+    latency_profile["mode"] = mode_str
+
     if args.live_profile and not args.dry_run:
-        if torch.cuda.is_available():
+        resumed_live = False
+        if not args.force and profile_path.is_file():
             try:
-                gpu_name = torch.cuda.get_device_name(0)
-                latency_profile["hardware_reference"] = (
-                    f"2x {gpu_name} (BF16 Live HuggingFace Generate)"
-                )
+                existing = json.loads(profile_path.read_text(encoding="utf-8"))
+                if (
+                    existing.get("mode") == "live_profile"
+                    and existing.get("models", {}).get("e4b", {}).get("profiles")
+                    and existing.get("models", {}).get("26b_a4b", {}).get("profiles")
+                ):
+                    latency_profile = existing
+                    resumed_live = True
+                    logger.info("Resumed verified live latency profile from %s.", profile_path)
             except Exception:
-                pass
-        models_cfg = cfg.get("models", {})
-        ctx_lengths = [int(x) for x in lat_cfg.get("context_lengths", [512, 2048, 4096])]
-        for key in ("e4b", "26b_a4b"):
-            ckpt = models_cfg.get(key, {}).get("merged_checkpoint_dir")
-            if ckpt and pathlib.Path(ckpt).exists():
-                logger.info("Running live latency profile for %s (%s)...", key, ckpt)
-                try:
-                    latency_profile["models"][key]["profiles"] = profile_single_model_live(
-                        model_path=str(ckpt),
-                        context_lengths=ctx_lengths,
-                        max_new_tokens=int(lat_cfg.get("max_new_tokens", 64)),
-                        warmup_runs=int(lat_cfg.get("warmup_runs", 1)),
-                        timed_runs=int(lat_cfg.get("timed_runs", 3)),
-                        device=str(models_cfg.get(key, {}).get("device", "cuda:0")),
+                resumed_live = False
+
+        if not resumed_live:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CRITICAL: `--live-profile` requires an active CUDA GPU; refusing to emit reference fallback numbers."
+                )
+            gpu_name = torch.cuda.get_device_name(0)
+            latency_profile["hardware_reference"] = (
+                f"Single {gpu_name} per Model (BF16 Live HuggingFace Generate)"
+            )
+            latency_profile["mode"] = "live_profile"
+            models_cfg = cfg.get("models", {})
+            ctx_lengths = [int(x) for x in lat_cfg.get("context_lengths", [512, 2048, 4096])]
+            for key in ("e4b", "26b_a4b"):
+                raw_ckpt = models_cfg.get(key, {}).get("merged_checkpoint_dir")
+                if not raw_ckpt:
+                    raise ValueError(f"Missing `models.{key}.merged_checkpoint_dir` in {args.config}!")
+                ckpt_path = pathlib.Path(str(raw_ckpt))
+                if not ckpt_path.is_absolute():
+                    ckpt_path = PROJECT_ROOT / ckpt_path
+                if not (ckpt_path / "config.json").is_file():
+                    raise FileNotFoundError(
+                        f"Live latency profiling failed: merged checkpoint not found at {ckpt_path}! "
+                        "Refusing to fall back to synthetic reference profile."
                     )
-                except Exception as exc:
-                    logger.warning(
-                        "Live latency profile skipped for %s (%s); using reference A100 80GB profile.",
-                        key,
-                        exc,
+                shards = list(ckpt_path.glob("*.safetensors"))
+                if shards:
+                    latency_profile["models"][key]["vram_bf16_gb"] = round(
+                        sum(p.stat().st_size for p in shards) / (1024.0**3), 2
                     )
+                logger.info("Running live latency profile for %s (%s)...", key, ckpt_path)
+                latency_profile["models"][key]["profiles"] = profile_single_model_live(
+                    model_path=str(ckpt_path),
+                    context_lengths=ctx_lengths,
+                    max_new_tokens=int(lat_cfg.get("max_new_tokens", 64)),
+                    warmup_runs=int(lat_cfg.get("warmup_runs", 1)),
+                    timed_runs=int(lat_cfg.get("timed_runs", 3)),
+                    device=str(models_cfg.get(key, {}).get("device", "cuda:0")),
+                )
 
     profile_path.parent.mkdir(parents=True, exist_ok=True)
-    profile_path.write_text(json.dumps(latency_profile, indent=2), encoding="utf-8")
+    atomic_write_json(profile_path, latency_profile)
     legacy_json_path = profile_path.parent / "latency_vram_report.json"
-    legacy_json_path.write_text(json.dumps(latency_profile, indent=2), encoding="utf-8")
+    atomic_write_json(legacy_json_path, latency_profile)
 
     md_report_path = profile_path.parent / "latency_vram_report.md"
     md_report_path.write_text(
@@ -933,11 +994,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         latency_profile=latency_profile,
         output_dir=plots_dir,
         dpi=int(plot_cfg.get("dpi", 300)),
+        require_real_data=bool(args.live_profile and not args.dry_run),
     )
 
     summary = {
         "status": "completed",
-        "mode": "dry_run" if args.dry_run else ("live_profile" if args.live_profile else "reference"),
+        "mode": mode_str,
         "profile_json": str(profile_path),
         "profile_markdown": str(md_report_path),
         "plots_count": len(generated_plots),

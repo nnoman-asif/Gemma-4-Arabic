@@ -1,227 +1,407 @@
-"""Gemma 4 chat template wrapper with strict thinking-block token preservation.
+"""Gemma 4 native chat template formatting, `<|channel>thought` CoT handling, and assistant loss masking.
 
-Enforces the Gemma 4 Chat Template Rule:
-1. Always format turns using:
-   `tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, enable_thinking=...)`
-2. Never strip the 4 hidden empty thinking-block tokens (`<|think|>\\n<|think|>\\n`)
-   emitted when `enable_thinking=False`.
-3. Support structured reasoning blocks (`<|think|>\\n...\\n<|think|>\\n...`) when
-   `enable_thinking=True` (for Arabic-Math-SFT and OpenMathInstruct-2).
+Verified byte-for-byte against `google/gemma-4-E4B-it` and `google/gemma-4-26B-A4B-it`
+`chat_template.jinja`:
+- Special tokens:
+    `<bos>` (2), `<eos>` (1), `<|turn>` (105), `<turn|>` (106),
+    `<|think|>` (98), `<|channel>` (100), `<channel|>` (101).
+- Non-thinking training (`enable_thinking=False`):
+    * `E4B-it`:
+        `<bos><|turn>user\n{U}<turn|>\n<|turn>model\n{A}<turn|>\n`
+        (or `<bos><|turn>system\n{S}<turn|>\n...` when a system message is present)
+    * `26B-A4B-it` (with `align_26b_empty_thought=True`, matching `add_generation_prompt=True`
+      and Unsloth `get_chat_template("gemma-4")`):
+        `<bos><|turn>user\n{U}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>{A}<turn|>\n`
+- Thinking training (`enable_thinking=True`):
+    `<bos><|turn>system\n<|think|>\n{optional_S}<turn|>\n<|turn>user\n{U}<turn|>\n<|turn>model\n<|channel>thought\n{R}\n<channel|>{A}<turn|>\n`
 """
 
-import inspect
-from typing import Any, Dict, List, Optional, Sequence
+import re
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.constants import (
-    ASSISTANT_TURN_PREFIX,
     BOS_TOKEN,
-    EMPTY_THINKING_BLOCK,
-    END_OF_TURN_TOKEN,
-    START_OF_TURN_TOKEN,
+    CHANNEL_END_TOKEN,
+    CHANNEL_START_TOKEN,
+    EMPTY_THOUGHT_CHANNEL,
+    FORBIDDEN_LEGACY_MARKERS,
     THINK_TOKEN,
+    THOUGHT_CHANNEL_CLOSE,
+    THOUGHT_CHANNEL_OPEN,
+    TURN_END_TOKEN,
+    TURN_START_TOKEN,
 )
 
-ROLE_MAPPING: Dict[str, str] = {
-    "user": "user",
-    "human": "user",
-    "prompter": "user",
-    "instruction": "user",
-    "assistant": "assistant",
-    "model": "assistant",
-    "gpt": "assistant",
-    "bot": "assistant",
-    "output": "assistant",
-    "system": "system",
-}
+_THINK_TAG_RE = re.compile(r"^\s*<think>\s*(.*?)\s*</think>\s*(.*)$", flags=re.DOTALL)
+_CHANNEL_TAG_RE = re.compile(
+    r"^\s*<\|channel>thought\s*\r?\n?(.*?)\r?\n?<channel\|>\s*(.*)$",
+    flags=re.DOTALL,
+)
+_LEGACY_PIPE_THINK_RE = re.compile(
+    r"^\s*<\|think\|>\s*(.*?)\s*<\|think\|>\s*(.*)$",
+    flags=re.DOTALL,
+)
 
 
-def normalize_message_roles(
+def parse_reasoning_and_content(raw_text: str) -> Tuple[str, str]:
+    """Split embedded `<think>...</think>` or `<|channel>thought...<channel|>` into `(reasoning, content)`.
+
+    If no closed reasoning tag is present, returns `("", stripped_text)`.
+    """
+    text = str(raw_text or "").strip()
+    if not text:
+        return ("", "")
+
+    for pattern in (_THINK_TAG_RE, _CHANNEL_TAG_RE, _LEGACY_PIPE_THINK_RE):
+        match = pattern.match(text)
+        if match:
+            reasoning = match.group(1).strip()
+            answer = match.group(2).strip()
+            return (reasoning, answer)
+
+    return ("", text)
+
+
+def make_uniform_message(
+    role: str,
+    content: str,
+    reasoning_content: str = "",
+) -> Dict[str, str]:
+    """Create a Parquet/Arrow-uniform message dict `{"role", "content", "reasoning_content"}`."""
+    clean_role = str(role or "user").strip().lower()
+    if clean_role == "model":
+        clean_role = "assistant"
+    elif clean_role in ("human", "prompter"):
+        clean_role = "user"
+    elif clean_role in ("gpt", "bot"):
+        clean_role = "assistant"
+
+    clean_content = str(content or "").strip()
+    clean_reasoning = str(reasoning_content or "").strip()
+
+    if clean_role == "assistant" and not clean_reasoning:
+        parsed_r, parsed_c = parse_reasoning_and_content(clean_content)
+        if parsed_r and parsed_c:
+            clean_reasoning = parsed_r
+            clean_content = parsed_c
+
+    return {
+        "role": clean_role,
+        "content": clean_content,
+        "reasoning_content": clean_reasoning if clean_role == "assistant" else "",
+    }
+
+
+def normalize_messages_schema(
     messages: Sequence[Dict[str, Any]],
-    default_system_prompt: Optional[str] = None,
 ) -> List[Dict[str, str]]:
-    """Normalize conversation turns to standard `system`, `user`, and `assistant` roles."""
+    """Normalize a sequence of message dicts into uniform `{"role", "content", "reasoning_content"}` dicts."""
     normalized: List[Dict[str, str]] = []
-
     for msg in messages:
-        raw_role = str(msg.get("role") or msg.get("from") or "user").strip().lower()
-        role = ROLE_MAPPING.get(raw_role, "user")
-        content = str(msg.get("content") if "content" in msg else msg.get("value", "")).strip()
-        if not content:
+        if not isinstance(msg, dict):
             continue
-        normalized.append({"role": role, "content": content})
-
-    if default_system_prompt and normalized:
-        if normalized[0]["role"] != "system":
-            normalized.insert(0, {"role": "system", "content": default_system_prompt.strip()})
-
+        role = str(msg.get("role") or msg.get("from") or "user")
+        content = str(msg.get("content") if msg.get("content") is not None else (msg.get("value") or ""))
+        reasoning = str(
+            msg.get("reasoning_content")
+            or msg.get("reasoning")
+            or msg.get("thinking")
+            or ""
+        )
+        uniform = make_uniform_message(role=role, content=content, reasoning_content=reasoning)
+        if uniform["content"] or uniform["reasoning_content"]:
+            normalized.append(uniform)
     return normalized
 
 
 def format_thinking_response(reasoning: str, final_answer: str) -> str:
-    """Wrap a step-by-step reasoning trace and final response in Gemma 4 `<|think|>` tags."""
+    """Format an assistant turn body using Gemma 4's native `<|channel>thought` channel."""
     clean_reasoning = (reasoning or "").strip()
     clean_answer = (final_answer or "").strip()
     if not clean_reasoning:
-        return f"{EMPTY_THINKING_BLOCK}{clean_answer}"
-    return f"{THINK_TOKEN}\n{clean_reasoning}\n{THINK_TOKEN}\n{clean_answer}"
+        return clean_answer
+    return f"{THOUGHT_CHANNEL_OPEN}{clean_reasoning}{THOUGHT_CHANNEL_CLOSE}{clean_answer}"
 
 
-def ensure_assistant_thinking_header(
-    content: str,
+def strip_embedded_thinking_from_content(text: str) -> str:
+    """Mirror Gemma 4 `strip_thinking` Jinja macro on assistant `content`."""
+    s = str(text or "")
+    if CHANNEL_END_TOKEN in s:
+        parts = s.split(CHANNEL_END_TOKEN)
+        out = ""
+        for part in parts:
+            if CHANNEL_START_TOKEN in part:
+                out += part.split(CHANNEL_START_TOKEN)[0]
+            else:
+                out += part
+        s = out
+    elif CHANNEL_START_TOKEN in s:
+        s = s.split(CHANNEL_START_TOKEN)[0]
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
+    s = re.sub(r"<\|think\|>.*?<\|think\|>", "", s, flags=re.DOTALL)
+    return s.strip()
+
+
+def has_nonempty_final_reasoning(messages: Sequence[Dict[str, Any]]) -> bool:
+    """Return True iff the last assistant message has non-empty `reasoning_content`."""
+    for msg in reversed(messages):
+        role = str(msg.get("role", "")).strip().lower()
+        if role in ("assistant", "model"):
+            r = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+            if r:
+                return True
+            parsed_r, _ = parse_reasoning_and_content(str(msg.get("content") or ""))
+            return bool(parsed_r)
+    return False
+
+
+def format_gemma4_chat(
+    messages: Sequence[Dict[str, Any]],
+    tokenizer: Optional[Any] = None,
     enable_thinking: bool = False,
-    reasoning: Optional[str] = None,
+    add_generation_prompt: bool = False,
+    add_bos: bool = True,
+    is_26b_moe: bool = False,
+    align_26b_empty_thought: bool = False,
 ) -> str:
-    """Ensure assistant turn content contains the appropriate Gemma 4 thinking block."""
-    stripped = (content or "").strip()
-    if stripped.startswith(THINK_TOKEN):
-        return stripped
-    if enable_thinking:
-        if reasoning:
-            return format_thinking_response(reasoning, stripped)
-        return f"{THINK_TOKEN}\n{stripped}\n{THINK_TOKEN}\n{stripped}"
-    return f"{EMPTY_THINKING_BLOCK}{stripped}"
+    """Render messages into native Gemma 4 `<|turn>...<turn|>` format.
+
+    Invariants enforced:
+    1. On completed training conversations (`add_generation_prompt=False`), if
+       `enable_thinking=True` is requested without non-empty reasoning on the final
+       assistant turn, `enable_thinking` is downgraded to `False` so `<|think|>` is
+       never emitted in the system header without a matching `<|channel>thought` body.
+    2. When `enable_thinking=True`, `<|turn>system\\n<|think|>\\n{optional_sys}<turn|>\\n`
+       is emitted at the top of the sequence, and the final assistant turn renders
+       `<|channel>thought\\n{reasoning}\\n<channel|>{answer}<turn|>\\n`.
+    3. When `enable_thinking=False`, `<|think|>` is NOT emitted; on `26B-A4B-it`,
+       `add_generation_prompt=True` (and completed assistant turns when
+       `align_26b_empty_thought=True`) emits `<|channel>thought\\n<channel|>`.
+    """
+    norm_msgs = normalize_messages_schema(messages)
+    if not norm_msgs:
+        return ""
+
+    effective_thinking = bool(enable_thinking)
+    if not add_generation_prompt and effective_thinking and not has_nonempty_final_reasoning(norm_msgs):
+        effective_thinking = False
+
+    # Use real HF Gemma 4 tokenizer when provided and verified to support native `<|turn>`
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        if "<|turn>" in str(tokenizer.chat_template) and not (is_26b_moe and align_26b_empty_thought and not effective_thinking):
+            rendered = tokenizer.apply_chat_template(
+                norm_msgs,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=effective_thinking,
+            )
+            if not add_bos and rendered.startswith(BOS_TOKEN):
+                rendered = rendered[len(BOS_TOKEN):]
+            elif add_bos and not rendered.startswith(BOS_TOKEN):
+                rendered = BOS_TOKEN + rendered
+            return rendered
+
+    chunks: List[str] = []
+    if add_bos:
+        chunks.append(BOS_TOKEN)
+
+    loop_msgs = list(norm_msgs)
+    has_system = bool(loop_msgs and loop_msgs[0]["role"] in ("system", "developer"))
+    sys_text = ""
+    if has_system:
+        sys_text = loop_msgs[0]["content"].strip()
+        loop_msgs = loop_msgs[1:]
+
+    if effective_thinking or sys_text:
+        sys_block = f"{TURN_START_TOKEN}system\n"
+        if effective_thinking:
+            sys_block += f"{THINK_TOKEN}\n"
+        if sys_text:
+            sys_block += sys_text
+        sys_block += f"{TURN_END_TOKEN}\n"
+        chunks.append(sys_block)
+
+    last_user_idx = -1
+    for idx, m in enumerate(loop_msgs):
+        if m["role"] == "user":
+            last_user_idx = idx
+
+    for idx, m in enumerate(loop_msgs):
+        role = m["role"]
+        content = m["content"].strip()
+        reasoning = m.get("reasoning_content", "").strip()
+
+        if role == "user":
+            chunks.append(f"{TURN_START_TOKEN}user\n{content}{TURN_END_TOKEN}\n")
+        elif role == "assistant":
+            clean_answer = strip_embedded_thinking_from_content(content)
+            turn_body = f"{TURN_START_TOKEN}model\n"
+            if effective_thinking and reasoning and idx > last_user_idx:
+                turn_body += f"{THOUGHT_CHANNEL_OPEN}{reasoning}{THOUGHT_CHANNEL_CLOSE}{clean_answer}"
+            elif not effective_thinking and is_26b_moe and align_26b_empty_thought:
+                turn_body += f"{EMPTY_THOUGHT_CHANNEL}{clean_answer}"
+            else:
+                turn_body += clean_answer
+            turn_body += f"{TURN_END_TOKEN}\n"
+            chunks.append(turn_body)
+        elif role in ("system", "developer") and content:
+            chunks.append(f"{TURN_START_TOKEN}system\n{content}{TURN_END_TOKEN}\n")
+
+    if add_generation_prompt:
+        gen_prefix = f"{TURN_START_TOKEN}model\n"
+        if is_26b_moe and not effective_thinking:
+            gen_prefix += EMPTY_THOUGHT_CHANNEL
+        chunks.append(gen_prefix)
+
+    return "".join(chunks)
+
+
+def build_tokenized_sft_Turn_masks(
+    messages: Sequence[Dict[str, Any]],
+    tokenizer: Any,
+    enable_thinking: bool = False,
+    max_seq_length: int = 4096,
+    is_26b_moe: bool = False,
+) -> Optional[Dict[str, List[int]]]:
+    """Tokenize a conversation for Stage 1 SFT with exact response-only `assistant_masks`.
+
+    Every `<bos>`, `<|turn>system...<turn|>\\n`, and `<|turn>user...<turn|>\\n<|turn>model\\n`
+    token receives `assistant_masks = 0` (`labels = -100` inside `UnslothSFTTrainer` BEFORE
+    `bfd` sequence packing). Only assistant completion tokens (`<|channel>thought...` +
+    `{answer}<turn|>\\n`) receive `assistant_masks = 1`.
+
+    Returns `None` if the conversation contains no assistant turn or exceeds `max_seq_length`
+    without any valid assistant tokens.
+    """
+    norm_msgs = normalize_messages_schema(messages)
+    if not norm_msgs:
+        return None
+
+    effective_thinking = bool(enable_thinking) and has_nonempty_final_reasoning(norm_msgs)
+
+    # Separate optional leading system message
+    loop_msgs = list(norm_msgs)
+    sys_text = ""
+    if loop_msgs and loop_msgs[0]["role"] in ("system", "developer"):
+        sys_text = loop_msgs[0]["content"].strip()
+        loop_msgs = loop_msgs[1:]
+
+    last_user_idx = -1
+    for idx, m in enumerate(loop_msgs):
+        if m["role"] == "user":
+            last_user_idx = idx
+
+    input_ids: List[int] = []
+    assistant_masks: List[int] = []
+
+    def _encode_segment(seg_text: str) -> List[int]:
+        return list(tokenizer.encode(seg_text, add_special_tokens=False))
+
+    # 1. Leading <bos> + optional system block (always masked = 0)
+    prefix_str = BOS_TOKEN
+    if effective_thinking or sys_text:
+        prefix_str += f"{TURN_START_TOKEN}system\n"
+        if effective_thinking:
+            prefix_str += f"{THINK_TOKEN}\n"
+        if sys_text:
+            prefix_str += sys_text
+        prefix_str += f"{TURN_END_TOKEN}\n"
+
+    prefix_ids = _encode_segment(prefix_str)
+    input_ids.extend(prefix_ids)
+    assistant_masks.extend([0] * len(prefix_ids))
+
+    # 2. Encode each turn cleanly along exact `<|turn>` / `<turn|>` token boundaries
+    for idx, m in enumerate(loop_msgs):
+        role = m["role"]
+        content = m["content"].strip()
+        reasoning = m.get("reasoning_content", "").strip()
+
+        if role == "user":
+            user_seg = f"{TURN_START_TOKEN}user\n{content}{TURN_END_TOKEN}\n"
+            u_ids = _encode_segment(user_seg)
+            input_ids.extend(u_ids)
+            assistant_masks.extend([0] * len(u_ids))
+        elif role == "assistant":
+            # Prompt header `<|turn>model\n` is masked (0)
+            header_ids = _encode_segment(f"{TURN_START_TOKEN}model\n")
+            input_ids.extend(header_ids)
+            assistant_masks.extend([0] * len(header_ids))
+
+            # Assistant completion body + `<turn|>\n` is supervised (1)
+            clean_answer = strip_embedded_thinking_from_content(content)
+            if effective_thinking and reasoning and idx > last_user_idx:
+                comp_seg = f"{THOUGHT_CHANNEL_OPEN}{reasoning}{THOUGHT_CHANNEL_CLOSE}{clean_answer}{TURN_END_TOKEN}\n"
+            elif not effective_thinking and is_26b_moe:
+                comp_seg = f"{EMPTY_THOUGHT_CHANNEL}{clean_answer}{TURN_END_TOKEN}\n"
+            else:
+                comp_seg = f"{clean_answer}{TURN_END_TOKEN}\n"
+
+            c_ids = _encode_segment(comp_seg)
+            input_ids.extend(c_ids)
+            assistant_masks.extend([1] * len(c_ids))
+
+    if len(input_ids) > max_seq_length:
+        if effective_thinking:
+            # Never slice `<|channel>thought...<channel|>` mid-thought; drop over-length CoT rows
+            return None
+        eot_ids = _encode_segment(f"{TURN_END_TOKEN}\n")
+        if max_seq_length <= len(eot_ids) + 16:
+            return None
+        keep_len = max_seq_length - len(eot_ids)
+        input_ids = input_ids[:keep_len] + eot_ids
+        assistant_masks = assistant_masks[:keep_len] + ([1] * len(eot_ids))
+        if sum(assistant_masks) < 16:
+            return None
+
+    if sum(assistant_masks) < 2 or assistant_masks[0] != 0:
+        return None
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "assistant_masks": assistant_masks,
+    }
+
+
+build_tokenized_sft_turn_masks = build_tokenized_sft_Turn_masks
 
 
 def verify_thinking_block_preserved(
     rendered_text: str,
     enable_thinking: bool = False,
 ) -> bool:
-    """Verify that Gemma 4 thinking tokens were preserved and never stripped."""
-    if not rendered_text or not isinstance(rendered_text, str):
+    """Assert that a rendered Gemma 4 conversation satisfies all native token invariants."""
+    if not rendered_text:
         return False
+
+    for bad_marker in FORBIDDEN_LEGACY_MARKERS:
+        if bad_marker in rendered_text:
+            return False
+
+    if "<think>" in rendered_text or "</think>" in rendered_text:
+        return False
+
+    if f"{TURN_START_TOKEN}user\n" not in rendered_text:
+        return False
+    if f"{TURN_START_TOKEN}model\n" not in rendered_text:
+        return False
+    if TURN_END_TOKEN not in rendered_text:
+        return False
+
     if enable_thinking:
-        return rendered_text.count(THINK_TOKEN) >= 2
-    return EMPTY_THINKING_BLOCK in rendered_text
-
-
-def render_gemma4_template_deterministic(
-    messages: Sequence[Dict[str, Any]],
-    add_generation_prompt: bool = False,
-    enable_thinking: bool = False,
-) -> str:
-    """Deterministic Gemma 4 template renderer used when no HF tokenizer is passed."""
-    norm_msgs = normalize_message_roles(messages)
-    system_prefix = ""
-    parts: List[str] = [BOS_TOKEN]
-
-    idx = 0
-    if norm_msgs and norm_msgs[0]["role"] == "system":
-        system_prefix = norm_msgs[0]["content"].strip() + "\n\n"
-        idx = 1
-
-    first_user_handled = False
-    for msg in norm_msgs[idx:]:
-        role = msg["role"]
-        content = msg["content"].strip()
-        if role == "user":
-            if not first_user_handled and system_prefix:
-                content = f"{system_prefix}{content}"
-                first_user_handled = True
-            parts.append(f"{START_OF_TURN_TOKEN}user\n{content}{END_OF_TURN_TOKEN}\n")
-        elif role == "assistant":
-            formatted_content = ensure_assistant_thinking_header(
-                content=content,
-                enable_thinking=enable_thinking,
-            )
-            parts.append(
-                f"{START_OF_TURN_TOKEN}model\n{formatted_content}{END_OF_TURN_TOKEN}\n"
-            )
-
-    if add_generation_prompt:
-        if enable_thinking:
-            parts.append(f"{START_OF_TURN_TOKEN}model\n{THINK_TOKEN}\n")
-        else:
-            parts.append(f"{START_OF_TURN_TOKEN}model\n{EMPTY_THINKING_BLOCK}")
-
-    return "".join(parts)
-
-
-def _inject_missing_thinking_blocks(
-    rendered: str,
-    enable_thinking: bool,
-) -> str:
-    """Ensure `<start_of_turn>model\\n` turns include the mandatory `<|think|>` block."""
-    if verify_thinking_block_preserved(rendered, enable_thinking=enable_thinking):
-        return rendered
-
-    marker = ASSISTANT_TURN_PREFIX
-    if marker not in rendered:
-        return rendered
-
-    segments = rendered.split(marker)
-    rebuilt = [segments[0]]
-    for seg in segments[1:]:
-        if seg.startswith(THINK_TOKEN):
-            rebuilt.append(marker + seg)
-        elif enable_thinking:
-            rebuilt.append(f"{marker}{THINK_TOKEN}\n\n{THINK_TOKEN}\n{seg}")
-        else:
-            rebuilt.append(f"{marker}{EMPTY_THINKING_BLOCK}{seg}")
-    return "".join(rebuilt)
-
-
-def format_gemma4_chat(
-    messages: Sequence[Dict[str, Any]],
-    tokenizer: Optional[Any] = None,
-    add_generation_prompt: bool = False,
-    enable_thinking: bool = False,
-    default_system_prompt: Optional[str] = None,
-    enforce_thinking_verification: bool = True,
-) -> str:
-    """Format conversation messages using `tokenizer.apply_chat_template`.
-
-    Always invokes `tokenizer.apply_chat_template(messages, tokenize=False,
-    add_generation_prompt=..., enable_thinking=...)` when a tokenizer is supplied,
-    and verifies that the 4 hidden empty thinking-block tokens (`<|think|>\\n<|think|>\\n`)
-    for `enable_thinking=False` (or reasoning `<|think|>` tags for `enable_thinking=True`)
-    are preserved.
-    """
-    norm_messages = normalize_message_roles(
-        messages=messages,
-        default_system_prompt=default_system_prompt,
-    )
-    if not norm_messages:
-        raise ValueError("Cannot format an empty message list.")
-
-    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
-        try:
-            sig = inspect.signature(tokenizer.apply_chat_template)
-            supports_enable_thinking = (
-                "enable_thinking" in sig.parameters
-                or any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD
-                    for p in sig.parameters.values()
-                )
-            )
-        except (TypeError, ValueError):
-            supports_enable_thinking = True
-
-        kwargs: Dict[str, Any] = {
-            "tokenize": False,
-            "add_generation_prompt": add_generation_prompt,
-        }
-        if supports_enable_thinking:
-            kwargs["enable_thinking"] = enable_thinking
-
-        rendered = tokenizer.apply_chat_template(norm_messages, **kwargs)
-        rendered = _inject_missing_thinking_blocks(
-            rendered=rendered,
-            enable_thinking=enable_thinking,
-        )
+        if f"{TURN_START_TOKEN}system\n{THINK_TOKEN}\n" not in rendered_text:
+            return False
+        if THOUGHT_CHANNEL_OPEN not in rendered_text:
+            return False
+        if CHANNEL_END_TOKEN not in rendered_text:
+            return False
+        # Verify non-empty reasoning between <|channel>thought\n and <channel|>
+        thought_body = rendered_text.split(THOUGHT_CHANNEL_OPEN, 1)[1].split(CHANNEL_END_TOKEN, 1)[0]
+        if not thought_body.strip():
+            return False
     else:
-        rendered = render_gemma4_template_deterministic(
-            messages=norm_messages,
-            add_generation_prompt=add_generation_prompt,
-            enable_thinking=enable_thinking,
-        )
+        if THINK_TOKEN in rendered_text:
+            return False
 
-    if enforce_thinking_verification and any(
-        m["role"] == "assistant" for m in norm_messages
-    ):
-        if not verify_thinking_block_preserved(rendered, enable_thinking=enable_thinking):
-            raise ValueError(
-                f"Gemma 4 thinking block verification failed (enable_thinking={enable_thinking}). "
-                "The 4 hidden thinking tokens must never be stripped."
-            )
-
-    return rendered
+    return True

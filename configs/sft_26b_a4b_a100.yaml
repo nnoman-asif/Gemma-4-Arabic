@@ -1,19 +1,20 @@
 # Stage 1 Supervised Fine-Tuning (SFT) Configuration for Gemma-4-26B-A4B-Arabic (MoE) on A100 80 GB
 # Optimized for NVIDIA A100 80 GB HBM2e (GPU 1 in Dual-Model Parallel Mode).
-# Architecture: 26B Total Parameters, 128 Routed Experts, Top-8 Active (3.8B Active Parameters per Token).
+# Architecture: 25.2B Total Parameters, 128 Routed Experts + 1 Shared Expert, Top-8 Active (3.8B Active Parameters/Token).
+# Unsloth auto-target discovery (`target_modules: null`) adapts attention + shared MLP + all 128 3D expert projections (`r=16, alpha=16`) while keeping `router` strictly frozen.
 
 model:
   base_model_id: "unsloth/gemma-4-26B-A4B-it"
   reference_model_id: "google/gemma-4-26B-A4B-it"
   hf_hub_repo_id: "noman-asif/Gemma-4-26B-A4B-Arabic-It"
   architecture_type: "moe"
-  total_parameters: "26.0B"
+  total_parameters: "25.2B"
   effective_parameters: "3.8B"
   num_experts: 128
   top_k_experts: 8
   vocab_size: 262144
   arabic_vocab_tokens: 8460
-  max_seq_length: 2048
+  max_seq_length: 4096
   dtype: "bfloat16"
   load_in_4bit: true
   quant_type: "nf4"
@@ -31,21 +32,14 @@ vram_optimization:
   freeze_moe_router: true
 
 lora:
-  use_rslora: true
-  r: 32
-  lora_alpha: 64
+  use_rslora: false
+  r: 16
+  lora_alpha: 16
   lora_dropout: 0.0
   bias: "none"
-  use_gradient_checkpointing: false
+  use_gradient_checkpointing: "unsloth"
   random_state: 3407
-  target_modules:
-    - "q_proj"
-    - "k_proj"
-    - "v_proj"
-    - "o_proj"
-    - "mlp.gate_proj"
-    - "mlp.up_proj"
-    - "mlp.down_proj"
+  target_modules: null
   exclude_modules:
     - "vision_tower"
     - "multi_modal_projector"
@@ -53,18 +47,18 @@ lora:
     - "router"
 
 training:
-  output_dir: "outputs/sft_26b_a4b_stage1"
-  per_device_train_batch_size: 5
+  output_dir: "outputs/sft_26b_a4b_a100"
+  per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 6
+  gradient_accumulation_steps: 8
   optim: "adamw_bnb_8bit"
-  learning_rate: 8.0e-5
+  learning_rate: 5.0e-5
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.05
   weight_decay: 0.01
   max_grad_norm: 1.0
-  neftune_noise_alpha: 5.0
-  num_train_epochs: 1.5
+  neftune_noise_alpha: null
+  num_train_epochs: 1.0
   packing: true
   completion_only_loss: true
   bf16: true
@@ -84,7 +78,7 @@ chat_template:
   add_generation_prompt: false
   preserve_thinking_tokens: true
   default_enable_thinking: false
-  empty_thinking_block: "<|think|>\n<|think|>\n"
+  empty_thinking_block: "<|channel>thought\n<channel|>"
 
 datasets:
   total_target_samples: 120000

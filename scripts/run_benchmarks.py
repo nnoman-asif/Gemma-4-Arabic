@@ -22,6 +22,7 @@ import math
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,10 @@ import yaml
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.constants import load_dotenv_if_present
+
+load_dotenv_if_present()
 
 logger = logging.getLogger(__name__)
 
@@ -234,13 +239,66 @@ def load_eval_config(config_path: pathlib.Path) -> Dict[str, Any]:
 
 
 def _resolve_hf_eval_cache_dir() -> Optional[str]:
-    """Return `/dev/shm/hf_eval_cache` on Linux to avoid root disk usage, or None otherwise."""
-    shm_root = pathlib.Path("/dev/shm")
-    if shm_root.exists() and os.access(str(shm_root), os.W_OK):
-        cache_dir = shm_root / "hf_eval_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return str(cache_dir)
+    """Return persistent `HF_DATASETS_CACHE` if configured, or `/dev/shm/hf_eval_cache` only when explicitly requested."""
+    explicit_cache = os.environ.get("HF_DATASETS_CACHE")
+    if explicit_cache:
+        return explicit_cache
+    if os.environ.get("GEMMA4_USE_SHM_EVAL_CACHE", "0") == "1":
+        shm_root = pathlib.Path("/dev/shm")
+        if shm_root.exists() and os.access(str(shm_root), os.W_OK):
+            cache_dir = shm_root / "hf_eval_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return str(cache_dir)
     return None
+
+
+def _find_free_localhost_port() -> int:
+    """Bind to port 0 on 127.0.0.1 momentarily to obtain a collision-free localhost port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return int(sock.getsockname()[1])
+
+
+def _build_isolated_gpu_env(device: str = "cuda:0", tag: str = "") -> Dict[str, str]:
+    """Construct an isolated environment dict for a single-GPU eval subprocess.
+
+    Isolates `CUDA_VISIBLE_DEVICES`, `MASTER_PORT`, `VLLM_PORT`, `TORCHINDUCTOR_CACHE_DIR`,
+    `TRITON_CACHE_DIR`, and `VLLM_CACHE_ROOT` so simultaneous Base (GPU 0) and Tuned (GPU 1)
+    workers never collide on TCP ports or TorchInductor/Triton JIT compiler locks.
+    """
+    child_env = os.environ.copy()
+    if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
+        gpu_idx = device.split(":")[1]
+        child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+
+    vis_gpu = str(child_env.get("CUDA_VISIBLE_DEVICES", "0")).split(",")[0].strip() or "0"
+    safe_tag = re.sub(r"[^a-zA-Z0-9_]+", "_", str(tag or "eval")).strip("_").lower()
+    slot_id = f"gpu{vis_gpu}_{safe_tag}"
+
+    child_env["MASTER_ADDR"] = "127.0.0.1"
+    child_env["MASTER_PORT"] = str(_find_free_localhost_port())
+    child_env["VLLM_PORT"] = str(_find_free_localhost_port())
+    child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    child_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    child_env.setdefault("HF_ALLOW_CODE_EVAL", "1")
+
+    cache_base = pathlib.Path(tempfile.gettempdir()) / f"gemma4_eval_compile_{slot_id}"
+    for env_key, sub in (
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+        ("TRITON_CACHE_DIR", "triton"),
+        ("VLLM_CACHE_ROOT", "vllm"),
+    ):
+        existing_val = child_env.get(env_key, "")
+        if not existing_val or slot_id not in existing_val:
+            sub_dir = cache_base / sub
+            try:
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                child_env[env_key] = str(sub_dir)
+            except Exception:
+                pass
+    return child_env
 
 
 def _patch_gemma4_config_for_lm_eval(model: Any) -> None:
@@ -324,10 +382,12 @@ def _patch_local_checkpoint_config_json(model_dir: pathlib.Path) -> bool:
                 cfg_data["text_config"]["use_cache"] = True
                 changed = True
         if changed:
-            cfg_path.write_text(
+            tmp_cfg = cfg_path.with_name(f"config.json.tmp.{os.getpid()}")
+            tmp_cfg.write_text(
                 json.dumps(cfg_data, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            os.replace(tmp_cfg, cfg_path)
             logger.info(
                 "Patched %s on disk (tie_word_embeddings / use_cache=true).",
                 cfg_path,
@@ -342,7 +402,9 @@ def _patch_local_checkpoint_config_json(model_dir: pathlib.Path) -> bool:
                     raw_tpl,
                 )
                 if restored_tpl != raw_tpl:
-                    chat_tpl_path.write_text(restored_tpl, encoding="utf-8")
+                    tmp_tpl = chat_tpl_path.with_name(f"chat_template.jinja.tmp.{os.getpid()}")
+                    tmp_tpl.write_text(restored_tpl, encoding="utf-8")
+                    os.replace(tmp_tpl, chat_tpl_path)
                     logger.info(
                         "Restored official 26B-A4B non-thinking channel prefix in %s.",
                         chat_tpl_path,
@@ -354,7 +416,7 @@ def _patch_local_checkpoint_config_json(model_dir: pathlib.Path) -> bool:
 
 
 def _prepare_gemma4_config_for_load(model_path: str) -> Any:
-    """Ensure `tie_word_embeddings=True` on disk (if local) and in `AutoConfig` before `from_pretrained`."""
+    """Ensure `tie_word_embeddings=True` on disk (only if `model_path` is a local dir) and in `AutoConfig`."""
     try:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4Model  # type: ignore
 
@@ -365,13 +427,9 @@ def _prepare_gemma4_config_for_load(model_path: str) -> Any:
     except Exception:
         pass
 
-    for candidate_dir in (
-        pathlib.Path(model_path),
-        PROJECT_ROOT / "outputs" / "merged_gemma4_e4b_arabic" / "merged_16bit",
-        PROJECT_ROOT / "outputs" / "merged_gemma4_26b_a4b_arabic" / "merged_16bit",
-    ):
-        if candidate_dir.is_dir():
-            _patch_local_checkpoint_config_json(candidate_dir)
+    candidate_dir = pathlib.Path(model_path)
+    if candidate_dir.is_dir():
+        _patch_local_checkpoint_config_json(candidate_dir)
 
     from transformers import AutoConfig
 
@@ -514,6 +572,80 @@ def clean_gemma4_completion(text: str, drop_unclosed_thought: bool = True) -> st
     if "<think>" in s and drop_unclosed_thought:
         s = s.split("<think>", 1)[0]
     return s.strip()
+
+
+def normalize_inspect_completion_for_scoring(text: str, is_aime: bool = False) -> str:
+    """Clean Gemma 4 completions for `inspect_evals` (`GPQA-Diamond` & `AIME-2026`).
+
+    In addition to stripping any residual thought channels or turn markers, converts standalone
+    LaTeX `\\[` / `\\]` display-math fence lines into `$$` when `is_aime=True` because upstream
+    `inspect_evals` `aime_scorer` skips trailing `$$` lines when locating the final `\\boxed{N}`
+    line, whereas a trailing `\\]` line otherwise masks `\\boxed{N}` on the line immediately above.
+    """
+    cleaned = clean_gemma4_completion(text, drop_unclosed_thought=True)
+    if not cleaned:
+        return ""
+    if is_aime:
+        cleaned = re.sub(r"(?m)^[ \t]*\\[\[\]][ \t\.,;]*$", "$$", cleaned)
+    return cleaned.strip()
+
+
+def _is_compilable_python_program(snippet: str) -> bool:
+    """Return `True` if `snippet` parses as valid Python AST with at least one non-trivial statement."""
+    import ast
+
+    code = str(snippet or "").strip()
+    if not code:
+        return False
+    try:
+        tree = ast.parse(code)
+        compile(tree, "<lcb_candidate>", "exec")
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    if not tree.body:
+        return False
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Expr):
+            return True
+        if not isinstance(getattr(stmt, "value", None), ast.Constant):
+            return True
+    return False
+
+
+def normalize_lcb_code_completion(text: str) -> str:
+    """Ensure `LiveCodeBench-v6` (`lighteval`) extracts the valid Python solution rather than trailing example I/O fences.
+
+    Upstream `lighteval` `extract_code()` extracts strictly the LAST markdown fenced block
+    (`outputlines[indexlines[-2]+1:indexlines[-1]]`). If a model appends a trailing example stdout/input
+    ```` ```...``` ```` block after its ```` ```python...``` ```` solution (or emits raw unfenced Python),
+    this normalizer preserves the last fenced block whenever it is valid Python, and otherwise promotes
+    the last valid Python code block so both Base and Tuned models are evaluated on their Python code.
+    """
+    cleaned = clean_gemma4_completion(text, drop_unclosed_thought=True)
+    if not cleaned:
+        return ""
+
+    all_fenced = re.findall(
+        r"```(?:[A-Za-z0-9_+\-]*)[ \t]*\r?\n(.*?)```",
+        cleaned,
+        flags=re.DOTALL,
+    )
+    if all_fenced and _is_compilable_python_program(all_fenced[-1]):
+        return cleaned
+
+    py_fenced = re.findall(
+        r"```(?:python|py)[ \t]*\r?\n(.*?)```",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    for cand in list(reversed(py_fenced)) + list(reversed(all_fenced)):
+        if _is_compilable_python_program(cand):
+            return f"```python\n{cand.strip()}\n```"
+
+    if not all_fenced and "```" not in cleaned and _is_compilable_python_program(cleaned):
+        return f"```python\n{cleaned.strip()}\n```"
+
+    return cleaned
 
 
 def _strip_thinking_blocks(text: str) -> str:
@@ -1584,8 +1716,8 @@ def evaluate_retention_gate(
 
     min_observed_ratio = min(ratios) if ratios else 1.0
     gate_passed = len(violations) == 0
-    recommended_lambda = 0.85 if gate_passed else (
-        min(sweep_lambdas) if sweep_lambdas else 0.80
+    recommended_lambda = 1.0 if gate_passed else (
+        min(sweep_lambdas) if sweep_lambdas else 0.85
     )
 
     return {
@@ -2074,13 +2206,7 @@ def run_lighteval_tasks_subprocess(
         str(per_subtask_samples),
     )
 
-    child_env = os.environ.copy()
-    if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
-        gpu_idx = device.split(":")[1]
-        child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-    child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
-    child_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    child_env = _build_isolated_gpu_env(device=device, tag=tag)
 
     le_batch_size = (
         1
@@ -2092,7 +2218,7 @@ def run_lighteval_tasks_subprocess(
     with tempfile.TemporaryDirectory(prefix="lighteval_ar_run_") as tmp_dir:
         out_json_file = pathlib.Path(tmp_dir) / "lighteval_results.json"
         runner_code = f"""
-import json, logging, os, pathlib, sys
+import inspect, json, logging, os, pathlib, sys
 for _n in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 sys.path.insert(0, {repr(str(PROJECT_ROOT))})
@@ -2126,15 +2252,18 @@ try:
                 max_samples={repr(per_subtask_samples)},
                 bootstrap_iters=0,
             )
-            model_config = VLLMModelConfig(
+            _vllm_kw = dict(
                 model_name={repr(load_target_path)},
                 dtype="bfloat16",
-                gpu_memory_utilization=0.88,
+                gpu_memory_utilization=0.90,
                 max_model_length={int(le_max_len)},
-                max_num_batched_tokens={max(4096, int(le_max_len))},
+                max_num_batched_tokens={max(8192, int(le_max_len))},
                 override_chat_template=False,
                 trust_remote_code=True,
             )
+            if "enable_prefix_caching" in inspect.signature(VLLMModelConfig).parameters:
+                _vllm_kw["enable_prefix_caching"] = True
+            model_config = VLLMModelConfig(**_vllm_kw)
             pipeline = Pipeline(
                 tasks={repr(tasks_csv)},
                 pipeline_parameters=pipeline_params,
@@ -2250,8 +2379,8 @@ def run_inspect_evals_subprocess(
             load_target_path = resolved_dir.as_posix()
 
     is_26b = "26b" in str(load_target_path).lower() or "26b" in str(tag).lower()
-    inspect_max_model_len = 24576 if is_26b else 32768
-    inspect_max_tokens = 18432 if is_26b else 24576
+    inspect_max_model_len = 32768
+    inspect_max_tokens = 28672
     inspect_max_conns = 32 if is_26b else 64
 
     logger.info(
@@ -2264,13 +2393,7 @@ def run_inspect_evals_subprocess(
         str(limit),
     )
 
-    child_env = os.environ.copy()
-    if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
-        gpu_idx = device.split(":")[1]
-        child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-    child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
-    child_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    child_env = _build_isolated_gpu_env(device=device, tag=tag)
     child_env.setdefault("INSPECT_DISPLAY", "plain")
 
     with tempfile.TemporaryDirectory(prefix="inspect_eval_run_") as tmp_dir:
@@ -2287,7 +2410,7 @@ sys.path.insert(0, {repr(str(PROJECT_ROOT))})
 from scripts.run_benchmarks import (
     _destroy_vllm_and_free_vram,
     _prepare_gemma4_config_for_load,
-    clean_gemma4_completion,
+    normalize_inspect_completion_for_scoring,
 )
 try:
     _prepare_gemma4_config_for_load({repr(load_target_path)})
@@ -2305,14 +2428,14 @@ except Exception:
         pass
 
 @solver
-def _gemma4_clean_solver(inner_solver: Solver) -> Solver:
+def _gemma4_clean_solver(inner_solver: Solver, is_aime: bool = False) -> Solver:
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         async def wrapped_generate(s: TaskState, *args, **kwargs) -> TaskState:
             s = await generate(s, *args, **kwargs)
             if s.output and s.output.completion:
                 raw_c = s.output.completion
-                if "<channel|>" in raw_c or "<|channel>" in raw_c or "<turn|>" in raw_c:
-                    cleaned = clean_gemma4_completion(raw_c, drop_unclosed_thought=True)
+                cleaned = normalize_inspect_completion_for_scoring(raw_c, is_aime=is_aime)
+                if cleaned != raw_c:
                     s.output.completion = cleaned
                     if getattr(s, "messages", None):
                         try:
@@ -2342,33 +2465,61 @@ if use_vllm:
 
 try:
     if use_vllm:
-        vllm_args = {{
-            "dtype": "bfloat16",
-            "gpu_memory_utilization": 0.88,
-            "max_model_len": {int(inspect_max_model_len)},
-            "trust_remote_code": True,
-            "timeout": 1200,
-        }}
-        if has_gemma4_parser:
-            vllm_args["reasoning_parser"] = "gemma4"
         extra_body = {{
             "top_k": 64,
             "chat_template_kwargs": {{"enable_thinking": True}},
         }}
         if not has_gemma4_parser:
             extra_body["skip_special_tokens"] = False
-        gen_cfg = GenerateConfig(
-            max_tokens={int(inspect_max_tokens)},
-            temperature=1.0,
-            top_p=0.95,
-            max_connections={int(inspect_max_conns)},
-            extra_body=extra_body,
-        )
-        model_inst = get_model(
-            {repr(f"vllm/{load_target_path}")},
-            config=gen_cfg,
-            **vllm_args,
-        )
+        try:
+            vllm_args = {{
+                "dtype": "bfloat16",
+                "gpu_memory_utilization": 0.90,
+                "max_model_len": {int(inspect_max_model_len)},
+                "trust_remote_code": True,
+                "timeout": 1200,
+            }}
+            if has_gemma4_parser:
+                vllm_args["reasoning_parser"] = "gemma4"
+            gen_cfg = GenerateConfig(
+                max_tokens={int(inspect_max_tokens)},
+                temperature=1.0,
+                top_p=0.95,
+                max_connections={int(inspect_max_conns)},
+                extra_body=extra_body,
+            )
+            model_inst = get_model(
+                {repr(f"vllm/{load_target_path}")},
+                config=gen_cfg,
+                **vllm_args,
+            )
+        except Exception:
+            try:
+                cleanup_servers()
+            except Exception:
+                pass
+            _destroy_vllm_and_free_vram()
+            vllm_args = {{
+                "dtype": "bfloat16",
+                "gpu_memory_utilization": 0.90,
+                "max_model_len": 24576,
+                "trust_remote_code": True,
+                "timeout": 1200,
+            }}
+            if has_gemma4_parser:
+                vllm_args["reasoning_parser"] = "gemma4"
+            gen_cfg = GenerateConfig(
+                max_tokens=20480,
+                temperature=1.0,
+                top_p=0.95,
+                max_connections=max(16, {int(inspect_max_conns)} // 2),
+                extra_body=extra_body,
+            )
+            model_inst = get_model(
+                {repr(f"vllm/{load_target_path}")},
+                config=gen_cfg,
+                **vllm_args,
+            )
     else:
         gen_cfg = GenerateConfig(
             max_tokens={int(inspect_max_tokens)},
@@ -2392,13 +2543,15 @@ try:
             from inspect_evals.gpqa import gpqa_diamond
             task_obj = gpqa_diamond(cot=True)
             task_obj.solver = _gemma4_clean_solver(
-                chain(task_obj.solver) if isinstance(task_obj.solver, list) else task_obj.solver
+                chain(task_obj.solver) if isinstance(task_obj.solver, list) else task_obj.solver,
+                is_aime=False,
             )
         elif "aime" in task_id or sname.strip().lower().startswith("aime"):
             from inspect_evals.aime2026 import aime2026
             task_obj = aime2026()
             task_obj.solver = _gemma4_clean_solver(
-                chain(task_obj.solver) if isinstance(task_obj.solver, list) else task_obj.solver
+                chain(task_obj.solver) if isinstance(task_obj.solver, list) else task_obj.solver,
+                is_aime=True,
             )
         else:
             raise ValueError(f"Unsupported inspect_evals task for suite '{{sname}}': {{task_id}}")
@@ -2468,23 +2621,26 @@ finally:
         pass
     _destroy_vllm_and_free_vram()
 """
-        proc = subprocess.run(
-            [sys.executable, "-c", runner_code],
-            env=child_env,
-            cwd=str(PROJECT_ROOT),
-        )
         partial_inspect: Dict[str, Dict[str, Any]] = {}
-        if out_json_file.exists():
-            try:
-                partial_inspect = json.loads(out_json_file.read_text(encoding="utf-8"))
-            except Exception:
-                partial_inspect = {}
-        if on_suite_complete is not None and partial_inspect:
-            for sname, smetrics in partial_inspect.items():
-                on_suite_complete(sname, smetrics)
-        if proc.returncode != 0 or len(partial_inspect) < len(suite_specs):
+        proc: Optional[subprocess.CompletedProcess[Any]] = None
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", runner_code],
+                env=child_env,
+                cwd=str(PROJECT_ROOT),
+            )
+        finally:
+            if out_json_file.exists():
+                try:
+                    partial_inspect = json.loads(out_json_file.read_text(encoding="utf-8"))
+                except Exception:
+                    partial_inspect = {}
+            if on_suite_complete is not None and partial_inspect:
+                for sname, smetrics in partial_inspect.items():
+                    on_suite_complete(sname, smetrics)
+        if proc is None or proc.returncode != 0 or len(partial_inspect) < len(suite_specs):
             raise RuntimeError(
-                f"[{tag}] inspect_evals subprocess failed (exit={proc.returncode}, completed={list(partial_inspect.keys())})"
+                f"[{tag}] inspect_evals subprocess failed (exit={getattr(proc, 'returncode', None)}, completed={list(partial_inspect.keys())})"
             )
 
     for sname, metrics in partial_inspect.items():
@@ -2519,36 +2675,44 @@ def run_lighteval_lcb_subprocess(
         _patch_local_checkpoint_config_json(pathlib.Path(load_target_path))
 
     is_26b = "26b" in str(load_target_path).lower() or "26b" in str(tag).lower()
-    lcb_max_model_len = 28672 if is_26b else 32768
-    lcb_max_new_tokens = 18432 if is_26b else 24576
-    lcb_max_num_seqs = 32 if is_26b else 64
+    base_num_seqs = 32 if is_26b else 64
 
     first_spec = next(iter(suite_specs.values()))
     lcb_task_str = str(first_spec.get("lighteval_task") or "lcb:codegeneration_v6|0")
     num_samples = int(first_spec.get("num_samples", 1))
     enable_thinking = bool(first_spec.get("enable_thinking", True))
 
-    logger.info(
-        "[%s] Running LightEval LiveCodeBench-v6 (%s, num_samples=%d, max_model_len=%d, max_new_tokens=%d, limit=%s)...",
-        tag,
-        lcb_task_str,
-        num_samples,
-        lcb_max_model_len,
-        lcb_max_new_tokens,
-        str(limit),
+    child_env = _build_isolated_gpu_env(device=device, tag=tag)
+
+    attempt_plans = (
+        [
+            (32768, 24576, base_num_seqs, 8192),
+            (24576, 18432, max(16, base_num_seqs // 2), 4096),
+        ]
+        if use_vllm
+        else [(8192, 4096, 1, 4096)]
     )
 
-    child_env = os.environ.copy()
-    if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
-        gpu_idx = device.split(":")[1]
-        child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-    child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
-    child_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    raw_lcb: Optional[Dict[str, Any]] = None
+    last_proc_rc: Optional[int] = None
 
-    with tempfile.TemporaryDirectory(prefix="lighteval_lcb_run_") as tmp_dir:
-        out_json_file = pathlib.Path(tmp_dir) / "lighteval_lcb_results.json"
-        runner_code = f"""
+    for attempt_idx, (lcb_max_model_len, lcb_max_new_tokens, lcb_max_num_seqs, lcb_batched_toks) in enumerate(
+        attempt_plans, start=1
+    ):
+        logger.info(
+            "[%s] Running LightEval LiveCodeBench-v6 (attempt %d/%d, %s, num_samples=%d, max_model_len=%d, max_new_tokens=%d, limit=%s)...",
+            tag,
+            attempt_idx,
+            len(attempt_plans),
+            lcb_task_str,
+            num_samples,
+            lcb_max_model_len,
+            lcb_max_new_tokens,
+            str(limit),
+        )
+        with tempfile.TemporaryDirectory(prefix="lighteval_lcb_run_") as tmp_dir:
+            out_json_file = pathlib.Path(tmp_dir) / "lighteval_lcb_results.json"
+            runner_code = f"""
 import json, logging, os, pathlib, sys
 for _n in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
     logging.getLogger(_n).setLevel(logging.WARNING)
@@ -2556,7 +2720,7 @@ sys.path.insert(0, {repr(str(PROJECT_ROOT))})
 from scripts.run_benchmarks import (
     _destroy_vllm_and_free_vram,
     _prepare_gemma4_config_for_load,
-    clean_gemma4_completion,
+    normalize_lcb_code_completion,
 )
 try:
     _prepare_gemma4_config_for_load({repr(load_target_path)})
@@ -2599,20 +2763,37 @@ try:
                 tok.apply_chat_template = _apply_with_thinking
                 return tok
 
-            def _generate(self, *args, **kwargs):
-                inputs = args[0] if len(args) > 0 else kwargs.get("inputs")
+            def _generate(
+                self,
+                inputs,
+                max_new_tokens=None,
+                stop_tokens=None,
+                returns_logits=False,
+                num_samples=1,
+                generate=True,
+            ):
                 orig_cfg_max_new = self.config.generation_parameters.max_new_tokens
+                eff_max_new = max_new_tokens
                 try:
-                    if inputs and isinstance(inputs, list) and isinstance(inputs[0], (list, tuple)):
+                    if generate and inputs and isinstance(inputs, list) and isinstance(inputs[0], (list, tuple)):
                         max_prompt_len = max(len(x) for x in inputs)
-                        eff_max_model = int(self._max_length or lcb_max_model_len)
+                        eff_max_model = int(getattr(self, "max_length", None) or getattr(self, "_max_length", None) or lcb_max_model_len)
                         safe_budget = max(512, eff_max_model - max_prompt_len - 32)
-                        if orig_cfg_max_new is not None and orig_cfg_max_new > safe_budget:
+                        if eff_max_new is None or int(eff_max_new) > safe_budget:
+                            eff_max_new = safe_budget
+                        if orig_cfg_max_new is not None and int(orig_cfg_max_new) > safe_budget:
                             self.config.generation_parameters.max_new_tokens = safe_budget
-                    outputs = super()._generate(*args, **kwargs)
+                    outputs = super()._generate(
+                        inputs=inputs,
+                        max_new_tokens=eff_max_new,
+                        stop_tokens=stop_tokens,
+                        returns_logits=returns_logits,
+                        num_samples=num_samples,
+                        generate=generate,
+                    )
                 finally:
                     self.config.generation_parameters.max_new_tokens = orig_cfg_max_new
-                if outputs:
+                if generate and outputs:
                     for req_out in outputs:
                         for comp in getattr(req_out, "outputs", ()):
                             token_ids = getattr(comp, "token_ids", None)
@@ -2620,7 +2801,7 @@ try:
                                 raw_txt = self.tokenizer.decode(token_ids, skip_special_tokens=False)
                             else:
                                 raw_txt = str(getattr(comp, "text", "") or "")
-                            comp.text = clean_gemma4_completion(raw_txt, drop_unclosed_thought=True)
+                            comp.text = normalize_lcb_code_completion(raw_txt)
                 return outputs
 
         gen_params = GenerationParameters(
@@ -2629,42 +2810,19 @@ try:
             top_p=0.95,
             top_k=64,
         )
-        try:
-            vllm_cfg = VLLMModelConfig(
-                model_name={repr(load_target_path)},
-                dtype="bfloat16",
-                gpu_memory_utilization=0.88,
-                max_model_length=lcb_max_model_len,
-                max_num_seqs={int(lcb_max_num_seqs)},
-                max_num_batched_tokens=8192,
-                override_chat_template=True,
-                add_special_tokens=False,
-                trust_remote_code=True,
-                generation_parameters=gen_params,
-            )
-            vllm_model = Gemma4LCBVLLMModel(vllm_cfg)
-        except Exception:
-            _destroy_vllm_and_free_vram()
-            lcb_max_model_len = 24576
-            gen_params = GenerationParameters(
-                max_new_tokens=16384,
-                temperature=1.0,
-                top_p=0.95,
-                top_k=64,
-            )
-            vllm_cfg = VLLMModelConfig(
-                model_name={repr(load_target_path)},
-                dtype="bfloat16",
-                gpu_memory_utilization=0.88,
-                max_model_length=lcb_max_model_len,
-                max_num_seqs=max(16, {int(lcb_max_num_seqs)} // 2),
-                max_num_batched_tokens=4096,
-                override_chat_template=True,
-                add_special_tokens=False,
-                trust_remote_code=True,
-                generation_parameters=gen_params,
-            )
-            vllm_model = Gemma4LCBVLLMModel(vllm_cfg)
+        vllm_cfg = VLLMModelConfig(
+            model_name={repr(load_target_path)},
+            dtype="bfloat16",
+            gpu_memory_utilization=0.90,
+            max_model_length=lcb_max_model_len,
+            max_num_seqs={int(lcb_max_num_seqs)},
+            max_num_batched_tokens={int(lcb_batched_toks)},
+            override_chat_template=True,
+            add_special_tokens=False,
+            trust_remote_code=True,
+            generation_parameters=gen_params,
+        )
+        vllm_model = Gemma4LCBVLLMModel(vllm_cfg)
 
         pipeline_params = PipelineParameters(
             launcher_type=ParallelismManager.VLLM,
@@ -2740,16 +2898,28 @@ try:
 finally:
     _destroy_vllm_and_free_vram()
 """
-        proc = subprocess.run(
-            [sys.executable, "-c", runner_code],
-            env=child_env,
-            cwd=str(PROJECT_ROOT),
-        )
-        if proc.returncode != 0 or not out_json_file.exists():
-            raise RuntimeError(
-                f"[{tag}] LightEval LiveCodeBench-v6 subprocess failed with exit code {proc.returncode}"
+            proc = subprocess.run(
+                [sys.executable, "-c", runner_code],
+                env=child_env,
+                cwd=str(PROJECT_ROOT),
             )
-        raw_lcb = json.loads(out_json_file.read_text(encoding="utf-8"))
+            last_proc_rc = proc.returncode
+            if proc.returncode == 0 and out_json_file.exists():
+                raw_lcb = json.loads(out_json_file.read_text(encoding="utf-8"))
+                break
+            if attempt_idx < len(attempt_plans):
+                logger.warning(
+                    "[%s] LiveCodeBench-v6 attempt %d/%d exited with code %s; retrying in fresh OS subprocess with reduced context window...",
+                    tag,
+                    attempt_idx,
+                    len(attempt_plans),
+                    proc.returncode,
+                )
+
+    if raw_lcb is None:
+        raise RuntimeError(
+            f"[{tag}] LightEval LiveCodeBench-v6 subprocess failed with exit code {last_proc_rc}"
+        )
 
     parsed_out: Dict[str, Dict[str, Any]] = {}
     for sname in suite_specs:
@@ -2771,13 +2941,17 @@ def _get_lm_eval_gen_kwargs(
     task_name: str,
     model_key_prefix: str = "e4b",
     use_vllm: bool = True,
+    max_model_len: int = 32768,
 ) -> Optional[Dict[str, Any]]:
     """Return official Gemma 4 Thinking Mode `generation_kwargs` for `lm_eval` generative tasks (`mmlu_pro`)."""
     _ = model_key_prefix
     clean = task_name.strip().lower()
     if clean == "mmlu_pro":
+        # Reserve 8,192 tokens for 5-shot CoT multiturn prompts so lm_eval's maybe_truncate
+        # never left-truncates prompts while granting up to 24,576 reasoning+answer tokens.
+        eff_gen_budget = max(4096, min(24576, int(max_model_len) - 8192))
         kw: Dict[str, Any] = {
-            "max_gen_toks": 16384,
+            "max_gen_toks": eff_gen_budget,
             "temperature": 1.0,
             "top_p": 0.95,
             "top_k": 64,
@@ -2794,6 +2968,45 @@ def _get_lm_eval_gen_kwargs(
             kw["skip_special_tokens"] = False
         return kw
     return None
+
+
+def _install_lm_eval_unclosed_thought_guard() -> None:
+    """Patch `lm_eval` `postprocess_generated_text` idempotently so unclosed `<|channel>thought` traces return `""` instead of leaking raw thoughts into regex extractors."""
+    try:
+        import lm_eval.models.utils as lm_utils
+    except Exception:
+        return
+
+    orig_fn = getattr(lm_utils, "postprocess_generated_text", None)
+    if orig_fn is None or getattr(orig_fn, "_gemma4_unclosed_thought_guarded", False):
+        return
+
+    def _guarded_postprocess_generated_text(
+        generation: str,
+        stop: Any,
+        think_end_token: Optional[str],
+    ) -> str:
+        if (
+            isinstance(generation, str)
+            and think_end_token == "<channel|>"
+            and "<channel|>" not in generation
+            and ("<|channel>thought" in generation or generation.lstrip().startswith("<|channel>"))
+        ):
+            return ""
+        return orig_fn(generation, stop, think_end_token)
+
+    setattr(_guarded_postprocess_generated_text, "_gemma4_unclosed_thought_guarded", True)
+    lm_utils.postprocess_generated_text = _guarded_postprocess_generated_text
+
+    for mod_name in ("lm_eval.models.huggingface", "lm_eval.models.vllm_causallms"):
+        mod_obj = sys.modules.get(mod_name)
+        if mod_obj is None:
+            try:
+                mod_obj = __import__(mod_name, fromlist=["postprocess_generated_text"])
+            except Exception:
+                mod_obj = None
+        if mod_obj is not None and hasattr(mod_obj, "postprocess_generated_text"):
+            setattr(mod_obj, "postprocess_generated_text", _guarded_postprocess_generated_text)
 
 
 def _should_apply_chat_template_for_task(
@@ -2830,6 +3043,8 @@ def _configure_lm_eval_thinking_for_task(
 ) -> None:
     """Configure `enable_thinking=True` and `think_end_token='<channel|>'` for `mmlu_pro` across `VLLM` and `HFLM`."""
     use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
+    if use_thinking:
+        _install_lm_eval_unclosed_thought_guard()
     if model_key_prefix == "26b_a4b":
         tok = getattr(lm_obj, "tokenizer", None)
         if tok is not None:
@@ -2883,17 +3098,19 @@ def run_lm_eval_task(
             _prepare_gemma4_config_for_load(model_path)
         except Exception:
             pass
-    is_26b = "26b" in str(model_path).lower()
-    lm_max_len = 24576 if is_26b else 32768
+    lm_max_len = 32768
     task_chat_tpl = _should_apply_chat_template_for_task(task_name, apply_chat_template)
     use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
+    if use_thinking:
+        _install_lm_eval_unclosed_thought_guard()
     model_backend = "vllm" if use_vllm else "hf"
     if use_vllm:
         model_args: Any = {
             "pretrained": model_path,
             "dtype": "bfloat16",
             "trust_remote_code": True,
-            "gpu_memory_utilization": 0.88,
+            "gpu_memory_utilization": 0.90,
+            "enable_prefix_caching": True,
             "max_model_len": lm_max_len,
             "enable_thinking": use_thinking,
             "think_end_token": "<channel|>" if use_thinking else None,
@@ -2908,7 +3125,11 @@ def run_lm_eval_task(
             "think_end_token": "<channel|>" if use_thinking else None,
             "chat_template_args": {"enable_thinking": True} if use_thinking else {},
         }
-    gen_kwargs = _get_lm_eval_gen_kwargs(task_name, use_vllm=use_vllm)
+    gen_kwargs = _get_lm_eval_gen_kwargs(
+        task_name,
+        use_vllm=use_vllm,
+        max_model_len=lm_max_len,
+    )
     payload = lm_eval.simple_evaluate(
         model=model_backend,
         model_args=model_args,
@@ -2946,21 +3167,18 @@ def _run_lm_eval_suites_subprocess(
     use_vllm: bool = True,
     apply_chat_template: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Run the `lm_eval` tasks for `model_path` in an isolated child subprocess so the OS reclaims 100% of vLLM's GPU memory pool upon completion."""
-    child_env = os.environ.copy()
-    if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
-        gpu_idx = device.split(":")[1]
-        child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-    child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
-    child_env.setdefault("HF_ALLOW_CODE_EVAL", "1")
+    """Run the `lm_eval` tasks for `model_path` in an isolated child subprocess so the OS reclaims 100% of vLLM's GPU memory pool upon completion or retry."""
+    child_env = _build_isolated_gpu_env(device=device, tag=tag)
+    candidate_lengths = (32768, 24576) if use_vllm else (32768,)
+    last_rc: Optional[int] = None
 
-    with tempfile.TemporaryDirectory(prefix="lm_eval_run_") as tmp_dir:
-        cfg_json_file = pathlib.Path(tmp_dir) / "eval_cfg.json"
-        out_json_file = pathlib.Path(tmp_dir) / "lm_eval_out.json"
-        cfg_json_file.write_text(json.dumps(cfg), encoding="utf-8")
+    for attempt_idx, cand_max_len in enumerate(candidate_lengths, start=1):
+        with tempfile.TemporaryDirectory(prefix="lm_eval_run_") as tmp_dir:
+            cfg_json_file = pathlib.Path(tmp_dir) / "eval_cfg.json"
+            out_json_file = pathlib.Path(tmp_dir) / "lm_eval_out.json"
+            cfg_json_file.write_text(json.dumps(cfg), encoding="utf-8")
 
-        runner_code = f"""
+            runner_code = f"""
 import json, logging, pathlib, sys
 logging.basicConfig(
     level=logging.INFO,
@@ -2982,22 +3200,34 @@ res = _evaluate_checkpoint_with_lm_eval(
     apply_chat_template={repr(bool(apply_chat_template))},
     _in_lm_eval_subprocess=True,
     _skip_non_lm_eval=True,
+    _lm_eval_max_len={int(cand_max_len)},
 )
 pathlib.Path({repr(str(out_json_file))}).write_text(
     json.dumps(res, indent=2),
     encoding="utf-8",
 )
 """
-        proc = subprocess.run(
-            [sys.executable, "-c", runner_code],
-            env=child_env,
-            cwd=str(PROJECT_ROOT),
-        )
-        if proc.returncode != 0 or not out_json_file.exists():
-            raise RuntimeError(
-                f"[{tag}] lm_eval child subprocess failed with exit code {proc.returncode}"
+            proc = subprocess.run(
+                [sys.executable, "-c", runner_code],
+                env=child_env,
+                cwd=str(PROJECT_ROOT),
             )
-        return json.loads(out_json_file.read_text(encoding="utf-8"))
+            last_rc = proc.returncode
+            if proc.returncode == 0 and out_json_file.exists():
+                return json.loads(out_json_file.read_text(encoding="utf-8"))
+            if attempt_idx < len(candidate_lengths):
+                logger.warning(
+                    "[%s] lm_eval subprocess attempt %d/%d (max_model_len=%d) failed with exit=%s; retrying in fresh OS subprocess...",
+                    tag,
+                    attempt_idx,
+                    len(candidate_lengths),
+                    cand_max_len,
+                    proc.returncode,
+                )
+
+    raise RuntimeError(
+        f"[{tag}] lm_eval child subprocess failed with exit code {last_rc}"
+    )
 
 
 def _evaluate_checkpoint_with_lm_eval(
@@ -3013,6 +3243,7 @@ def _evaluate_checkpoint_with_lm_eval(
     _preserved_arabic: Optional[Dict[str, Dict[str, Any]]] = None,
     _preserved_retention: Optional[Dict[str, Dict[str, Any]]] = None,
     checkpoint_callback: Optional[Any] = None,
+    _lm_eval_max_len: int = 32768,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Evaluate a checkpoint across all 4 isolated runner stages (`lighteval` Arabic, `lm_eval` MMLU-Pro, `inspect_evals` GPQA+AIME, `lighteval_lcb` LiveCodeBench-v6)."""
     eval_cfg = cfg.get("evaluation", {})
@@ -3023,7 +3254,7 @@ def _evaluate_checkpoint_with_lm_eval(
     default_bs = 8 if model_key_prefix == "26b_a4b" else int(eval_cfg.get("batch_size", 32))
     batch_size = int(model_specific_cfg.get("batch_size", default_bs))
     max_seq_len = int(eval_cfg.get("max_seq_length", 8192))
-    lm_eval_max_len = 24576 if model_key_prefix == "26b_a4b" else 32768
+    lm_eval_max_len = int(_lm_eval_max_len or 32768)
 
     out: Dict[str, Dict[str, Dict[str, Any]]] = {
         "arabic": dict(_preserved_arabic or {}),
@@ -3066,21 +3297,24 @@ def _evaluate_checkpoint_with_lm_eval(
         and str(v.get("runner", "lm_eval")).strip().lower() == "lighteval_lcb"
     }
 
-    # Stage 1: OALL v2 Arabic MCQ via LightEval (isolated subprocess)
+    # Stage 1: OALL v2 Arabic MCQ via LightEval (isolated subprocess, chunked for interrupt-safe checkpointing)
     if pending_lighteval_ar and not _skip_non_lm_eval:
-        le_metrics = run_lighteval_tasks_subprocess(
-            model_path=model_path,
-            suite_names=pending_lighteval_ar,
-            device=device,
-            limit=limit,
-            max_seq_len=max_seq_len,
-            batch_size=batch_size,
-            use_vllm=use_vllm,
-            tag=tag,
-        )
-        for sname, smetrics in le_metrics.items():
-            out["arabic"][sname] = smetrics
-        _flush_stage()
+        ar_chunk_size = 3 if (limit is None and len(pending_lighteval_ar) > 3) else len(pending_lighteval_ar)
+        for chunk_start in range(0, len(pending_lighteval_ar), ar_chunk_size):
+            ar_chunk = pending_lighteval_ar[chunk_start : chunk_start + ar_chunk_size]
+            le_metrics = run_lighteval_tasks_subprocess(
+                model_path=model_path,
+                suite_names=ar_chunk,
+                device=device,
+                limit=limit,
+                max_seq_len=max_seq_len,
+                batch_size=batch_size,
+                use_vllm=use_vllm,
+                tag=tag,
+            )
+            for sname, smetrics in le_metrics.items():
+                out["arabic"][sname] = smetrics
+            _flush_stage()
 
     # Stage 2: MMLU-Pro (and any configured lm_eval suites)
     has_pending_lm_eval = bool(pending_lm_eval_ar or pending_lm_eval_ret)
@@ -3132,52 +3366,58 @@ def _evaluate_checkpoint_with_lm_eval(
             logger.info(
                 "[%s] Initializing lm_eval model (%s) on %s: %s",
                 tag,
-                "vLLM" if use_vllm else f"HFLM (batch_size={batch_size})",
+                f"vLLM (max_model_len={lm_eval_max_len})" if use_vllm else f"HFLM (batch_size={batch_size})",
                 device,
                 model_path,
             )
             model_obj: Any = None
             lm_obj: Any = None
             effective_use_vllm = bool(use_vllm)
+            active_max_model_len = lm_eval_max_len
 
             if effective_use_vllm:
                 try:
                     from lm_eval.models.vllm_causallms import VLLM
 
                     model_dir = pathlib.Path(model_path)
-                    if (model_dir / "adapter_config.json").exists() and not (model_dir / "config.json").exists():
-                        adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
-                        base_model_path = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
-                        lm_obj = VLLM(
-                            pretrained=base_model_path,
-                            lora_local_path=str(model_path),
-                            dtype="bfloat16",
-                            trust_remote_code=True,
-                            gpu_memory_utilization=0.88,
-                            max_model_len=lm_eval_max_len,
-                            batch_size="auto",
-                            enable_thinking=True,
-                            think_end_token="<channel|>",
-                        )
-                    else:
-                        lm_obj = VLLM(
-                            pretrained=model_path,
-                            dtype="bfloat16",
-                            trust_remote_code=True,
-                            gpu_memory_utilization=0.88,
-                            max_model_len=lm_eval_max_len,
-                            batch_size="auto",
-                            enable_thinking=True,
-                            think_end_token="<channel|>",
-                        )
+                    is_peft_vllm = (model_dir / "adapter_config.json").exists() and not (
+                        model_dir / "config.json"
+                    ).exists()
+                    base_model_path = (
+                        str(
+                            json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8")).get(
+                                "base_model_name_or_path"
+                            )
+                            or ""
+                        ).strip()
+                        if is_peft_vllm
+                        else model_path
+                    )
+                    vllm_init_kw: Dict[str, Any] = {
+                        "pretrained": base_model_path,
+                        "dtype": "bfloat16",
+                        "trust_remote_code": True,
+                        "gpu_memory_utilization": 0.90,
+                        "enable_prefix_caching": True,
+                        "max_model_len": active_max_model_len,
+                        "batch_size": "auto",
+                        "enable_thinking": True,
+                        "think_end_token": "<channel|>",
+                    }
+                    if is_peft_vllm:
+                        vllm_init_kw["lora_local_path"] = str(model_path)
+                    lm_obj = VLLM(**vllm_init_kw)
                 except Exception as vllm_exc:
+                    _destroy_vllm_and_free_vram()
+                    if _in_lm_eval_subprocess:
+                        # Exit child subprocess immediately so parent retries in a 100% clean OS process
+                        raise
                     logger.warning(
                         "[%s] vLLM initialization failed (%s); falling back to HFLM (batch_size=%d).",
                         tag,
                         vllm_exc,
                         batch_size,
                     )
-                    _destroy_vllm_and_free_vram()
                     effective_use_vllm = False
 
             if not effective_use_vllm:
@@ -3233,14 +3473,19 @@ def _evaluate_checkpoint_with_lm_eval(
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                lm_obj = HFLM(
-                    pretrained=model_obj,
-                    tokenizer=tokenizer,
-                    backend="causal",
-                    batch_size=batch_size,
-                    max_length=lm_eval_max_len,
-                    trust_remote_code=True,
-                )
+                hflm_kw: Dict[str, Any] = {
+                    "pretrained": model_obj,
+                    "tokenizer": tokenizer,
+                    "backend": "causal",
+                    "batch_size": batch_size,
+                    "max_length": lm_eval_max_len,
+                    "trust_remote_code": True,
+                }
+                if "enable_thinking" in inspect.signature(HFLM.__init__).parameters:
+                    hflm_kw["enable_thinking"] = True
+                if "think_end_token" in inspect.signature(HFLM.__init__).parameters:
+                    hflm_kw["think_end_token"] = "<channel|>"
+                lm_obj = HFLM(**hflm_kw)
                 lm_obj.chat_template_args = {}
                 _ensure_gemma4_tied_lm_head(lm_obj, tag=f"{tag}:hflm")
 
@@ -3275,6 +3520,7 @@ def _evaluate_checkpoint_with_lm_eval(
                         task_name,
                         model_key_prefix=model_key_prefix,
                         use_vllm=effective_use_vllm,
+                        max_model_len=active_max_model_len,
                     )
                     logger.info(
                         "[%s] Running lm_eval on %s/%s (task=%s, shots=%d, limit=%s, metric=%s, chat_template=%s)...",
@@ -3705,6 +3951,344 @@ def run_inprocess_gpu_eval(
     return payload
 
 
+def _load_single_role_checkpoint(
+    role_cache_path: pathlib.Path,
+    combined_cache_path: pathlib.Path,
+    role: str,
+    limit: Optional[int],
+    base_model_id: str,
+    tuned_model_path: str,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Load completed `(arabic, retention)` dicts for `role` (`'base'` or `'tuned'`) when run parameters match."""
+    def _valid_entries(section: Any) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(section, dict):
+            return {}
+        return {
+            k: v
+            for k, v in section.items()
+            if isinstance(v, dict)
+            and "eval_score_pct" in v
+            and not v.get("_skipped")
+        }
+
+    for cand_path in (role_cache_path, combined_cache_path):
+        if not cand_path.exists():
+            continue
+        try:
+            raw = json.loads(cand_path.read_text(encoding="utf-8"))
+            if raw.get("limit") != limit:
+                continue
+            if role == "base" and str(raw.get("base_model_id") or "") != str(base_model_id):
+                continue
+            if role == "tuned" and str(raw.get("tuned_model_path") or "") != str(tuned_model_path):
+                continue
+            role_block = raw.get(role, {})
+            if isinstance(role_block, dict):
+                ar_map = _valid_entries(role_block.get("arabic", {}))
+                ret_map = _valid_entries(role_block.get("retention", {}))
+                if ar_map or ret_map:
+                    return (ar_map, ret_map)
+        except Exception as exc:
+            logger.warning("Could not read role checkpoint %s: %s", cand_path, exc)
+    return ({}, {})
+
+
+def run_single_role_gpu_eval(
+    model_key: str,
+    role: str,
+    base_model_id: str,
+    tuned_model_path: str,
+    cfg: Optional[Dict[str, Any]] = None,
+    target_device: str = "cuda:0",
+    limit: Optional[int] = None,
+    use_cached_eval: bool = False,
+    use_vllm: bool = True,
+    apply_chat_template: bool = True,
+    selected_tasks: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Evaluate ONLY `base` OR ONLY `tuned` on a dedicated GPU, writing exclusively to `live_raw_{model_key}_{role}.json`."""
+    if role not in ("base", "tuned"):
+        raise ValueError(f"role must be 'base' or 'tuned', got {role!r}")
+    if cfg is None:
+        cfg = load_eval_config(PROJECT_ROOT / "configs" / "eval_config.yaml")
+
+    ar_defs = cfg.get("arabic_benchmarks", {})
+    ret_defs = cfg.get("retention_anchors", {})
+    eval_reports_dir = PROJECT_ROOT / "outputs" / "eval_reports"
+    role_cache_path = eval_reports_dir / f"live_raw_{model_key}_{role}.json"
+    combined_cache_path = eval_reports_dir / f"live_raw_{model_key}.json"
+
+    target_checkpoint = base_model_id if role == "base" else tuned_model_path
+    if role == "tuned":
+        cand_dir = pathlib.Path(tuned_model_path)
+        if ("/" not in tuned_model_path or cand_dir.exists() or tuned_model_path.startswith("outputs")):
+            if not (cand_dir / "config.json").exists() and not (cand_dir / "adapter_config.json").exists():
+                raise FileNotFoundError(
+                    f"[{model_key}:tuned] Merged checkpoint not found at '{tuned_model_path}' "
+                    f"(missing config.json). Ensure Stage 2 merge completed before benchmarking."
+                )
+
+    if use_cached_eval and not selected_tasks:
+        c_ar, c_ret = _load_single_role_checkpoint(
+            role_cache_path=role_cache_path,
+            combined_cache_path=combined_cache_path,
+            role=role,
+            limit=limit,
+            base_model_id=base_model_id,
+            tuned_model_path=tuned_model_path,
+        )
+        if ar_defs and ret_defs and all(s in c_ar for s in ar_defs) and all(s in c_ret for s in ret_defs):
+            snap_cached = {
+                "model_key": model_key,
+                "role": role,
+                "base_model_id": base_model_id,
+                "tuned_model_path": tuned_model_path,
+                "device": target_device,
+                "limit": limit,
+                role: {"arabic": c_ar, "retention": c_ret},
+            }
+            _atomic_write_json(role_cache_path, snap_cached)
+            logger.info(
+                "[%s:%s] All 10 suites already completed; reusing cached results -> %s",
+                model_key,
+                role,
+                role_cache_path,
+            )
+            return snap_cached
+    else:
+        c_ar, c_ret = ({}, {})
+
+    resolved_selection = _resolve_selected_suites(cfg, selected_tasks)
+
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"[{model_key}:{role}] CUDA GPU is required for live role evaluation.")
+
+    use_dev = target_device
+    if ":" in use_dev:
+        idx = int(use_dev.split(":")[1])
+        if idx >= torch.cuda.device_count():
+            use_dev = "cuda:0"
+
+    if resolved_selection is not None:
+        sel_ar, sel_ret = resolved_selection
+        ex_ar, ex_ret = _load_single_role_checkpoint(
+            role_cache_path=role_cache_path,
+            combined_cache_path=combined_cache_path,
+            role=role,
+            limit=limit,
+            base_model_id=base_model_id,
+            tuned_model_path=tuned_model_path,
+        )
+        pres_ar: Dict[str, Dict[str, Any]] = {}
+        pres_ret: Dict[str, Dict[str, Any]] = {}
+        for sname in ar_defs:
+            if sname not in sel_ar:
+                pres_ar[sname] = ex_ar.get(sname, {"_skipped": True})
+        for sname in ret_defs:
+            if sname not in sel_ret:
+                pres_ret[sname] = ex_ret.get(sname, {"_skipped": True})
+    else:
+        pres_ar = dict(c_ar)
+        pres_ret = dict(c_ret)
+
+    def _clean_side(side: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        cleaned_side: Dict[str, Dict[str, Any]] = {"arabic": {}, "retention": {}}
+        for grp_name in ("arabic", "retention"):
+            for k, v in (side.get(grp_name) or {}).items():
+                if isinstance(v, dict) and not v.get("_skipped"):
+                    cleaned_side[grp_name][k] = v
+        return cleaned_side
+
+    role_state: Dict[str, Dict[str, Any]] = _clean_side({"arabic": pres_ar, "retention": pres_ret})
+
+    def _persist_role(updated: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        nonlocal role_state
+        role_state = _clean_side(updated)
+        snap = {
+            "model_key": model_key,
+            "role": role,
+            "base_model_id": base_model_id,
+            "tuned_model_path": tuned_model_path,
+            "device": use_dev,
+            "limit": limit,
+            role: role_state,
+        }
+        _atomic_write_json(role_cache_path, snap)
+        return snap
+
+    evaluated = _evaluate_checkpoint_with_lm_eval(
+        model_path=target_checkpoint,
+        device=use_dev,
+        cfg=cfg,
+        tag=f"{model_key}:{role}",
+        limit=limit,
+        use_vllm=use_vllm,
+        apply_chat_template=apply_chat_template,
+        _preserved_arabic=pres_ar,
+        _preserved_retention=pres_ret,
+        checkpoint_callback=_persist_role,
+    )
+    final_snap = _persist_role(evaluated)
+    logger.info("Saved %s:%s live GPU evaluation metrics to %s", model_key, role, role_cache_path)
+    return final_snap
+
+
+def combine_role_checkpoints(
+    model_key: str,
+    base_model_id: str,
+    tuned_model_path: str,
+    cfg: Dict[str, Any],
+    limit: Optional[int] = None,
+    selected_tasks: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Merge `live_raw_{model_key}_base.json` and `live_raw_{model_key}_tuned.json` into `live_raw_{model_key}.json`."""
+    eval_reports_dir = PROJECT_ROOT / "outputs" / "eval_reports"
+    base_path = eval_reports_dir / f"live_raw_{model_key}_base.json"
+    tuned_path = eval_reports_dir / f"live_raw_{model_key}_tuned.json"
+    combined_path = eval_reports_dir / f"live_raw_{model_key}.json"
+
+    b_ar, b_ret = _load_single_role_checkpoint(
+        role_cache_path=base_path,
+        combined_cache_path=combined_path,
+        role="base",
+        limit=limit,
+        base_model_id=base_model_id,
+        tuned_model_path=tuned_model_path,
+    )
+    t_ar, t_ret = _load_single_role_checkpoint(
+        role_cache_path=tuned_path,
+        combined_cache_path=combined_path,
+        role="tuned",
+        limit=limit,
+        base_model_id=base_model_id,
+        tuned_model_path=tuned_model_path,
+    )
+
+    resolved_selection = _resolve_selected_suites(cfg, selected_tasks)
+    req_ar = resolved_selection[0] if resolved_selection is not None else list(cfg.get("arabic_benchmarks", {}).keys())
+    req_ret = resolved_selection[1] if resolved_selection is not None else list(cfg.get("retention_anchors", {}).keys())
+
+    missing_base = [s for s in req_ar if s not in b_ar] + [s for s in req_ret if s not in b_ret]
+    missing_tuned = [s for s in req_ar if s not in t_ar] + [s for s in req_ret if s not in t_ret]
+    if missing_base or missing_tuned:
+        raise RuntimeError(
+            f"[{model_key}] Cannot combine role checkpoints: missing base suites={missing_base}, "
+            f"missing tuned suites={missing_tuned} (checked {base_path.name}, {tuned_path.name}, {combined_path.name})."
+        )
+
+    combined_payload = {
+        "model_key": model_key,
+        "base_model_id": base_model_id,
+        "tuned_model_path": tuned_model_path,
+        "device": "dual_gpu_role_parallel",
+        "limit": limit,
+        "base": {"arabic": b_ar, "retention": b_ret},
+        "tuned": {"arabic": t_ar, "retention": t_ret},
+    }
+    _atomic_write_json(combined_path, combined_payload)
+    logger.info("Combined base + tuned role checkpoints into %s", combined_path)
+    return combined_payload
+
+
+def prewarm_eval_datasets(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Pre-download and cache all 10 benchmark datasets in a single process before parallel GPU workers launch."""
+    if cfg is None:
+        cfg = load_eval_config(PROJECT_ROOT / "configs" / "eval_config.yaml")
+    warmed: List[str] = []
+    warnings_list: List[str] = []
+
+    try:
+        from datasets import load_dataset
+
+        # 1. OALL v2 Arabic suites + MMLU-Pro
+        hf_specs: List[Tuple[str, Optional[str], str]] = [
+            ("OALL/Arabic_MMLU", sub, "ArabicMMLU") for sub in ARABIC_MMLU_40_SUBSETS
+        ]
+        hf_specs.extend(
+            [
+                ("MBZUAI/MadinahQA", "Arabic Language (General)", "MadinahQA"),
+                ("MBZUAI/MadinahQA", "Arabic Language (Grammar)", "MadinahQA"),
+                ("asas-ai/AraTrust", "default", "AraTrust"),
+                ("OALL/Arabic_EXAMS", None, "EXAMS-AR"),
+                ("TIGER-Lab/MMLU-Pro", None, "MMLU-Pro"),
+                ("MathArena/aime_2026", None, "AIME-2026"),
+            ]
+        )
+        for sub in (
+            "mcq_exams_test_ar",
+            "meta_ar_dialects",
+            "meta_ar_msa",
+            "multiple_choice_facts_truefalse_balanced_task",
+            "multiple_choice_grounded_statement_soqal_task",
+            "multiple_choice_grounded_statement_xglue_mlqa_task",
+            "multiple_choice_rating_sentiment_no_neutral_task",
+            "multiple_choice_rating_sentiment_task",
+            "multiple_choice_sentiment_task",
+        ):
+            hf_specs.append(("OALL/AlGhafa-Arabic-LLM-Benchmark-Native", sub, "AlGhafa"))
+        for sub in ACVA_ALL_58_SUBSETS:
+            hf_specs.append(("OALL/ACVA", sub, "ACVA"))
+
+        for repo_id, subset, label in hf_specs:
+            try:
+                if subset:
+                    _ = load_dataset(repo_id, subset)
+                else:
+                    _ = load_dataset(repo_id)
+                if label not in warmed:
+                    warmed.append(label)
+            except Exception as exc:
+                warnings_list.append(f"{label} ({repo_id}/{subset}): {exc}")
+    except Exception as exc:
+        warnings_list.append(f"datasets import failed: {exc}")
+
+    # 2. Inspect Evals (GPQA-Diamond & AIME-2026)
+    try:
+        from inspect_evals.gpqa import gpqa_diamond
+
+        _ = gpqa_diamond(cot=True)
+        warmed.append("GPQA-Diamond")
+    except Exception as exc:
+        warnings_list.append(f"GPQA-Diamond: {exc}")
+
+    try:
+        from inspect_evals.aime2026 import aime2026
+
+        _ = aime2026()
+        warmed.append("AIME-2026")
+    except Exception as exc:
+        warnings_list.append(f"AIME-2026: {exc}")
+
+    # 3. LiveCodeBench-v6 (`lighteval` dataset cache)
+    try:
+        from huggingface_hub import hf_hub_download
+
+        for fname in ("test6.jsonl",):
+            try:
+                hf_hub_download(
+                    repo_id="livecodebench/code_generation_lite",
+                    filename=fname,
+                    repo_type="dataset",
+                )
+            except Exception:
+                pass
+        warmed.append("LiveCodeBench-v6")
+    except Exception as exc:
+        warnings_list.append(f"LiveCodeBench-v6: {exc}")
+
+    summary = {
+        "status": "prewarmed",
+        "warmed_suites": warmed,
+        "warnings_count": len(warnings_list),
+    }
+    if warnings_list:
+        logger.warning("Dataset prewarm encountered %d non-fatal warnings (first: %s)", len(warnings_list), warnings_list[0])
+    logger.info("Prewarmed benchmark datasets: %s", ", ".join(warmed))
+    return summary
+
+
 def _run_single_suite_fallback(
     checkpoint_path: str,
     suite_name: str,
@@ -4104,6 +4688,33 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Model family member to evaluate: e4b, 26b_a4b, or both.",
     )
     parser.add_argument(
+        "--only-role",
+        dest="only_role",
+        type=str,
+        choices=["all", "base", "tuned"],
+        default="all",
+        help=(
+            "Role execution mode: 'all' evaluates both Base and Arabic-Tuned; "
+            "'base' evaluates ONLY Base -> live_raw_{model_key}_base.json; "
+            "'tuned' evaluates ONLY Arabic-Tuned -> live_raw_{model_key}_tuned.json."
+        ),
+    )
+    parser.add_argument(
+        "--combine-role-reports",
+        action="store_true",
+        default=False,
+        help=(
+            "Merge completed live_raw_{model_key}_base.json and live_raw_{model_key}_tuned.json "
+            "into live_raw_{model_key}.json and generate Markdown/JSON reports without GPU inference."
+        ),
+    )
+    parser.add_argument(
+        "--prewarm-datasets",
+        action="store_true",
+        default=False,
+        help="Pre-download and cache all 10 benchmark datasets in one foreground process and exit.",
+    )
+    parser.add_argument(
         "--model-path",
         type=str,
         default=None,
@@ -4197,7 +4808,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _build_child_eval_cmd(args: argparse.Namespace, model_key: str) -> List[str]:
+def _build_child_eval_cmd(
+    args: argparse.Namespace,
+    model_key: str,
+    only_role: str = "all",
+    model_path: Optional[str] = None,
+) -> List[str]:
     """Construct CLI command for an isolated single-GPU child subprocess."""
     cmd = [
         sys.executable,
@@ -4207,6 +4823,10 @@ def _build_child_eval_cmd(args: argparse.Namespace, model_key: str) -> List[str]
         "--model-key",
         model_key,
     ]
+    if only_role != "all":
+        cmd.extend(["--only-role", only_role])
+    if model_path:
+        cmd.extend(["--model-path", str(model_path)])
     if args.eval_base:
         cmd.append("--eval-base")
     if args.use_cached_eval:
@@ -4230,6 +4850,131 @@ def _build_child_eval_cmd(args: argparse.Namespace, model_key: str) -> List[str]
     return cmd
 
 
+def _run_role_parallel_pair_on_dual_gpus(
+    args: argparse.Namespace,
+    cfg: Dict[str, Any],
+    model_key: str,
+    base_model_id: str,
+    tuned_model_path: str,
+) -> Dict[str, Any]:
+    """Run `base` on GPU 0 and `tuned` on GPU 1 simultaneously for one model, then combine checkpoints."""
+    logger.info(
+        "[%s] Launching parallel Base (GPU 0: %s) + Arabic-Tuned (GPU 1: %s) benchmark workers...",
+        model_key,
+        base_model_id,
+        tuned_model_path,
+    )
+    base_env = os.environ.copy()
+    base_env["CUDA_VISIBLE_DEVICES"] = "0"
+    tuned_env = os.environ.copy()
+    tuned_env["CUDA_VISIBLE_DEVICES"] = "1"
+
+    # Allocate isolated ports and Inductor/Triton/vLLM compile caches per GPU slot
+    for slot_env, slot_tag in ((base_env, f"{model_key}_base"), (tuned_env, f"{model_key}_tuned")):
+        vis_gpu = slot_env["CUDA_VISIBLE_DEVICES"]
+        slot_env["MASTER_ADDR"] = "127.0.0.1"
+        slot_env["MASTER_PORT"] = str(_find_free_localhost_port())
+        slot_env["VLLM_PORT"] = str(_find_free_localhost_port())
+        slot_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        slot_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+        slot_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        slot_env.setdefault("HF_ALLOW_CODE_EVAL", "1")
+        cache_base = pathlib.Path(tempfile.gettempdir()) / f"gemma4_eval_compile_gpu{vis_gpu}_{slot_tag}"
+        for env_key, sub in (
+            ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+            ("TRITON_CACHE_DIR", "triton"),
+            ("VLLM_CACHE_ROOT", "vllm"),
+        ):
+            sub_dir = cache_base / sub
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            slot_env[env_key] = str(sub_dir)
+
+    proc_base = subprocess.Popen(
+        _build_child_eval_cmd(args, model_key=model_key, only_role="base", model_path=tuned_model_path),
+        env=base_env,
+        cwd=str(PROJECT_ROOT),
+    )
+    proc_tuned = subprocess.Popen(
+        _build_child_eval_cmd(args, model_key=model_key, only_role="tuned", model_path=tuned_model_path),
+        env=tuned_env,
+        cwd=str(PROJECT_ROOT),
+    )
+    rc_base = proc_base.wait()
+    rc_tuned = proc_tuned.wait()
+    if rc_base != 0 or rc_tuned != 0:
+        raise RuntimeError(
+            f"[{model_key}] Parallel Base/Tuned evaluation failed "
+            f"(rc_base_gpu0={rc_base}, rc_tuned_gpu1={rc_tuned})."
+        )
+
+    return combine_role_checkpoints(
+        model_key=model_key,
+        base_model_id=base_model_id,
+        tuned_model_path=tuned_model_path,
+        cfg=cfg,
+        limit=args.limit,
+        selected_tasks=args.tasks,
+    )
+
+
+def _write_family_outputs(
+    args: argparse.Namespace,
+    eval_cfg: Dict[str, Any],
+    e4b_res: Dict[str, Any],
+    moe_res: Dict[str, Any],
+) -> str:
+    """Render and persist family Markdown + JSON benchmark comparison artifacts."""
+    family_md = generate_family_markdown_report(e4b_res, moe_res)
+    family_payload = {
+        "mode": e4b_res.get("mode", "live_lm_eval"),
+        "models": {
+            "e4b": e4b_res,
+            "26b_a4b": moe_res,
+        },
+        **e4b_res,
+    }
+    if args.output_md or not args.dry_run:
+        md_path = pathlib.Path(
+            args.output_md
+            or eval_cfg.get(
+                "output_report_path",
+                "outputs/eval_reports/benchmark_comparison.md",
+            )
+        )
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(family_md, encoding="utf-8")
+        fam_md_path = PROJECT_ROOT / "outputs" / "eval_reports" / "family_benchmark_comparison.md"
+        fam_md_path.parent.mkdir(parents=True, exist_ok=True)
+        fam_md_path.write_text(family_md, encoding="utf-8")
+        legacy_md_path = PROJECT_ROOT / "outputs" / "eval_reports" / "benchmark_report.md"
+        legacy_md_path.write_text(family_md, encoding="utf-8")
+        for mk, mres in (("e4b", e4b_res), ("26b_a4b", moe_res)):
+            per_md_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"benchmark_comparison_{mk}.md"
+            per_md_path.write_text(generate_markdown_report(mres), encoding="utf-8")
+    if args.output_json or not args.dry_run:
+        json_path = pathlib.Path(
+            args.output_json
+            or eval_cfg.get(
+                "output_json_path",
+                "outputs/eval_reports/benchmark_results.json",
+            )
+        )
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(family_payload, indent=2), encoding="utf-8")
+        fam_json_path = pathlib.Path(
+            eval_cfg.get(
+                "family_comparison_json_path",
+                "outputs/eval_reports/family_benchmark_comparison.json",
+            )
+        )
+        fam_json_path.parent.mkdir(parents=True, exist_ok=True)
+        fam_json_path.write_text(json.dumps(family_payload, indent=2), encoding="utf-8")
+        for mk, mres in (("e4b", e4b_res), ("26b_a4b", moe_res)):
+            per_json_path = PROJECT_ROOT / "outputs" / "eval_reports" / f"benchmark_results_{mk}.json"
+            per_json_path.write_text(json.dumps(mres, indent=2), encoding="utf-8")
+    return family_md
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point for automated benchmark evaluation and report generation."""
     if hasattr(sys.stdout, "reconfigure"):
@@ -4248,54 +4993,238 @@ def main(argv: Optional[List[str]] = None) -> int:
     eval_cfg = cfg.get("evaluation", {})
     models_cfg = cfg.get("models", {})
 
-    if args.model_key == "both":
-        e4b_path = str(
-            models_cfg.get("e4b", {}).get(
-                "merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic/merged_16bit"
+    # Mode 1: Prewarm all 10 benchmark datasets in one foreground process
+    if args.prewarm_datasets:
+        if args.dry_run:
+            summary = {
+                "status": "dry_run_prewarmed",
+                "arabic_suites": list(cfg.get("arabic_benchmarks", {}).keys()),
+                "retention_suites": list(cfg.get("retention_anchors", {}).keys()),
+            }
+        else:
+            summary = prewarm_eval_datasets(cfg)
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    # Mode 2: Single-role isolated GPU worker (--only-role base OR --only-role tuned)
+    if args.only_role in ("base", "tuned"):
+        if args.model_key == "both":
+            raise ValueError(
+                "--only-role base|tuned requires --model-key e4b or --model-key 26b_a4b (not 'both')."
             )
+        model_entry = models_cfg.get(args.model_key, {}) if isinstance(models_cfg, dict) else {}
+        default_tuned_path = model_entry.get(
+            "merged_checkpoint_dir",
+            eval_cfg.get("merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic/merged_16bit"),
+        )
+        tuned_model_path = str(args.model_path or default_tuned_path)
+        base_model_id = str(model_entry.get("base_model_id", tuned_model_path))
+        target_device = str(model_entry.get("device", eval_cfg.get("device", "cuda:0")))
+
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "mode": "dry_run_single_role",
+                        "model_key": args.model_key,
+                        "role": args.only_role,
+                        "target_checkpoint": base_model_id if args.only_role == "base" else tuned_model_path,
+                        "arabic_benchmarks_count": len(cfg.get("arabic_benchmarks", {})),
+                        "retention_anchors_count": len(cfg.get("retention_anchors", {})),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+
+        snap = run_single_role_gpu_eval(
+            model_key=args.model_key,
+            role=args.only_role,
+            base_model_id=base_model_id,
+            tuned_model_path=tuned_model_path,
+            cfg=cfg,
+            target_device=target_device,
+            limit=args.limit,
+            use_cached_eval=args.use_cached_eval,
+            use_vllm=args.use_vllm,
+            apply_chat_template=args.apply_chat_template,
+            selected_tasks=args.tasks,
+        )
+        role_data = snap.get(args.only_role, {})
+        print(
+            json.dumps(
+                {
+                    "mode": "live_single_role",
+                    "model_key": args.model_key,
+                    "role": args.only_role,
+                    "arabic_completed": len(role_data.get("arabic", {})),
+                    "retention_completed": len(role_data.get("retention", {})),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    # Mode 3: Combine completed Base + Tuned role checkpoints into final JSON + Markdown reports
+    if args.combine_role_reports:
+        if args.model_key == "both":
+            e4b_entry = models_cfg.get("e4b", {})
+            moe_entry = models_cfg.get("26b_a4b", {})
+            e4b_path = str(e4b_entry.get("merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic/merged_16bit"))
+            moe_path = str(moe_entry.get("merged_checkpoint_dir", "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit"))
+            e4b_base = str(e4b_entry.get("base_model_id", "unsloth/gemma-4-E4B-it"))
+            moe_base = str(moe_entry.get("base_model_id", "unsloth/gemma-4-26B-A4B-it"))
+            if not args.dry_run:
+                combine_role_checkpoints(
+                    model_key="e4b",
+                    base_model_id=e4b_base,
+                    tuned_model_path=e4b_path,
+                    cfg=cfg,
+                    limit=args.limit,
+                    selected_tasks=args.tasks,
+                )
+                combine_role_checkpoints(
+                    model_key="26b_a4b",
+                    base_model_id=moe_base,
+                    tuned_model_path=moe_path,
+                    cfg=cfg,
+                    limit=args.limit,
+                    selected_tasks=args.tasks,
+                )
+            e4b_res = build_benchmark_results(
+                cfg=cfg,
+                model_path=e4b_path,
+                dry_run=args.dry_run,
+                limit=args.limit,
+                model_key="e4b",
+                eval_base=args.eval_base,
+                use_cached_eval=True,
+                no_reference_fallback=args.no_reference_fallback,
+                use_vllm=args.use_vllm,
+                apply_chat_template=args.apply_chat_template,
+                selected_tasks=args.tasks,
+                load_cache_only=not args.dry_run,
+            )
+            moe_res = build_benchmark_results(
+                cfg=cfg,
+                model_path=moe_path,
+                dry_run=args.dry_run,
+                limit=args.limit,
+                model_key="26b_a4b",
+                eval_base=args.eval_base,
+                use_cached_eval=True,
+                no_reference_fallback=args.no_reference_fallback,
+                use_vllm=args.use_vllm,
+                apply_chat_template=args.apply_chat_template,
+                selected_tasks=args.tasks,
+                load_cache_only=not args.dry_run,
+            )
+            family_md = _write_family_outputs(args, eval_cfg, e4b_res, moe_res)
+            print(family_md)
+            return 0
+
+        model_entry = models_cfg.get(args.model_key, {}) if isinstance(models_cfg, dict) else {}
+        model_path = str(
+            args.model_path
+            or model_entry.get("merged_checkpoint_dir")
+            or eval_cfg.get("merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic/merged_16bit")
+        )
+        base_model_id = str(model_entry.get("base_model_id", model_path))
+        if not args.dry_run:
+            combine_role_checkpoints(
+                model_key=args.model_key,
+                base_model_id=base_model_id,
+                tuned_model_path=model_path,
+                cfg=cfg,
+                limit=args.limit,
+                selected_tasks=args.tasks,
+            )
+        results = build_benchmark_results(
+            cfg=cfg,
+            model_path=model_path,
+            dry_run=args.dry_run,
+            limit=args.limit,
+            model_key=args.model_key,
+            eval_base=args.eval_base,
+            use_cached_eval=True,
+            no_reference_fallback=args.no_reference_fallback,
+            use_vllm=args.use_vllm,
+            apply_chat_template=args.apply_chat_template,
+            selected_tasks=args.tasks,
+            load_cache_only=not args.dry_run,
+        )
+        md_report = generate_markdown_report(results)
+        if args.output_md or not args.dry_run:
+            md_path = pathlib.Path(
+                args.output_md
+                or PROJECT_ROOT / "outputs" / "eval_reports" / f"benchmark_comparison_{args.model_key}.md"
+            )
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(md_report, encoding="utf-8")
+        if args.output_json or not args.dry_run:
+            json_path = pathlib.Path(
+                args.output_json
+                or PROJECT_ROOT / "outputs" / "eval_reports" / f"benchmark_results_{args.model_key}.json"
+            )
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(md_report)
+        print(
+            json.dumps(
+                {
+                    "mode": results["mode"],
+                    "model_key": results["model_key"],
+                    "arabic_benchmarks_count": results["arabic_benchmarks_count"],
+                    "retention_anchors_count": results["retention_anchors_count"],
+                    "average_arabic_gain": results["average_arabic_gain"],
+                    "retention_gate_passed": results["retention_gate"]["gate_passed"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    # Mode 4: Full evaluation (--only-role all)
+    can_parallel_dual_gpu = False
+    if not args.dry_run:
+        try:
+            import torch
+
+            can_parallel_dual_gpu = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+        except Exception:
+            can_parallel_dual_gpu = False
+
+    if args.model_key == "both":
+        e4b_entry = models_cfg.get("e4b", {})
+        moe_entry = models_cfg.get("26b_a4b", {})
+        e4b_path = str(
+            e4b_entry.get("merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic/merged_16bit")
         )
         moe_path = str(
-            models_cfg.get("26b_a4b", {}).get(
-                "merged_checkpoint_dir", "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit"
-            )
+            moe_entry.get("merged_checkpoint_dir", "outputs/merged_gemma4_26b_a4b_arabic/merged_16bit")
         )
-
-        can_parallel_dual_gpu = False
-        if not args.dry_run:
-            try:
-                import torch
-
-                can_parallel_dual_gpu = torch.cuda.is_available() and torch.cuda.device_count() >= 2
-            except Exception:
-                can_parallel_dual_gpu = False
+        e4b_base = str(e4b_entry.get("base_model_id", "unsloth/gemma-4-E4B-it"))
+        moe_base = str(moe_entry.get("base_model_id", "unsloth/gemma-4-26B-A4B-it"))
 
         if can_parallel_dual_gpu:
-            logger.info(
-                "Detected >= 2 GPUs: launching isolated subprocesses for E4B (CUDA_VISIBLE_DEVICES=0) and 26B-A4B (CUDA_VISIBLE_DEVICES=1)..."
-            )
-            env_gpu0 = os.environ.copy()
-            env_gpu0["CUDA_VISIBLE_DEVICES"] = "0"
-            env_gpu1 = os.environ.copy()
-            env_gpu1["CUDA_VISIBLE_DEVICES"] = "1"
+            # Verify both merged checkpoints exist up-front before starting any benchmark
+            for mk_check, mp_check in (("e4b", e4b_path), ("26b_a4b", moe_path)):
+                p_check = pathlib.Path(mp_check)
+                if not (p_check / "config.json").exists() and not (p_check / "adapter_config.json").exists():
+                    raise FileNotFoundError(
+                        f"[{mk_check}] Merged checkpoint missing at '{mp_check}'. "
+                        f"Both E4B and 26B-A4B must finish training and merging before benchmarking starts."
+                    )
+            prewarm_eval_datasets(cfg)
 
-            proc_e4b = subprocess.Popen(
-                _build_child_eval_cmd(args, "e4b"),
-                env=env_gpu0,
-                cwd=str(PROJECT_ROOT),
+            # Step 1: E4B Base on GPU 0 + E4B Tuned on GPU 1 simultaneously
+            _run_role_parallel_pair_on_dual_gpus(
+                args=args,
+                cfg=cfg,
+                model_key="e4b",
+                base_model_id=e4b_base,
+                tuned_model_path=e4b_path,
             )
-            proc_moe = subprocess.Popen(
-                _build_child_eval_cmd(args, "26b_a4b"),
-                env=env_gpu1,
-                cwd=str(PROJECT_ROOT),
-            )
-            rc_e4b = proc_e4b.wait()
-            rc_moe = proc_moe.wait()
-            if rc_e4b != 0 or rc_moe != 0:
-                raise RuntimeError(
-                    f"Parallel Dual-GPU evaluation subprocess failed (rc_e4b={rc_e4b}, rc_26b_a4b={rc_moe})."
-                )
-
-            # Load completed results from outputs/eval_reports/live_raw_e4b.json and live_raw_26b_a4b.json
             e4b_res = build_benchmark_results(
                 cfg=cfg,
                 model_path=e4b_path,
@@ -4309,6 +5238,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 apply_chat_template=args.apply_chat_template,
                 selected_tasks=args.tasks,
                 load_cache_only=True,
+            )
+            (PROJECT_ROOT / "outputs" / "eval_reports").mkdir(parents=True, exist_ok=True)
+            (PROJECT_ROOT / "outputs" / "eval_reports" / "benchmark_comparison_e4b.md").write_text(
+                generate_markdown_report(e4b_res), encoding="utf-8"
+            )
+
+            # Step 2: 26B-A4B Base on GPU 0 + 26B-A4B Tuned on GPU 1 simultaneously
+            _run_role_parallel_pair_on_dual_gpus(
+                args=args,
+                cfg=cfg,
+                model_key="26b_a4b",
+                base_model_id=moe_base,
+                tuned_model_path=moe_path,
             )
             moe_res = build_benchmark_results(
                 cfg=cfg,
@@ -4352,75 +5294,56 @@ def main(argv: Optional[List[str]] = None) -> int:
                 selected_tasks=args.tasks,
             )
 
-        family_md = generate_family_markdown_report(e4b_res, moe_res)
-        family_payload = {
-            "mode": e4b_res.get("mode", "live_lm_eval"),
-            "models": {
-                "e4b": e4b_res,
-                "26b_a4b": moe_res,
-            },
-            **e4b_res,
-        }
-        if args.output_md or not args.dry_run:
-            md_path = pathlib.Path(
-                args.output_md
-                or eval_cfg.get(
-                    "output_report_path",
-                    "outputs/eval_reports/benchmark_comparison.md",
-                )
-            )
-            md_path.parent.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(family_md, encoding="utf-8")
-            fam_md_path = PROJECT_ROOT / "outputs" / "eval_reports" / "family_benchmark_comparison.md"
-            fam_md_path.parent.mkdir(parents=True, exist_ok=True)
-            fam_md_path.write_text(family_md, encoding="utf-8")
-            legacy_md_path = PROJECT_ROOT / "outputs" / "eval_reports" / "benchmark_report.md"
-            legacy_md_path.write_text(family_md, encoding="utf-8")
-        if args.output_json or not args.dry_run:
-            json_path = pathlib.Path(
-                args.output_json
-                or eval_cfg.get(
-                    "output_json_path",
-                    "outputs/eval_reports/benchmark_results.json",
-                )
-            )
-            json_path.parent.mkdir(parents=True, exist_ok=True)
-            json_path.write_text(json.dumps(family_payload, indent=2), encoding="utf-8")
-            fam_json_path = pathlib.Path(
-                eval_cfg.get(
-                    "family_comparison_json_path",
-                    "outputs/eval_reports/family_benchmark_comparison.json",
-                )
-            )
-            fam_json_path.parent.mkdir(parents=True, exist_ok=True)
-            fam_json_path.write_text(json.dumps(family_payload, indent=2), encoding="utf-8")
+        family_md = _write_family_outputs(args, eval_cfg, e4b_res, moe_res)
         print(family_md)
         return 0
 
-    default_path = (
-        models_cfg.get(args.model_key, {}).get("merged_checkpoint_dir")
-        if isinstance(models_cfg, dict) and args.model_key in models_cfg
-        else None
-    )
+    model_entry = models_cfg.get(args.model_key, {}) if isinstance(models_cfg, dict) else {}
+    default_path = model_entry.get("merged_checkpoint_dir")
     model_path = str(
         args.model_path
         or default_path
-        or eval_cfg.get("merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic")
+        or eval_cfg.get("merged_checkpoint_dir", "outputs/merged_gemma4_e4b_arabic/merged_16bit")
     )
+    base_model_id = str(model_entry.get("base_model_id", model_path))
 
-    results = build_benchmark_results(
-        cfg=cfg,
-        model_path=model_path,
-        dry_run=args.dry_run,
-        limit=args.limit,
-        model_key=args.model_key,
-        eval_base=args.eval_base,
-        use_cached_eval=args.use_cached_eval,
-        no_reference_fallback=args.no_reference_fallback,
-        use_vllm=args.use_vllm,
-        apply_chat_template=args.apply_chat_template,
-        selected_tasks=args.tasks,
-    )
+    if can_parallel_dual_gpu:
+        prewarm_eval_datasets(cfg)
+        _run_role_parallel_pair_on_dual_gpus(
+            args=args,
+            cfg=cfg,
+            model_key=args.model_key,
+            base_model_id=base_model_id,
+            tuned_model_path=model_path,
+        )
+        results = build_benchmark_results(
+            cfg=cfg,
+            model_path=model_path,
+            dry_run=False,
+            limit=args.limit,
+            model_key=args.model_key,
+            eval_base=args.eval_base,
+            use_cached_eval=True,
+            no_reference_fallback=args.no_reference_fallback,
+            use_vllm=args.use_vllm,
+            apply_chat_template=args.apply_chat_template,
+            selected_tasks=args.tasks,
+            load_cache_only=True,
+        )
+    else:
+        results = build_benchmark_results(
+            cfg=cfg,
+            model_path=model_path,
+            dry_run=args.dry_run,
+            limit=args.limit,
+            model_key=args.model_key,
+            eval_base=args.eval_base,
+            use_cached_eval=args.use_cached_eval,
+            no_reference_fallback=args.no_reference_fallback,
+            use_vllm=args.use_vllm,
+            apply_chat_template=args.apply_chat_template,
+            selected_tasks=args.tasks,
+        )
     md_report = generate_markdown_report(results)
 
     if args.output_md or not args.dry_run:

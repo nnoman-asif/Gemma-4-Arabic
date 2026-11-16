@@ -1,8 +1,8 @@
-# Stage 2 Trust-Region Direct Preference Optimization (TR-DPO) Configuration
-# Aligns Gemma-4-Arabic on Saudi dialect and Arabic preference pairs within an 8.0 GB VRAM budget.
+# Stage 2 Direct Preference Optimization (DPO) Configuration (8.0 GB Single-GPU Tier)
+# Aligns Gemma-4-E4B-Arabic on Saudi dialect, MSA, and English UltraFeedback preference pairs within an 8.0 GB VRAM budget.
 
 model:
-  base_model_id: "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit"
+  base_model_id: "unsloth/gemma-4-E4B-it"
   sft_adapter_dir: "outputs/sft_stage1"
   max_seq_length: 1536
   dtype: "bfloat16"
@@ -25,9 +25,9 @@ vram_optimization:
   precompute_ref_log_probs: false
 
 lora:
-  use_rslora: true
+  use_rslora: false
   r: 32
-  lora_alpha: 64
+  lora_alpha: 32
   lora_dropout: 0.0
   bias: "none"
   use_gradient_checkpointing: "unsloth"
@@ -44,7 +44,7 @@ lora:
 dpo:
   beta: 0.1
   tr_alpha: 0.6
-  tr_update_steps: 50
+  tr_update_steps: 0
   loss_type: "sigmoid"
   max_length: 1536
   max_prompt_length: 768
@@ -57,12 +57,12 @@ training:
   per_device_eval_batch_size: 1
   gradient_accumulation_steps: 8
   optim: "paged_adamw_8bit"
-  learning_rate: 5.0e-7
+  learning_rate: 5.0e-6
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.10
   weight_decay: 0.01
   max_grad_norm: 1.0
-  num_train_epochs: 1
+  num_train_epochs: 1.0
   bf16: true
   tf32: true
   fp16: false
@@ -70,22 +70,23 @@ training:
   dataloader_num_workers: 0
   logging_steps: 10
   save_strategy: "steps"
-  save_steps: 200
-  save_total_limit: 3
-  eval_strategy: "steps"
+  save_steps: 100
+  save_total_limit: 2
+  eval_strategy: "no"
   eval_steps: 200
   seed: 3407
 
 datasets:
   total_target_pairs: 20000
   output_dataset_dir: "data/dpo_mixed"
+  hf_hub_dataset_repo: "noman-asif/Arabic-Preference-DPO-20k"
 
   preference_sources:
     arabic_dialect_dpo_saudi:
       repo_id: "HeshamHaroon/arabic-dialect-dpo"
       config_name: "saudi"
       split: "train"
-      weight: 0.35
+      weight: 0.20
       enable_thinking: false
       requires_explicit_config: true
 
@@ -96,3 +97,10 @@ datasets:
       weight: 0.65
       enable_thinking: false
       unify_prompt_from_chosen: true
+
+    ultrafeedback_english_dpo:
+      repo_id: "argilla/ultrafeedback-binarized-preferences-cleaned"
+      config_name: "default"
+      split: "train"
+      weight: 0.15
+      enable_thinking: false

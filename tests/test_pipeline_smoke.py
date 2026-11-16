@@ -7,8 +7,8 @@ Verifies:
 3. Strict 75% Arabic / 25% Replay stratified buffer allocation and mixing.
 4. Dynamic `named_modules()` discovery, CPU forward hook for `embed_tokens_per_layer`,
    and CPU offload/restoration for `audio_tower` and `vision_tower`.
-5. Stage 2 Trust-Region DPO reference EMA math (`tr_alpha=0.6`).
-6. TIES-Merging (`lambda=0.85`, `density=0.70`) sign election, trimming, and state dict interpolation.
+5. Stage 2 Conversational DPO (`ref_model=None` / optional Trust-Region EMA `tr_alpha=0.6`).
+6. Lossless 16-Bit Merging (`lambda=1.0`, `density=1.0`) and optional TIES sign election/trimming math.
 7. Zero-forgetting retention gate evaluation and YAML configuration integrity.
 """
 
@@ -32,6 +32,7 @@ from scripts.benchmark_latency_and_plots import (
     generate_all_family_plots,
 )
 from scripts.benchmark_vllm_concurrency import (
+    _compute_active_kv_and_runtime_gb,
     build_reference_vllm_concurrency_profile,
     generate_vllm_concurrency_plot,
     render_vllm_markdown_report,
@@ -41,6 +42,7 @@ from scripts.run_benchmarks import (
     ARABIC_MMLU_40_SUBSETS,
     _atomic_write_json,
     _build_child_eval_cmd,
+    _build_isolated_gpu_env,
     _configure_lm_eval_thinking_for_task,
     _ensure_gemma4_tied_lm_head,
     _extract_arc_mcq_letter,
@@ -59,11 +61,14 @@ from scripts.run_benchmarks import (
     _truncate_math_continuation,
     build_custom_lm_eval_task_dict,
     clean_gemma4_completion,
+    combine_role_checkpoints,
     compute_effective_task_limit,
     evaluate_retention_gate,
     extract_lm_eval_detailed_metrics,
     generate_family_markdown_report,
     generate_markdown_report,
+    normalize_inspect_completion_for_scoring,
+    normalize_lcb_code_completion,
     parse_args as parse_bench_args,
     parse_lighteval_results_json,
     parse_lm_eval_results_json,
@@ -71,34 +76,48 @@ from scripts.run_benchmarks import (
     resolve_lm_eval_task_specs,
 )
 from src.chat_template import (
+    build_tokenized_sft_Turn_masks,
     format_gemma4_chat,
     format_thinking_response,
     verify_thinking_block_preserved,
 )
 from src.constants import (
     ALL_9_DATASET_REPOS,
+    ALL_DATASET_REPOS,
     ARABIC_DIALECT_DPO_REPO,
+    CHANNEL_END_TOKEN,
+    CHANNEL_THOUGHT_PREFIX,
     DEFAULT_TIES_DENSITY,
     DEFAULT_TIES_LAMBDA,
     DPO_TRUST_REGION_ALPHA,
     EMPTY_THINKING_BLOCK,
     LORA_ALPHA,
+    LORA_ALPHA_26B,
     LORA_RANK,
+    LORA_RANK_26B,
     LORA_TARGET_MODULES,
     PRIMARY_MODEL_ID_26B,
-    THINK_TOKEN,
+    TURN_END_TOKEN,
+    TURN_START_TOKEN,
 )
 from src.data_normalizer import (
+    BenchmarkDecontaminator,
     drop_pil_image_columns,
     normalize_acegpt_v2_row,
+    normalize_alpaca_gpt4_arabic_row,
     normalize_arabic_math_row,
+    normalize_arabic_math_synth_row,
     normalize_aya_arabic_row,
+    normalize_aya_dataset_arabic_row,
+    normalize_medical_reasoning_arabic_row,
     normalize_saudi_laws_row,
+    normalize_smolkalam_row,
     normalize_voho_saudi_row,
 )
 from src.dpo_formatter import (
     normalize_arabic_dialect_dpo_row,
     normalize_arcee_arabic_dpo_row,
+    normalize_ultrafeedback_dpo_row,
     validate_dpo_load_config,
 )
 from src.merge_and_export import (
@@ -108,17 +127,29 @@ from src.merge_and_export import (
     ties_trim_tensor,
 )
 from src.model_loader import (
+    atomic_write_json,
     build_8gb_device_map,
     ensure_tied_lm_head,
+    find_latest_valid_checkpoint,
     freeze_embeddings_and_towers,
+    is_adapter_stage_complete,
 )
 from src.replay_mixer import (
     compute_mix_allocation,
     mix_arabic_and_replay_samples,
+    normalize_codefeedback_row,
+    normalize_codeforces_cot_row,
+    normalize_opencode_reasoning_row,
     normalize_openmath_instruct_row,
+    normalize_openscience_reasoning_row,
     normalize_ultrachat_row,
 )
-from src.train_dpo import update_trust_region_reference_params
+from src.train_dpo import (
+    align_26b_chat_template_for_dpo,
+    install_dpo_default_adapter_resume_hook,
+    update_trust_region_reference_params,
+    verify_dpo_prefix_alignment,
+)
 from src.vram_hooks import (
     apply_8gb_vram_optimizations,
     get_vram_telemetry,
@@ -130,11 +161,16 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
     """Comprehensive unit and smoke test suite for the Gemma-4-Arabic repository."""
 
     def test_01_constants_and_yaml_configs(self) -> None:
-        """Verify all 9 dataset repos and YAML config invariants."""
-        self.assertEqual(len(ALL_9_DATASET_REPOS), 9)
+        """Verify all V2 dataset repos, LoRA ranks, and YAML config invariants."""
+        self.assertGreaterEqual(len(ALL_DATASET_REPOS), 15)
+        self.assertGreaterEqual(len(ALL_9_DATASET_REPOS), 9)
         self.assertEqual(LORA_RANK, 32)
-        self.assertEqual(LORA_ALPHA, 64)
+        self.assertEqual(LORA_ALPHA, 32)
+        self.assertEqual(LORA_RANK_26B, 16)
+        self.assertEqual(LORA_ALPHA_26B, 16)
         self.assertEqual(len(LORA_TARGET_MODULES), 7)
+        self.assertEqual(DEFAULT_TIES_LAMBDA, 1.0)
+        self.assertEqual(DEFAULT_TIES_DENSITY, 1.0)
 
         sft_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "sft_config.yaml").read_text(encoding="utf-8")
@@ -142,71 +178,96 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         dpo_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "dpo_config.yaml").read_text(encoding="utf-8")
         )
+        dpo_e4b_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "dpo_e4b_a100.yaml").read_text(encoding="utf-8")
+        )
+        dpo_26b_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "dpo_26b_a4b_a100.yaml").read_text(encoding="utf-8")
+        )
         eval_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
         )
 
-        self.assertTrue(sft_cfg["lora"]["use_rslora"])
+        self.assertFalse(sft_cfg["lora"]["use_rslora"])
         self.assertEqual(sft_cfg["lora"]["r"], 32)
-        self.assertEqual(sft_cfg["lora"]["lora_alpha"], 64)
+        self.assertEqual(sft_cfg["lora"]["lora_alpha"], 32)
         self.assertEqual(sft_cfg["datasets"]["arabic_mix_ratio"], 0.75)
         self.assertEqual(sft_cfg["datasets"]["replay_mix_ratio"], 0.25)
 
         self.assertEqual(dpo_cfg["dpo"]["beta"], 0.1)
-        self.assertEqual(dpo_cfg["dpo"]["tr_alpha"], 0.6)
-        self.assertEqual(dpo_cfg["training"]["learning_rate"], 5.0e-7)
+        self.assertEqual(dpo_cfg["training"]["learning_rate"], 5.0e-6)
         self.assertEqual(dpo_cfg["dpo"]["max_length"], 1536)
+        self.assertEqual(dpo_e4b_cfg["dpo"]["max_length"], 3072)
+        self.assertEqual(dpo_26b_cfg["dpo"]["max_length"], 3072)
 
         self.assertEqual(len(eval_cfg["arabic_benchmarks"]), 6)
         self.assertNotIn("MGSM-Ar", eval_cfg["arabic_benchmarks"])
         self.assertEqual(len(eval_cfg["retention_anchors"]), 4)
 
     def test_02_gemma4_chat_template_thinking_tokens(self) -> None:
-        """Verify Gemma 4 chat template preserves thinking-block tokens in both modes."""
+        """Verify native Gemma 4 chat template tokens (<|turn>, <|channel>thought, <channel|>)."""
         msgs_direct = [
-            {"role": "user", "content": "ما هي عاصمة المملكة العربية السعودية؟"},
-            {"role": "assistant", "content": "الرياض هي العاصمة."},
+            {"role": "user", "content": "ما هي عاصمة المملكة العربية السعودية؟", "reasoning_content": ""},
+            {"role": "assistant", "content": "الرياض هي العاصمة.", "reasoning_content": ""},
         ]
-        rendered_false = format_gemma4_chat(msgs_direct, enable_thinking=False)
-        self.assertIn(EMPTY_THINKING_BLOCK, rendered_false)
-        self.assertTrue(verify_thinking_block_preserved(rendered_false, enable_thinking=False))
+        rendered_false_e4b = format_gemma4_chat(msgs_direct, enable_thinking=False)
+        self.assertIn(TURN_START_TOKEN, rendered_false_e4b)
+        self.assertIn(TURN_END_TOKEN, rendered_false_e4b)
+        self.assertNotIn("<start_of_turn>", rendered_false_e4b)
+        self.assertNotIn("<end_of_turn>", rendered_false_e4b)
+        self.assertNotIn(EMPTY_THINKING_BLOCK, rendered_false_e4b)
+        self.assertTrue(verify_thinking_block_preserved(rendered_false_e4b, enable_thinking=False))
+
+        rendered_false_26b = format_gemma4_chat(
+            msgs_direct,
+            enable_thinking=False,
+            is_26b_moe=True,
+            align_26b_empty_thought=True,
+        )
+        self.assertIn(EMPTY_THINKING_BLOCK, rendered_false_26b)
 
         msgs_thinking = [
-            {"role": "user", "content": "احسب 9 * 7"},
+            {"role": "user", "content": "احسب 9 * 7", "reasoning_content": ""},
             {
                 "role": "assistant",
                 "content": format_thinking_response("9 ضرب 7 يساوي 63", "الناتج هو 63."),
             },
         ]
         rendered_true = format_gemma4_chat(msgs_thinking, enable_thinking=True)
-        self.assertGreaterEqual(rendered_true.count(THINK_TOKEN), 2)
+        self.assertIn(CHANNEL_THOUGHT_PREFIX, rendered_true)
+        self.assertIn(CHANNEL_END_TOKEN, rendered_true)
+        self.assertNotIn("<think>", rendered_true)
+        self.assertNotIn("</think>", rendered_true)
         self.assertTrue(verify_thinking_block_preserved(rendered_true, enable_thinking=True))
 
-    def test_03_all_5_arabic_sft_normalizers(self) -> None:
-        """Verify schema normalizers for all 5 Stage 1 Arabic SFT datasets."""
+    def test_03_all_arabic_sft_normalizers_and_decontaminator(self) -> None:
+        """Verify schema normalizers for all 9 Stage 1 Arabic SFT datasets and 13-gram decontamination."""
         # 1. VohoAI/voho-saudi-dialogues (messages_json + speaker prefix stripping)
         voho = normalize_voho_saudi_row(
             {
                 "messages_json": json.dumps(
                     [
-                        {"role": "user", "content": "User: وشلون أطلع بدل فاقد للهوية؟"},
-                        {"role": "assistant", "content": "المساعد: عن طريق منصة أبشر ثم خدماتي."},
+                        {"role": "user", "content": "User: وشلون أطلع بدل فاقد للهوية الوطنية عبر منصة أبشر؟"},
+                        {"role": "assistant", "content": "المساعد: ادخل على منصة أبشر ثم اختر خدماتي فالأحوال المدنية ثم الإبلاغ عن الوثائق المفقودة وحجز موعد."},
                     ]
                 )
             }
         )
         self.assertIsNotNone(voho)
         assert voho is not None
-        self.assertFalse(voho["messages"][1]["content"].startswith("User:"))
-        self.assertFalse(voho["messages"][2]["content"].startswith("المساعد:"))
-        self.assertIn(EMPTY_THINKING_BLOCK, voho["text"])
+        user_turns = [m for m in voho["messages"] if m["role"] == "user"]
+        asst_turns = [m for m in voho["messages"] if m["role"] == "assistant"]
+        self.assertFalse(user_turns[0]["content"].startswith("User:"))
+        self.assertFalse(asst_turns[0]["content"].startswith("المساعد:"))
+        self.assertIn(TURN_START_TOKEN, voho["text"])
+        self.assertNotIn("<start_of_turn>", voho["text"])
 
         # 2. SaudiArabicLaws ("moj" flat and "boe" nested)
         moj = normalize_saudi_laws_row(
             {
-                "doc_title": "نظام العمل",
+                "doc_title": "نظام العمل السعودي",
                 "article_title": "المادة الأولى",
-                "text": "يسمى هذا النظام نظام العمل.",
+                "text": "يسمى هذا النظام نظام العمل ويهدف إلى تنظيم العلاقة التعاقدية بين صاحب العمل والعامل في المملكة.",
             },
             config_name="moj",
         )
@@ -214,7 +275,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             {
                 "law": {"title_ar": "نظام المعاملات المدنية"},
                 "article": {"article_title_norm": "المادة الخامسة", "text": ""},
-                "retrieval": {"contextual_text": "تطبق أحكام هذا النظام على جميع المسائل."},
+                "retrieval": {"contextual_text": "تطبق أحكام هذا النظام على جميع المسائل التي تناولتها نصوصه في لفظها أو في فحواها."},
             },
             config_name="boe",
         )
@@ -229,15 +290,16 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         ace = normalize_acegpt_v2_row(
             {
                 "conversations": [
-                    {"from": "human", "value": "عرف البلاغة في اللغة العربية."},
-                    {"from": "gpt", "value": "البلاغة هي مطابقة الكلام لمقتضى الحال."},
+                    {"from": "human", "value": "عرف علم البلاغة في اللغة العربية واذكر أقسامه الثلاثة الرئيسية."},
+                    {"from": "gpt", "value": "البلاغة هي مطابقة الكلام لمقتضى الحال مع فصاحته، وتنقسم إلى ثلاثة علوم رئيسية هي علم المعاني وعلم البيان وعلم البديع."},
                 ]
             }
         )
         self.assertIsNotNone(ace)
         assert ace is not None
-        self.assertEqual(ace["messages"][1]["role"], "user")
-        self.assertEqual(ace["messages"][2]["role"], "assistant")
+        roles_ace = [m["role"] for m in ace["messages"]]
+        self.assertIn("user", roles_ace)
+        self.assertIn("assistant", roles_ace)
 
         # 4. Omartificial-Intelligence-Space/Arabic-Math-SFT (.remove_columns(["image"]) + thinking)
         class _DummyMathDataset:
@@ -256,20 +318,21 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         math_item = normalize_arabic_math_row(
             {
                 "image": "PIL_IMAGE_PLACEHOLDER",
-                "problem": "حل المعادلة 2س + 4 = 10",
-                "solution": "نطرح 4 من الطرفين: 2س = 6\nنقسم على 2: س = 3",
+                "problem": "حل المعادلة الخطية التالية بالتفصيل: 2س + 4 = 10",
+                "solution": "الخطوة الأولى: نطرح 4 من الطرفين فنحصل على 2س = 6.\nالخطوة الثانية: نقسم الطرفين على 2.\nإذن قيمة س النهائية هي 3.",
             }
         )
         self.assertIsNotNone(math_item)
         assert math_item is not None
         self.assertTrue(math_item["enable_thinking"])
-        self.assertGreaterEqual(math_item["text"].count(THINK_TOKEN), 2)
+        self.assertIn(CHANNEL_THOUGHT_PREFIX, math_item["text"])
+        self.assertIn(CHANNEL_END_TOKEN, math_item["text"])
 
         # 5. CohereForAI/aya_collection_language_split (inputs/targets + JSON tool-calling)
         aya = normalize_aya_arabic_row(
             {
-                "inputs": "تحقق من رصيد الإجازات للموظف رقم 102",
-                "targets": "رصيد الإجازات المتبقي هو 21 يوما.",
+                "inputs": "تحقق من رصيد الإجازات السنوية المتبقي للموظف رقم 102 في النظام",
+                "targets": "رصيد الإجازات السنوية المتبقي للموظف رقم 102 هو 21 يوماً عمل.",
                 "tools": [{"name": "get_leave_balance"}],
                 "tool_call": {"name": "get_leave_balance", "arguments": {"emp_id": 102}},
             }
@@ -278,14 +341,79 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         assert aya is not None
         self.assertIn("get_leave_balance", aya["text"])
 
+        # 6-9. New V2 Arabic normalizers (Gheras Medical CoT, Smolkalam OpenThoughts3, Alpaca-GPT4-Arabic, Aya Arabic)
+        med = normalize_medical_reasoning_arabic_row(
+            {
+                "Question": "مريض يعاني من عطش شديد وكثرة التبول وارتفاع سكر الدم الصائم إلى 190 ملغ/ديسيلتر، ما التشخيص المرجح؟",
+                "Complex_CoT": "نلاحظ وجود الأعراض الكلاسيكية لفرط سكر الدم مع تجاوز مستوى الجلوكوز الصائم لعتبة 126 ملغ/ديسيلتر عند الفحص السريري.",
+                "Response": "التشخيص المرجح هو داء السكري من النوع الثاني، ويلزم تأكيده بفحص السكر التراكمي HbA1c.",
+            }
+        )
+        self.assertIsNotNone(med)
+        assert med is not None
+        self.assertTrue(med["enable_thinking"])
+        self.assertTrue(med["messages"][-1]["reasoning_content"].startswith("نلاحظ"))
+
+        smol = normalize_smolkalam_row(
+            {
+                "LR": 0.98,
+                "SCR": 0.99,
+                "messages": [
+                    {"role": "user", "content": "احسب مساحة مستطيل طوله 12 سم وعرضه 5 سم بالتفصيل."},
+                    {"role": "assistant", "content": "<think>\nلحساب مساحة المستطيل نضرب الطول في العرض مباشرة: المساحة تساوي 12 ضرب 5 أي 60 سنتيمتراً مربعاً.\n</think>\nمساحة المستطيل تساوي 60 سنتيمتراً مربعاً."},
+                ],
+            },
+            source_key="smolkalam_arabic_reasoning_cot",
+            require_thinking=True,
+        )
+        self.assertIsNotNone(smol)
+        assert smol is not None
+        self.assertTrue(smol["enable_thinking"])
+        self.assertNotIn("<think>", smol["messages"][-1]["content"])
+        self.assertIn("60", smol["messages"][-1]["reasoning_content"])
+
+        synth_math = normalize_arabic_math_synth_row(
+            {
+                "instruction": "أوجد قيمة س إذا كان 3س + 9 = 24.",
+                "reasoning": "نطرح 9 من الطرفين فنحصل على 3س = 15 ثم نقسم على 3 فنحصل على س = 5.",
+                "answer": "قيمة س النهائية تساوي 5.",
+            }
+        )
+        self.assertIsNotNone(synth_math)
+
+        alpaca_ar = normalize_alpaca_gpt4_arabic_row(
+            {
+                "conversations": [
+                    {"from": "human", "value": "اشرح الفرق الجوهري بين التشفير المتماثل والتشفير غير المتماثل في أمن المعلومات."},
+                    {"from": "gpt", "value": "يعتمد التشفير المتماثل على مفتاح سري واحد للتشفير وفك التشفير، بينما يستخدم التشفير غير المتماثل زوجاً من المفاتيح هما المفتاح العام والمفتاح الخاص."},
+                ]
+            }
+        )
+        self.assertIsNotNone(alpaca_ar)
+
+        aya_human = normalize_aya_dataset_arabic_row(
+            {
+                "language_code": "ars",
+                "inputs": "وش أهم الفعاليات التراثية في مهرجان الجنادرية بالمملكة العربية السعودية؟",
+                "targets": "يضم مهرجان الجنادرية العرضة السعودية، وأجنحة المناطق التراثية، والحرف اليدوية التقليدية، والأمسيات الشعرية.",
+            }
+        )
+        self.assertIsNotNone(aya_human)
+
+        # 13-gram Benchmark Decontaminator verification
+        decontam = BenchmarkDecontaminator()
+        eval_text = "في القانون التجاري السعودي ما هي الشروط النظامية الواجب توافرها لتأسيس شركة مساهمة مبسطة وفق النظام الجديد"
+        decontam.add_benchmark_text(eval_text)
+        self.assertTrue(decontam.is_contaminated(eval_text))
+        self.assertFalse(decontam.is_contaminated("كيف أحسب زكاة عروض التجارة في نهاية الحول؟"))
+
     def test_04_replay_normalizers_and_75_25_mixer(self) -> None:
-        """Verify Replay Buffer normalizers (Datasets 6 & 7) and strict 75/25 mixing."""
-        # 6. HuggingFaceH4/ultrachat_200k
+        """Verify all 6 Replay Buffer normalizers and strict 75/25 mixing."""
         ultra = normalize_ultrachat_row(
             {
                 "messages": [
-                    {"role": "user", "content": "Explain binary search."},
-                    {"role": "assistant", "content": "Binary search halves the search interval each step."},
+                    {"role": "user", "content": "Explain binary search and its worst-case time complexity."},
+                    {"role": "assistant", "content": "Binary search repeatedly halves a sorted search interval, achieving O(log n) worst-case time complexity."},
                 ]
             }
         )
@@ -293,31 +421,73 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         assert ultra is not None
         self.assertFalse(ultra["enable_thinking"])
 
-        # 7. nvidia/OpenMathInstruct-2
+        # OpenMathInstruct-2 must preserve BOTH reasoning_content AND \boxed{expected_answer} in content
         openmath = normalize_openmath_instruct_row(
             {
-                "problem": "Evaluate 7! / 5!.",
-                "generated_solution": "7! / 5! = 7 * 6 = 42.",
+                "problem": "Evaluate 7! / 5! step by step.",
+                "generated_solution": "We expand 7! / 5! = (7 * 6 * 5!) / 5! = 7 * 6 = 42.",
                 "expected_answer": "42",
             }
         )
         self.assertIsNotNone(openmath)
         assert openmath is not None
         self.assertTrue(openmath["enable_thinking"])
+        self.assertIn("7 * 6 = 42", openmath["messages"][-1]["reasoning_content"])
+        self.assertIn("\\boxed{42}", openmath["messages"][-1]["content"])
+
+        ocr = normalize_opencode_reasoning_row(
+            {
+                "input": "Write a Python function `is_prime(n: int) -> bool` that checks primality in O(sqrt(n)).",
+                "output": "<think>\nCheck n < 2 first, then test divisors up to isqrt(n).\n</think>\n```python\nimport math\ndef is_prime(n: int) -> bool:\n    if n < 2:\n        return False\n    return all(n % d != 0 for d in range(2, math.isqrt(n) + 1))\n```",
+            }
+        )
+        self.assertIsNotNone(ocr)
+        assert ocr is not None
+        self.assertTrue(ocr["enable_thinking"])
+        self.assertNotIn("<think>", ocr["messages"][-1]["content"])
+
+        cf = normalize_codeforces_cot_row(
+            {
+                "finish_reason": "stop",
+                "messages": [
+                    {"role": "user", "content": "Given an array of n integers, output their sum in Python."},
+                    {"role": "assistant", "content": "<think>\nRead n and sum the array using Python's built-in sum function.\n</think>\n```python\nimport sys\ndata = sys.stdin.read().split()\nprint(sum(map(int, data[1:])))\n```"},
+                ],
+            }
+        )
+        self.assertIsNotNone(cf)
+
+        cfb = normalize_codefeedback_row(
+            {
+                "query": "Implement iterative factorial in Python for non-negative integers.",
+                "answer": "Here is an iterative Python implementation:\n```python\ndef factorial(n: int) -> int:\n    res = 1\n    for i in range(2, n + 1):\n        res *= i\n    return res\n```",
+            }
+        )
+        self.assertIsNotNone(cfb)
+
+        sci = normalize_openscience_reasoning_row(
+            {
+                "input": "What is the spin quantum number of an electron and how many spin states exist?",
+                "output": "<think>\nAn electron is a spin-1/2 fermion with m_s = +1/2 or -1/2.\n</think>\nAn electron has spin quantum number s = 1/2, giving 2s + 1 = 2 spin states (+1/2 and -1/2).",
+            }
+        )
+        self.assertIsNotNone(sci)
+        assert sci is not None
+        self.assertTrue(sci["enable_thinking"])
 
         alloc = compute_mix_allocation(total_samples=200)
         self.assertEqual(alloc["arabic_total"], 150)
         self.assertEqual(alloc["replay_total"], 50)
 
         ar_pool = [{"source": "voho_saudi_dialogues", "text": f"ar_{i}"} for i in range(12)]
-        rep_pool = [ultra, openmath, ultra, openmath]
+        rep_pool = [ultra, openmath, ocr, sci]
         mixed, stats = mix_arabic_and_replay_samples(ar_pool, rep_pool)
+        self.assertEqual(len(mixed), 16)
         self.assertAlmostEqual(stats["arabic_fraction"], 0.75, places=6)
         self.assertAlmostEqual(stats["replay_fraction"], 0.25, places=6)
 
     def test_05_dpo_normalizers_and_prompt_unification(self) -> None:
-        """Verify Stage 2 DPO normalizers (Datasets 8 & 9) and prompt unification."""
-        # 8. HeshamHaroon/arabic-dialect-dpo (must require name="saudi")
+        """Verify all 3 Stage 2 conversational DPO normalizers and prompt hygiene."""
         self.assertEqual(validate_dpo_load_config(ARABIC_DIALECT_DPO_REPO, "saudi"), "saudi")
         with self.assertRaises(ValueError):
             validate_dpo_load_config(ARABIC_DIALECT_DPO_REPO, "default")
@@ -326,23 +496,27 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
 
         saudi_dpo = normalize_arabic_dialect_dpo_row(
             {
-                "prompt": "كيف أقدم على وظيفة في جدارات؟",
-                "chosen": "سجل الدخول عبر النفاذ الوطني في منصة جدارات وأكمل ملفك المهني ثم قدم على الوظائف المتاحة.",
-                "rejected": "لا أعرف.",
+                "prompt": "كيف أقدم على وظيفة حكومية أو في القطاع الخاص عبر منصة جدارات؟",
+                "chosen": "سجل الدخول عبر النفاذ الوطني الموحد في منصة جدارات، ثم أكمل ملفك المهني وارفع المؤهلات، وبعدها استعرض الوظائف المتاحة وقدم عليها مباشرة.",
+                "rejected": "ادخل على الموقع القديم لوزارة الخدمة المدنية وأرسل أوراقك بالبريد العادي وانتظر الرد.",
             }
         )
         self.assertIsNotNone(saudi_dpo)
+        assert saudi_dpo is not None
+        self.assertIsInstance(saudi_dpo["prompt"], str)
+        self.assertIsInstance(saudi_dpo["prompt_messages"], list)
+        self.assertIsInstance(saudi_dpo["chosen_only_messages"], list)
+        self.assertIsInstance(saudi_dpo["rejected_only_messages"], list)
 
-        # 9. arcee-globe/arabic-orpo-dpo-mix-40k-filtered (prompt unification)
         arcee_dpo = normalize_arcee_arabic_dpo_row(
             {
                 "chosen": [
-                    {"role": "user", "content": "الصياغة المعتمدة للسؤال باللغة العربية"},
-                    {"role": "assistant", "content": "إجابة نموذجية مفصلة وصحيحة."},
+                    {"role": "user", "content": "الصياغة المعتمدة للسؤال باللغة العربية حول أهمية الأمن السيبراني"},
+                    {"role": "assistant", "content": "يحمي الأمن السيبراني البنية التحتية الرقمية والبيانات الحساسة من الهجمات الإلكترونية والاختراقات."},
                 ],
                 "rejected": [
                     {"role": "user", "content": "صياغة مختلفة تماما يجب استبدالها"},
-                    {"role": "assistant", "content": "إجابة ضعيفة."},
+                    {"role": "assistant", "content": "الأمن السيبراني مجرد برنامج لتسريع شاشة الحاسوب فقط لا غير."},
                 ],
             }
         )
@@ -350,12 +524,29 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         assert arcee_dpo is not None
         self.assertEqual(
             arcee_dpo["chosen_messages"][0]["content"],
-            "الصياغة المعتمدة للسؤال باللغة العربية",
+            "الصياغة المعتمدة للسؤال باللغة العربية حول أهمية الأمن السيبراني",
         )
         self.assertEqual(
             arcee_dpo["rejected_messages"][0]["content"],
-            "الصياغة المعتمدة للسؤال باللغة العربية",
+            "الصياغة المعتمدة للسؤال باللغة العربية حول أهمية الأمن السيبراني",
         )
+
+        uf_dpo = normalize_ultrafeedback_dpo_row(
+            {
+                "prompt": "Explain why hash tables achieve O(1) average lookup time.",
+                "chosen": [
+                    {"role": "user", "content": "Explain why hash tables achieve O(1) average lookup time."},
+                    {"role": "assistant", "content": "A hash function maps keys uniformly across buckets, keeping the average chain length constant when the load factor is bounded."},
+                ],
+                "rejected": [
+                    {"role": "user", "content": "Explain why hash tables achieve O(1) average lookup time."},
+                    {"role": "assistant", "content": "Hash tables sort every key alphabetically before scanning them one by one."},
+                ],
+                "chosen_rating": 5.0,
+                "rejected_rating": 2.0,
+            }
+        )
+        self.assertIsNotNone(uf_dpo)
 
     def test_06_vram_cpu_ple_hook_and_multimodal_offload(self) -> None:
         """Verify dynamic named_modules() PLE CPU hook and audio/vision tower offload."""
@@ -429,8 +620,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             lambda_scale=DEFAULT_TIES_LAMBDA,
             density=1.0,
         )
-        self.assertAlmostEqual(float(interpolated["layer.weight"][0].item()), 11.70, places=4)
-        self.assertAlmostEqual(float(interpolated["layer.weight"][1].item()), 23.40, places=4)
+        self.assertAlmostEqual(float(interpolated["layer.weight"][0].item()), 12.00, places=4)
+        self.assertAlmostEqual(float(interpolated["layer.weight"][1].item()), 24.00, places=4)
 
     def test_08_retention_gate_and_markdown_report(self) -> None:
         """Verify Zero-Forgetting Retention Gate pass/fail logic and Markdown report."""
@@ -484,11 +675,22 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             self.assertFalse(cfg["vram_optimization"]["offload_multimodal_towers_to_cpu"])
             self.assertEqual(cfg["training"]["optim"], "adamw_bnb_8bit")
 
+        sft_e4b = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "sft_e4b_a100.yaml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(sft_e4b["lora"]["r"], 32)
+        self.assertEqual(sft_e4b["lora"]["lora_alpha"], 32)
+        self.assertFalse(sft_e4b["lora"]["use_rslora"])
+
         sft_26b = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "sft_26b_a4b_a100.yaml").read_text(encoding="utf-8")
         )
         self.assertEqual(sft_26b["model"]["base_model_id"], PRIMARY_MODEL_ID_26B)
         self.assertEqual(sft_26b["datasets"]["total_target_samples"], 120000)
+        self.assertEqual(sft_26b["lora"]["r"], 16)
+        self.assertEqual(sft_26b["lora"]["lora_alpha"], 16)
+        self.assertFalse(sft_26b["lora"]["use_rslora"])
+        self.assertIsNone(sft_26b["lora"]["target_modules"])
         self.assertTrue(sft_26b["vram_optimization"]["freeze_moe_router"])
 
         class _MockMoEBlock(nn.Module):
@@ -583,7 +785,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(
             _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=True),
             {
-                "max_gen_toks": 16384,
+                "max_gen_toks": 24576,
                 "temperature": 1.0,
                 "top_p": 0.95,
                 "top_k": 64,
@@ -595,7 +797,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(
             _get_lm_eval_gen_kwargs("mmlu_pro", model_key_prefix="26b_a4b", use_vllm=False),
             {
-                "max_gen_toks": 16384,
+                "max_gen_toks": 24576,
                 "temperature": 1.0,
                 "top_p": 0.95,
                 "top_k": 64,
@@ -914,12 +1116,12 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         eval_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
         )
-        self.assertEqual(eval_cfg["retention_gate"]["min_retention_ratio"], 0.90)
-        self.assertEqual(eval_cfg["retention_gate"]["max_allowed_drop_pct"], 8.50)
+        self.assertEqual(eval_cfg["retention_gate"]["min_retention_ratio"], 0.95)
+        self.assertEqual(eval_cfg["retention_gate"]["max_allowed_drop_pct"], 5.00)
         for anchor_name in ("MMLU-Pro", "GPQA-Diamond", "AIME-2026", "LiveCodeBench-v6"):
             self.assertEqual(
                 eval_cfg["retention_anchors"][anchor_name]["max_regression_pct"],
-                8.50,
+                5.00,
             )
             self.assertTrue(eval_cfg["retention_anchors"][anchor_name]["enable_thinking"])
         for removed_anchor in ("GSM8K", "HumanEval", "ARC-Challenge"):
@@ -1345,6 +1547,446 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             self.assertEqual(len(plots), 2)
             for p_str in plots:
                 self.assertTrue(pathlib.Path(p_str).exists())
+
+    def test_12_v2_masking_dpo_prefix_and_role_parallel_eval(self) -> None:
+        """Verify SFT -100 turn masking, 26B DPO prefix alignment, and parallel role checkpoint combining."""
+        import scripts.run_benchmarks as rb
+
+        # 1. Verify CLI flags & isolated GPU environment builder
+        role_args = parse_bench_args(["--model-key", "e4b", "--only-role", "base"])
+        self.assertEqual(role_args.only_role, "base")
+        comb_args = parse_bench_args(["--model-key", "both", "--combine-role-reports"])
+        self.assertTrue(comb_args.combine_role_reports)
+        pre_args = parse_bench_args(["--prewarm-datasets"])
+        self.assertTrue(pre_args.prewarm_datasets)
+
+        child_role_cmd = _build_child_eval_cmd(
+            role_args, model_key="e4b", only_role="tuned", model_path="outputs/merged_gemma4_e4b_arabic/merged_16bit"
+        )
+        self.assertIn("--only-role", child_role_cmd)
+        self.assertIn("tuned", child_role_cmd)
+
+        env_a = _build_isolated_gpu_env(device="cuda:0", tag="e4b_base")
+        env_b = _build_isolated_gpu_env(device="cuda:1", tag="e4b_tuned")
+        self.assertNotEqual(env_a["MASTER_PORT"], env_b["MASTER_PORT"])
+        self.assertNotEqual(env_a["VLLM_PORT"], env_b["VLLM_PORT"])
+        self.assertNotEqual(env_a["TORCHINDUCTOR_CACHE_DIR"], env_b["TORCHINDUCTOR_CACHE_DIR"])
+
+        # 2. Verify combine_role_checkpoints merges live_raw_e4b_base.json + live_raw_e4b_tuned.json
+        eval_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory(prefix="gemma4_role_combine_") as tmp_dir:
+            tmp_root = pathlib.Path(tmp_dir)
+            reports_dir = tmp_root / "outputs" / "eval_reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            base_ar = {k: {"eval_score_pct": 40.0, "n_samples": 100} for k in eval_cfg["arabic_benchmarks"]}
+            base_ret = {k: {"eval_score_pct": 55.0, "n_samples": 100} for k in eval_cfg["retention_anchors"]}
+            tuned_ar = {k: {"eval_score_pct": 52.5, "n_samples": 100} for k in eval_cfg["arabic_benchmarks"]}
+            tuned_ret = {k: {"eval_score_pct": 55.2, "n_samples": 100} for k in eval_cfg["retention_anchors"]}
+
+            _atomic_write_json(
+                reports_dir / "live_raw_e4b_base.json",
+                {
+                    "model_key": "e4b",
+                    "role": "base",
+                    "base_model_id": "unsloth/gemma-4-E4B-it",
+                    "tuned_model_path": "outputs/merged_gemma4_e4b_arabic/merged_16bit",
+                    "limit": None,
+                    "base": {"arabic": base_ar, "retention": base_ret},
+                },
+            )
+            _atomic_write_json(
+                reports_dir / "live_raw_e4b_tuned.json",
+                {
+                    "model_key": "e4b",
+                    "role": "tuned",
+                    "base_model_id": "unsloth/gemma-4-E4B-it",
+                    "tuned_model_path": "outputs/merged_gemma4_e4b_arabic/merged_16bit",
+                    "limit": None,
+                    "tuned": {"arabic": tuned_ar, "retention": tuned_ret},
+                },
+            )
+            orig_root = rb.PROJECT_ROOT
+            try:
+                rb.PROJECT_ROOT = tmp_root
+                combined = combine_role_checkpoints(
+                    model_key="e4b",
+                    base_model_id="unsloth/gemma-4-E4B-it",
+                    tuned_model_path="outputs/merged_gemma4_e4b_arabic/merged_16bit",
+                    cfg=eval_cfg,
+                    limit=None,
+                )
+                self.assertTrue((reports_dir / "live_raw_e4b.json").exists())
+                self.assertEqual(combined["base"]["arabic"]["ArabicMMLU"]["eval_score_pct"], 40.0)
+                self.assertEqual(combined["tuned"]["arabic"]["ArabicMMLU"]["eval_score_pct"], 52.5)
+            finally:
+                rb.PROJECT_ROOT = orig_root
+
+        # 3. Verify real Gemma 4 tokenizer SFT -100 turn masking & 26B DPO prefix alignment if cached locally
+        from datasets import Dataset
+        from src.train_sft import pretokenize_sft_dataset
+        from transformers import AutoTokenizer
+
+        for model_id in ("unsloth/gemma-4-E4B-it", "unsloth/gemma-4-26B-A4B-it"):
+            try:
+                tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+            except OSError:
+                continue
+
+            is_moe = "26B" in model_id
+            sample_msgs = [
+                {"role": "user", "content": "اشرح المادة 74 من نظام العمل.", "reasoning_content": ""},
+                {
+                    "role": "assistant",
+                    "content": "تنص المادة 74 على حالات انتهاء عقد العمل نظاماً.",
+                    "reasoning_content": "نستعرض الحالات النظامية في نظام العمل السعودي.",
+                },
+            ]
+            masked = build_tokenized_sft_Turn_masks(
+                sample_msgs,
+                tokenizer=tok,
+                max_seq_length=512,
+                enable_thinking=True,
+                is_26b_moe=is_moe,
+            )
+            self.assertIsNotNone(masked)
+            assert masked is not None
+            self.assertEqual(len(masked["input_ids"]), len(masked["assistant_masks"]))
+            self.assertEqual(masked["assistant_masks"][0], 0)
+            self.assertGreater(sum(masked["assistant_masks"]), 5)
+            self.assertNotIn(3, masked["input_ids"])  # zero <unk>
+
+            pretok_ds = pretokenize_sft_dataset(
+                Dataset.from_list([{"messages": sample_msgs, "enable_thinking": True}]),
+                tokenizer=tok,
+                max_seq_length=512,
+                is_26b_moe=is_moe,
+            )
+            self.assertEqual(len(pretok_ds), 1)
+            self.assertNotIn("labels", pretok_ds.column_names)
+            self.assertEqual(pretok_ds[0]["assistant_masks"][0], 0)
+            self.assertGreater(sum(pretok_ds[0]["assistant_masks"]), 5)
+
+            orig_tpl = tok.chat_template
+            try:
+                if is_moe:
+                    tok.chat_template = align_26b_chat_template_for_dpo(tok.chat_template)
+                verify_dpo_prefix_alignment(
+                    {
+                        "prompt": [{"role": "user", "content": "ما عاصمة السعودية؟"}],
+                        "chosen": [{"role": "assistant", "content": "الرياض."}],
+                        "rejected": [{"role": "assistant", "content": "جدة."}],
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                    tok,
+                )
+            finally:
+                tok.chat_template = orig_tpl
+
+    def test_13_checkpoint_resume_scorers_and_zero_fake_guards(self) -> None:
+        """Verify crash/spot-preemption checkpoint recovery, DPO multi-adapter resume, scorer normalizers, and zero-fake guards."""
+        from datasets import Dataset
+        from peft import LoraConfig, get_peft_model
+        from src.train_sft import pretokenize_sft_dataset
+
+        # 1. All 6 YAML configs must enforce frequent rolling checkpoints (save_steps=100, save_total_limit=2)
+        for cfg_name in (
+            "sft_e4b_a100.yaml",
+            "sft_26b_a4b_a100.yaml",
+            "dpo_e4b_a100.yaml",
+            "dpo_26b_a4b_a100.yaml",
+            "sft_config.yaml",
+            "dpo_config.yaml",
+        ):
+            loaded = yaml.safe_load((PROJECT_ROOT / "configs" / cfg_name).read_text(encoding="utf-8"))
+            self.assertEqual(loaded["training"]["save_steps"], 100, cfg_name)
+            self.assertEqual(loaded["training"]["save_total_limit"], 2, cfg_name)
+            self.assertEqual(loaded["training"]["save_strategy"], "steps", cfg_name)
+
+        # 2. Partial root save cleanup + corrupted trailing checkpoint fallback
+        with tempfile.TemporaryDirectory(prefix="gemma4_ckpt_guard_") as tmp_dir:
+            out_dir = pathlib.Path(tmp_dir)
+            # Simulate crash mid-root-save: adapter_config.json written, training_metrics.json missing
+            (out_dir / "adapter_config.json").write_text('{"peft_type": "LORA"}', encoding="utf-8")
+            (out_dir / "adapter_model.safetensors").write_bytes(b"X" * 512)
+
+            ckpt_100 = out_dir / "checkpoint-100"
+            ckpt_100.mkdir()
+            atomic_write_json(ckpt_100 / "trainer_state.json", {"global_step": 100})
+            atomic_write_json(ckpt_100 / "adapter_config.json", {"peft_type": "LORA"})
+            (ckpt_100 / "adapter_model.safetensors").write_bytes(b"W" * 512)
+            (ckpt_100 / "optimizer.pt").write_bytes(b"O" * 128)
+
+            # Simulate interrupted checkpoint-200 (missing trainer_state.json)
+            ckpt_200 = out_dir / "checkpoint-200"
+            ckpt_200.mkdir()
+            atomic_write_json(ckpt_200 / "adapter_config.json", {"peft_type": "LORA"})
+            (ckpt_200 / "adapter_model.safetensors").write_bytes(b"W" * 512)
+
+            # Simulate interrupted DPO checkpoint-300 with half-written ref/ subdirectory
+            ckpt_300 = out_dir / "checkpoint-300"
+            (ckpt_300 / "ref").mkdir(parents=True)
+            atomic_write_json(ckpt_300 / "trainer_state.json", {"global_step": 300})
+            atomic_write_json(ckpt_300 / "adapter_config.json", {"peft_type": "LORA"})
+            (ckpt_300 / "adapter_model.safetensors").write_bytes(b"W" * 512)
+            (ckpt_300 / "optimizer.pt").write_bytes(b"O" * 128)
+            atomic_write_json(ckpt_300 / "ref" / "adapter_config.json", {"peft_type": "LORA"})
+
+            self.assertFalse(
+                is_adapter_stage_complete(out_dir, "training_metrics.json", cleanup_partial_root=True)
+            )
+            self.assertFalse((out_dir / "adapter_config.json").exists())
+
+            resumed = find_latest_valid_checkpoint(out_dir, require_optimizer_state=True, cleanup_corrupt=True)
+            self.assertEqual(resumed, str(ckpt_100))
+            self.assertFalse(ckpt_200.exists())
+            self.assertFalse(ckpt_300.exists())
+
+            # Once root save + metrics complete, stage is recognized as complete
+            atomic_write_json(out_dir / "adapter_config.json", {"peft_type": "LORA"})
+            (out_dir / "adapter_model.safetensors").write_bytes(b"W" * 512)
+            atomic_write_json(out_dir / "training_metrics.json", {"train_loss": 0.85})
+            self.assertTrue(
+                is_adapter_stage_complete(out_dir, "training_metrics.json", cleanup_partial_root=True)
+            )
+
+        # 3. Real PEFT multi-adapter DPO checkpoint resume hook verification ("default" + frozen "ref")
+        from transformers import PretrainedConfig
+
+        class _TinyBackbone(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = PretrainedConfig(model_type="gemma4_text", use_cache=False)
+                self.q_proj = nn.Linear(16, 16, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.q_proj(x)
+
+        with tempfile.TemporaryDirectory(prefix="gemma4_dpo_resume_") as tmp_dpo_dir:
+            ckpt_dir = pathlib.Path(tmp_dpo_dir) / "checkpoint-100"
+            ckpt_dir.mkdir(parents=True)
+
+            base_net = _TinyBackbone()
+            lora_cfg = LoraConfig(r=4, lora_alpha=4, target_modules=["q_proj"], bias="none")
+            peft_net = get_peft_model(base_net, lora_cfg)
+            peft_net.add_adapter("ref", lora_cfg)
+
+            # Set distinct non-zero weights for step-0 "ref" vs trained step-100 "default"
+            with torch.no_grad():
+                for n, p in peft_net.named_parameters():
+                    if ".ref." in n:
+                        p.fill_(0.25)
+                    elif ".default." in n:
+                        p.fill_(0.75)
+
+            peft_net.save_pretrained(str(ckpt_dir), selected_adapters=["default"])
+            peft_net.save_pretrained(str(ckpt_dir), selected_adapters=["ref"])
+            self.assertTrue((ckpt_dir / "adapter_config.json").is_file())
+            self.assertTrue((ckpt_dir / "ref" / "adapter_config.json").is_file())
+
+            # Freshly initialized resume model where Trainer._load_from_checkpoint only loaded "ref"
+            fresh_peft = get_peft_model(_TinyBackbone(), lora_cfg)
+            fresh_peft.add_adapter("ref", lora_cfg)
+            with torch.no_grad():
+                for n, p in fresh_peft.named_parameters():
+                    if ".ref." in n:
+                        p.fill_(0.25)
+                    elif ".default." in n:
+                        p.zero_()
+
+            class _DummyDPOTrainer:
+                def __init__(self, m: nn.Module) -> None:
+                    self.model = m
+
+                def _load_from_checkpoint(
+                    self, resume_from_checkpoint: str, model: Any = None
+                ) -> None:
+                    # Simulate upstream Trainer bug: skips loading "default" when subfolder "ref" exists
+                    return None
+
+            dummy_trainer = _DummyDPOTrainer(fresh_peft)
+            install_dpo_default_adapter_resume_hook(dummy_trainer, freeze_moe_router=True)
+            dummy_trainer._load_from_checkpoint(str(ckpt_dir), None)
+
+            self.assertEqual(fresh_peft.active_adapter, "default")
+            for n, p in fresh_peft.named_parameters():
+                if ".default." in n and "lora_" in n:
+                    self.assertTrue(p.requires_grad, f"{n} must remain trainable after resume")
+                    self.assertTrue(
+                        torch.allclose(p, torch.full_like(p, 0.75)),
+                        f"{n} was not restored from checkpoint-100 root adapter!",
+                    )
+                elif ".ref." in n and "lora_" in n:
+                    self.assertFalse(p.requires_grad, f"{n} must stay frozen after resume")
+                    self.assertTrue(torch.allclose(p, torch.full_like(p, 0.25)))
+
+        # 4. Benchmark scorer normalizers (AIME trailing \] fix & LCB trailing stdout fence protection)
+        aime_raw = (
+            "<|channel>thought\nCompute 7 * 10 = 70.\n<channel|>"
+            "Therefore, the final answer is:\n\\[\n\\boxed{70}\n\\]<turn|>"
+        )
+        aime_norm = normalize_inspect_completion_for_scoring(aime_raw, is_aime=True)
+        self.assertEqual(aime_norm, "Therefore, the final answer is:\n$$\n\\boxed{70}\n$$")
+        # Confirm trailing $$ line is skipped cleanly when scanning last non-$$ line
+        non_dollar_lines = [ln.strip() for ln in aime_norm.splitlines() if ln.strip() and ln.strip() != "$$"]
+        self.assertEqual(non_dollar_lines[-1], "\\boxed{70}")
+
+        lcb_with_io_fence = (
+            "<|channel>thought\nRead integer n and print n*2.\n<channel|>"
+            "Here is the solution:\n```python\nimport sys\n\ndef solve():\n    n = int(sys.stdin.read().strip())\n    print(n * 2)\n\nif __name__ == '__main__':\n    solve()\n```\n"
+            "Example output:\n```text\nInput:\n5\nOutput:\n10\n```"
+        )
+        lcb_norm = normalize_lcb_code_completion(lcb_with_io_fence)
+        self.assertTrue(lcb_norm.startswith("```python\n"))
+        self.assertIn("def solve():", lcb_norm)
+        self.assertNotIn("Output:\n10", lcb_norm)
+
+        lcb_self_corrected = (
+            "Draft:\n```python\ndef solve():\n    return 0\n```\n"
+            "Fixed solution:\n```python\ndef solve():\n    return 42\n```"
+        )
+        lcb_self_norm = normalize_lcb_code_completion(lcb_self_corrected)
+        self.assertIn("return 42", lcb_self_norm)
+
+        # 5. Over-length SFT thinking trace must drop cleanly (None) rather than slicing mid-thought
+        class _CharTok:
+            def apply_chat_template(self, msgs: Any, tokenize: bool = False, **kw: Any) -> str:
+                return format_gemma4_chat(msgs, enable_thinking=kw.get("enable_thinking", False))
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+                return [ord(ch) % 200 + 10 for ch in text]
+
+        long_think_msgs = [
+            {"role": "user", "content": "Solve", "reasoning_content": ""},
+            {
+                "role": "assistant",
+                "content": "42",
+                "reasoning_content": "step " * 200,
+            },
+        ]
+        self.assertIsNone(
+            build_tokenized_sft_Turn_masks(
+                long_think_msgs,
+                tokenizer=_CharTok(),
+                max_seq_length=64,
+                enable_thinking=True,
+                is_26b_moe=False,
+            )
+        )
+
+        # Verify SFT pre-tokenized Arrow disk cache reloads instantaneously on resume
+        short_msgs = [
+            {"role": "user", "content": "Hi", "reasoning_content": ""},
+            {"role": "assistant", "content": "Hello world answer!", "reasoning_content": ""},
+        ]
+        with tempfile.TemporaryDirectory(prefix="gemma4_pretok_cache_") as tmp_cache:
+            cdir = pathlib.Path(tmp_cache) / "dense"
+            ds1 = pretokenize_sft_dataset(
+                Dataset.from_list([{"messages": short_msgs, "enable_thinking": False}]),
+                tokenizer=_CharTok(),
+                max_seq_length=256,
+                is_26b_moe=False,
+                cache_dir=cdir,
+            )
+            self.assertEqual(len(ds1), 1)
+            # Second call with matching row count & broken tokenizer=None proves Arrow cache hit
+            ds2 = pretokenize_sft_dataset(
+                Dataset.from_list([{"messages": []}]),
+                tokenizer=None,
+                max_seq_length=256,
+                is_26b_moe=False,
+                cache_dir=cdir,
+            )
+            self.assertEqual(len(ds2), 1)
+
+        # 6. Zero-fake-number hard guard in generate_all_family_plots(require_real_data=True)
+        #    and monotonic vLLM dynamic KV-cache scaling across 1 -> 50 concurrent users
+        eval_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory(prefix="gemma4_real_guard_") as tmp_plots:
+            import scripts.benchmark_latency_and_plots as blp
+
+            orig_blp_root = blp.PROJECT_ROOT
+            try:
+                blp.PROJECT_ROOT = pathlib.Path(tmp_plots)
+                with self.assertRaises((RuntimeError, FileNotFoundError)):
+                    generate_all_family_plots(
+                        eval_cfg=eval_cfg,
+                        latency_profile=build_reference_latency_profile(),
+                        output_dir=pathlib.Path(tmp_plots) / "plots",
+                        dpi=100,
+                        require_real_data=True,
+                    )
+            finally:
+                blp.PROJECT_ROOT = orig_blp_root
+
+        kv_1 = _compute_active_kv_and_runtime_gb("nonexistent_e4b", [768] * 1, is_moe=False)
+        kv_10 = _compute_active_kv_and_runtime_gb("nonexistent_e4b", [768] * 10, is_moe=False)
+        kv_30 = _compute_active_kv_and_runtime_gb("nonexistent_e4b", [768] * 30, is_moe=False)
+        kv_50 = _compute_active_kv_and_runtime_gb("nonexistent_e4b", [768] * 50, is_moe=False)
+        self.assertLess(kv_1, kv_10)
+        self.assertLess(kv_10, kv_30)
+        self.assertLess(kv_30, kv_50)
+        self.assertLess(9.2 + kv_50, 80.0)
+
+        # Verify 26B-A4B MoE KV geometry (num_global_key_value_heads=2 + attention_k_eq_v=True)
+        moe_kv_1 = _compute_active_kv_and_runtime_gb("nonexistent_26b", [768] * 1, is_moe=True)
+        moe_kv_50 = _compute_active_kv_and_runtime_gb("nonexistent_26b", [768] * 50, is_moe=True)
+        self.assertLess(moe_kv_1, moe_kv_50)
+        self.assertLess(47.7 + moe_kv_50, 80.0)
+
+        # 7. Verify MMLU-Pro dynamic max_gen_toks budget & lm_eval unclosed-thought guard
+        from scripts.run_benchmarks import (
+            _get_lm_eval_gen_kwargs,
+            _install_lm_eval_unclosed_thought_guard,
+        )
+        import lm_eval.models.utils as lm_utils
+
+        kw_32k = _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=True, max_model_len=32768)
+        kw_24k = _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=True, max_model_len=24576)
+        assert kw_32k is not None and kw_24k is not None
+        self.assertEqual(kw_32k["max_gen_toks"], 24576)
+        self.assertEqual(kw_24k["max_gen_toks"], 16384)
+        self.assertFalse(kw_32k["skip_special_tokens"])
+
+        _install_lm_eval_unclosed_thought_guard()
+        self.assertEqual(
+            lm_utils.postprocess_generated_text(
+                "<|channel>thought\nChecking (A) and (B)...",
+                ["<turn|>"],
+                "<channel|>",
+            ),
+            "",
+        )
+        self.assertEqual(
+            lm_utils.postprocess_generated_text(
+                "<|channel>thought\nDone.\n<channel|>The answer is (D)<turn|>extra",
+                ["<turn|>"],
+                "<channel|>",
+            ),
+            "The answer is (D)",
+        )
+
+        # 8. Verify single-point training history renders cleanly without crashing plot generator
+        from scripts.benchmark_latency_and_plots import _load_training_curve_series
+
+        with tempfile.TemporaryDirectory(prefix="gemma4_single_pt_") as tmp_hist:
+            st_path = pathlib.Path(tmp_hist) / "trainer_state.json"
+            atomic_write_json(st_path, {"log_history": [{"step": 10, "loss": 1.25}]})
+            series = _load_training_curve_series(pathlib.Path(tmp_hist) / "training_metrics.json", ("loss",))
+            self.assertEqual(series, ([0.0, 10.0], [1.25, 1.25]))
+
+        # 9. Compile-check every inline "${PYTHON_BIN}" -c "..." snippet in run_dual_a100_pipeline.sh
+        import re
+
+        sh_text = (PROJECT_ROOT / "scripts" / "run_dual_a100_pipeline.sh").read_text(encoding="utf-8")
+        py_snippets = re.findall(r'"\$\{PYTHON_BIN\}"\s+-c\s+"(.*?)"', sh_text, flags=re.S)
+        self.assertGreaterEqual(len(py_snippets), 10)
+        for idx, raw_snip in enumerate(py_snippets):
+            unescaped = raw_snip.replace('\\"', '"').replace("\\$", "$")
+            compile(unescaped, f"run_dual_a100_pipeline.sh:snippet_{idx}", "exec")
 
 
 if __name__ == "__main__":

@@ -19,8 +19,10 @@ Saves:
 """
 
 import argparse
+import inspect
 import json
 import logging
+import math
 import os
 import pathlib
 import subprocess
@@ -42,9 +44,14 @@ from scripts.benchmark_latency_and_plots import (
     load_eval_config,
 )
 from scripts.run_benchmarks import (
+    _build_isolated_gpu_env,
     _destroy_vllm_and_free_vram,
     _prepare_gemma4_config_for_load,
 )
+from src.constants import load_dotenv_if_present
+from src.model_loader import atomic_write_json
+
+load_dotenv_if_present()
 
 logger = logging.getLogger(__name__)
 
@@ -389,6 +396,68 @@ def _measure_checkpoint_safetensors_gb(model_path: str, fallback_gb: float) -> f
     return fallback_gb
 
 
+def _compute_active_kv_and_runtime_gb(
+    model_path: str,
+    active_seq_lens: List[int],
+    is_moe: bool = False,
+) -> float:
+    """Compute active PagedAttention BF16 KV-cache + CUDA graph/activation footprint (GiB) from `config.json` and live request lengths.
+
+    Why not use `torch.cuda.mem_get_info(0)` directly as `vram_used_gb`?
+    vLLM pre-reserves `gpu_memory_utilization` (`90%` = `~72 GB` on an 80 GB A100) upfront for its
+    entire KV block pool, which would falsely report `~72 GB` flat even for a `9.2 GB` model at 1 user.
+    Instead, we compute exact 16-token-paged BF16 K+V block allocations across every SWA and Global
+    layer from the checkpoint's `config.json` plus CUDA graph / runtime workspace overhead, while
+    recording `vllm_reserved_pool_gb` separately.
+    """
+    cfg_data: Dict[str, Any] = {}
+    cfg_file = pathlib.Path(model_path) / "config.json"
+    if cfg_file.is_file():
+        try:
+            cfg_data = json.loads(cfg_file.read_text(encoding="utf-8"))
+        except Exception:
+            cfg_data = {}
+    text_cfg = cfg_data.get("text_config", cfg_data) if isinstance(cfg_data, dict) else {}
+
+    num_layers = int(text_cfg.get("num_hidden_layers", 30 if is_moe else 42))
+    layer_types = list(text_cfg.get("layer_types") or [])
+    if len(layer_types) != num_layers:
+        if is_moe:
+            layer_types = ["sliding_attention" if (i + 1) % 6 != 0 else "full_attention" for i in range(num_layers)]
+        else:
+            layer_types = ["sliding_attention" if (i + 1) % 6 != 0 else "full_attention" for i in range(num_layers)]
+
+    sliding_window = int(text_cfg.get("sliding_window") or (1024 if is_moe else 512))
+    local_kv_heads = int(text_cfg.get("num_key_value_heads") or (8 if is_moe else 4))
+    global_kv_heads = int(
+        text_cfg.get("num_global_key_value_heads")
+        or text_cfg.get("global_num_key_value_heads")
+        or (2 if is_moe else local_kv_heads)
+    )
+    attn_k_eq_v = bool(text_cfg.get("attention_k_eq_v", is_moe))
+    global_kv_buffers = 1 if attn_k_eq_v else 2
+    local_head_dim = int(text_cfg.get("head_dim") or 256)
+    global_head_dim = int(text_cfg.get("global_head_dim") or 512)
+    block_size = 16
+
+    kv_bytes_total = 0
+    for seq_len in active_seq_lens:
+        s_len = max(1, int(seq_len))
+        paged_full = int(math.ceil(s_len / float(block_size)) * block_size)
+        paged_swa = int(math.ceil(min(s_len, sliding_window) / float(block_size)) * block_size)
+        for l_type in layer_types:
+            if "sliding" in str(l_type).lower():
+                # 2 tensors (K + V) * 2 bytes (bf16)
+                kv_bytes_total += paged_swa * 2 * local_kv_heads * local_head_dim * 2
+            else:
+                # Global attention uses 1 buffer when attention_k_eq_v=True (K=V), else 2 (K+V)
+                kv_bytes_total += paged_full * global_kv_buffers * global_kv_heads * global_head_dim * 2
+
+    cuda_graph_and_workspace_gb = (1.65 if is_moe else 1.15) + (0.025 * len(active_seq_lens))
+    kv_gb = (kv_bytes_total / (1024.0 ** 3)) + cuda_graph_and_workspace_gb
+    return round(max(0.25, kv_gb), 2)
+
+
 def profile_vllm_model_live(
     model_path: str,
     concurrency_users: List[int],
@@ -397,15 +466,12 @@ def profile_vllm_model_live(
     gpu_memory_utilization: float = 0.90,
     weights_vram_gb: float = 9.2,
     device: str = "cuda:0",
+    require_vllm: bool = False,
     _in_isolated_subprocess: bool = False,
 ) -> Tuple[Dict[str, Any], float, str]:
-    """Run live vLLM benchmark in an isolated GPU-pinned subprocess, or fallback to live GPU PyTorch batched profiling."""
+    """Run live vLLM benchmark in an isolated GPU-pinned subprocess."""
     if not _in_isolated_subprocess and torch.cuda.is_available():
-        child_env = os.environ.copy()
-        if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
-            child_env["CUDA_VISIBLE_DEVICES"] = str(device.split(":")[1])
-        child_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-        child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+        child_env = _build_isolated_gpu_env(device=device, tag="vllm_conc")
 
         with tempfile.TemporaryDirectory(prefix="vllm_conc_") as tmp_dir:
             out_file = pathlib.Path(tmp_dir) / "vllm_conc_out.json"
@@ -423,6 +489,7 @@ scaling, measured_w_gb, engine_str = profile_vllm_model_live(
     gpu_memory_utilization={float(gpu_memory_utilization)},
     weights_vram_gb={float(weights_vram_gb)},
     device="cuda:0",
+    require_vllm={repr(bool(require_vllm))},
     _in_isolated_subprocess=True,
 )
 pathlib.Path({repr(str(out_file))}).write_text(
@@ -444,7 +511,11 @@ pathlib.Path({repr(str(out_file))}).write_text(
 
     try:
         from vllm import LLM, SamplingParams
-    except ImportError:
+    except ImportError as vllm_imp_exc:
+        if require_vllm:
+            raise RuntimeError(
+                "CRITICAL: `--live-vllm` requires `vllm>=0.30.0` installed on the GPU node; refusing fallback."
+            ) from vllm_imp_exc
         logger.info(
             "vLLM package not installed; executing live PyTorch/Transformers batched GPU concurrency benchmark on %s...",
             device,
@@ -469,15 +540,40 @@ pathlib.Path({repr(str(out_file))}).write_text(
         pass
 
     measured_weights_gb = _measure_checkpoint_safetensors_gb(model_path, weights_vram_gb)
+    is_moe_model = "26b" in str(model_path).lower() or "a4b" in str(model_path).lower() or measured_weights_gb > 25.0
 
-    llm = LLM(
-        model=model_path,
-        dtype="bfloat16",
-        trust_remote_code=True,
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=4096,
-        tensor_parallel_size=1,
-    )
+    llm_kwargs: Dict[str, Any] = {
+        "model": model_path,
+        "dtype": "bfloat16",
+        "trust_remote_code": True,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "max_model_len": 4096,
+        "tensor_parallel_size": 1,
+        "enable_prefix_caching": False,
+    }
+    try:
+        llm_sig = inspect.signature(LLM.__init__).parameters
+        if "limit_mm_per_prompt" in llm_sig:
+            llm_kwargs["limit_mm_per_prompt"] = {"image": 0}
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in llm_sig.values()):
+            llm_kwargs = {k: v for k, v in llm_kwargs.items() if k in llm_sig}
+    except Exception:
+        pass
+
+    pre_init_free_bytes = 0
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            pre_init_free_bytes, _ = torch.cuda.mem_get_info(0)
+        except Exception:
+            pre_init_free_bytes = 0
+
+    try:
+        llm = LLM(**llm_kwargs)
+    except TypeError:
+        llm_kwargs.pop("limit_mm_per_prompt", None)
+        llm_kwargs.pop("enable_prefix_caching", None)
+        llm = LLM(**llm_kwargs)
 
     scaling_results: Dict[str, Any] = {}
     try:
@@ -488,13 +584,14 @@ pathlib.Path({repr(str(out_file))}).write_text(
         )
         repeated_text = base_prompt * max(2, prompt_tokens // 16)
         try:
-            raw_ids = tok.encode(repeated_text, add_special_tokens=False)[: max(32, prompt_tokens - 24)]
+            raw_ids = tok.encode(repeated_text, add_special_tokens=False)[: max(32, prompt_tokens - 28)]
             prompt_body = tok.decode(raw_ids, skip_special_tokens=True)
         except Exception:
             prompt_body = repeated_text[: prompt_tokens * 3]
 
-        def _format_user_prompt(user_idx: int) -> str:
-            user_content = f"[User {user_idx + 1}] {prompt_body}"
+        def _format_user_prompt(user_idx: int, run_nonce: int = 0) -> str:
+            # Unique leading nonce guarantees uncached prefill compute across every timed run and user
+            user_content = f"[Session {run_nonce} | User {user_idx + 1}] {prompt_body}"
             if getattr(tok, "chat_template", None):
                 try:
                     rendered = tok.apply_chat_template(
@@ -516,22 +613,21 @@ pathlib.Path({repr(str(out_file))}).write_text(
 
         # Warmup single request
         warmup_params = SamplingParams(temperature=0.0, max_tokens=8)
-        _ = llm.generate([_format_user_prompt(0)], warmup_params)
+        _ = llm.generate([_format_user_prompt(0, run_nonce=0)], warmup_params)
 
         for num_users in concurrency_users:
-            batch_prompts = [_format_user_prompt(i) for i in range(num_users)]
-
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
-            # 1. Measure Prefill / Time-To-First-Token (TTFT) across 3 timed runs
+            # 1. Measure Uncached Prefill / Time-To-First-Token (TTFT) across 3 distinct-nonce runs
             ttft_params = SamplingParams(temperature=0.0, max_tokens=1)
             ttft_samples_ms: List[float] = []
-            for _ in range(3):
+            for run_idx in range(1, 4):
+                ttft_prompts = [_format_user_prompt(i, run_nonce=run_idx * 1000 + num_users) for i in range(num_users)]
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                _ = llm.generate(batch_prompts, ttft_params)
+                _ = llm.generate(ttft_prompts, ttft_params)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 ttft_samples_ms.append((time.perf_counter() - t0) * 1000.0)
@@ -540,6 +636,7 @@ pathlib.Path({repr(str(out_file))}).write_text(
             ttft_p95_ms = ttft_samples_ms[-1]
 
             # 2. Measure Continuous-Batched Decode Throughput across N concurrent requests
+            decode_prompts = [_format_user_prompt(i, run_nonce=9000 + num_users) for i in range(num_users)]
             try:
                 gen_params = SamplingParams(
                     temperature=0.0,
@@ -552,24 +649,41 @@ pathlib.Path({repr(str(out_file))}).write_text(
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_start = time.perf_counter()
-            outputs = llm.generate(batch_prompts, gen_params)
+            outputs = llm.generate(decode_prompts, gen_params)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             elapsed = max(1e-6, time.perf_counter() - t_start)
+            prefill_sec = ttft_median_ms / 1000.0
+            decode_elapsed = max(elapsed - prefill_sec, elapsed * 0.25, 1e-6)
 
-            total_generated_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
-            total_system_tps = total_generated_tokens / elapsed
+            decoded_tokens_total = sum(max(1, len(o.outputs[0].token_ids) - 1) for o in outputs)
+            total_system_tps = decoded_tokens_total / decode_elapsed
             per_user_tps = total_system_tps / max(1, num_users)
+
+            active_seq_lens = [
+                len(getattr(o, "prompt_token_ids", ()) or ()) + len(o.outputs[0].token_ids)
+                for o in outputs
+            ]
+            if not active_seq_lens:
+                active_seq_lens = [prompt_tokens + max_new_tokens] * num_users
 
             if torch.cuda.is_available():
                 free_bytes, total_bytes = torch.cuda.mem_get_info(0)
-                vram_used_gb = (total_bytes - free_bytes) / (1024.0 ** 3)
+                if pre_init_free_bytes > free_bytes:
+                    vllm_reserved_gb = (pre_init_free_bytes - free_bytes) / (1024.0 ** 3)
+                else:
+                    vllm_reserved_gb = (total_bytes - free_bytes) / (1024.0 ** 3)
                 total_hbm_gb = max(1.0, total_bytes / (1024.0 ** 3))
             else:
-                vram_used_gb = measured_weights_gb
+                vllm_reserved_gb = measured_weights_gb
                 total_hbm_gb = 80.0
 
-            kv_gb = max(0.0, round(vram_used_gb - measured_weights_gb, 2))
+            kv_gb = _compute_active_kv_and_runtime_gb(
+                model_path=model_path,
+                active_seq_lens=active_seq_lens,
+                is_moe=is_moe_model,
+            )
+            vram_used_gb = min(total_hbm_gb, round(measured_weights_gb + kv_gb, 2))
 
             scaling_results[str(num_users)] = {
                 "concurrent_users": num_users,
@@ -579,10 +693,11 @@ pathlib.Path({repr(str(out_file))}).write_text(
                 "total_system_tokens_per_sec": round(total_system_tps, 2),
                 "kv_cache_and_runtime_gb": kv_gb,
                 "vram_used_gb": round(vram_used_gb, 2),
+                "vllm_reserved_pool_gb": round(vllm_reserved_gb, 2),
                 "vram_utilization_pct": round((vram_used_gb / total_hbm_gb) * 100.0, 1),
             }
             logger.info(
-                "[vLLM] Users=%d -> TTFT=%.1f ms (P95=%.1f ms) | PerUser=%.1f tok/s | Sys=%.1f tok/s | DeviceVRAM=%.2f/%.1f GB",
+                "[vLLM] Users=%d -> TTFT=%.1f ms (P95=%.1f ms) | PerUser=%.1f tok/s | Sys=%.1f tok/s | ActiveVRAM=%.2f/%.1f GB (Pool=%.1f GB)",
                 num_users,
                 ttft_median_ms,
                 ttft_p95_ms,
@@ -590,6 +705,7 @@ pathlib.Path({repr(str(out_file))}).write_text(
                 total_system_tps,
                 vram_used_gb,
                 total_hbm_gb,
+                vllm_reserved_gb,
             )
     finally:
         _destroy_vllm_and_free_vram(model_obj=llm)
@@ -597,7 +713,7 @@ pathlib.Path({repr(str(out_file))}).write_text(
     return (
         scaling_results,
         measured_weights_gb,
-        "vLLM (PagedAttention + Continuous Batching + Prefix Caching)",
+        "vLLM (PagedAttention + Continuous Batching, Uncached Prefill)",
     )
 
 
@@ -796,6 +912,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Generate reference vLLM multi-user report and plots without launching GPU engine.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run live vLLM concurrency benchmark even if a completed `live_vllm` JSON already exists.",
+    )
     return parser.parse_args(argv)
 
 
@@ -831,45 +952,69 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not md_path.is_absolute():
         md_path = PROJECT_ROOT / md_path
 
+    mode_str = "dry_run" if args.dry_run else ("live_vllm" if args.live_vllm else "reference")
     profile = build_reference_vllm_concurrency_profile()
     users_list = [int(u) for u in vllm_cfg.get("concurrency_users", [1, 10, 30, 40, 50])]
     profile["workload"]["concurrency_users"] = users_list
+    profile["mode"] = mode_str
 
     if args.live_vllm and not args.dry_run:
-        if torch.cuda.is_available():
+        resumed_live = False
+        if not args.force and json_path.is_file():
             try:
-                gpu_name = torch.cuda.get_device_name(0)
-                profile["hardware_target"] = f"Single {gpu_name} (80.0 GB HBM2e)"
+                existing = json.loads(json_path.read_text(encoding="utf-8"))
+                if (
+                    existing.get("mode") == "live_vllm"
+                    and existing.get("models", {}).get("e4b", {}).get("concurrency_scaling")
+                    and existing.get("models", {}).get("26b_a4b", {}).get("concurrency_scaling")
+                ):
+                    profile = existing
+                    resumed_live = True
+                    logger.info("Resumed verified live vLLM concurrency profile from %s.", json_path)
             except Exception:
-                pass
-        models_cfg = cfg.get("models", {})
-        for key, default_w_gb in (("e4b", 9.2), ("26b_a4b", 50.8)):
-            ckpt = models_cfg.get(key, {}).get("merged_checkpoint_dir")
-            target_dev = str(models_cfg.get(key, {}).get("device", "cuda:0"))
-            if ckpt and pathlib.Path(ckpt).exists():
-                logger.info("Running live concurrency benchmark for %s (%s) on %s...", key, ckpt, target_dev)
-                try:
-                    scaling, measured_w_gb, engine_str = profile_vllm_model_live(
-                        model_path=str(ckpt),
-                        concurrency_users=users_list,
-                        prompt_tokens=int(vllm_cfg.get("prompt_tokens", 512)),
-                        max_new_tokens=int(vllm_cfg.get("max_new_tokens", 256)),
-                        gpu_memory_utilization=float(vllm_cfg.get("gpu_memory_utilization", 0.90)),
-                        weights_vram_gb=default_w_gb,
-                        device=target_dev,
+                resumed_live = False
+
+        if not resumed_live:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CRITICAL: `--live-vllm` requires an active CUDA GPU; refusing to emit reference fallback numbers."
+                )
+            gpu_name = torch.cuda.get_device_name(0)
+            total_vram_gb = round(torch.cuda.get_device_properties(0).total_memory / (1024.0 ** 3), 1)
+            profile["hardware_target"] = f"Single {gpu_name} ({total_vram_gb} GB HBM)"
+            profile["gpu_vram_limit_gb"] = total_vram_gb
+            profile["mode"] = "live_vllm"
+            models_cfg = cfg.get("models", {})
+            for key, default_w_gb in (("e4b", 9.2), ("26b_a4b", 50.8)):
+                raw_ckpt = models_cfg.get(key, {}).get("merged_checkpoint_dir")
+                if not raw_ckpt:
+                    raise ValueError(f"Missing `models.{key}.merged_checkpoint_dir` in {args.config}!")
+                ckpt_path = pathlib.Path(str(raw_ckpt))
+                if not ckpt_path.is_absolute():
+                    ckpt_path = PROJECT_ROOT / ckpt_path
+                if not (ckpt_path / "config.json").is_file():
+                    raise FileNotFoundError(
+                        f"Live vLLM concurrency benchmark failed: merged checkpoint not found at {ckpt_path}! "
+                        "Refusing to fall back to synthetic reference profile."
                     )
-                    profile["models"][key]["concurrency_scaling"] = scaling
-                    profile["models"][key]["weights_vram_gb"] = measured_w_gb
-                    profile["engine"] = engine_str
-                except Exception as exc:
-                    logger.warning(
-                        "Live concurrency benchmark unavailable for %s (%s); using reference A100 80GB profile.",
-                        key,
-                        exc,
-                    )
+                target_dev = str(models_cfg.get(key, {}).get("device", "cuda:0"))
+                logger.info("Running live vLLM concurrency benchmark for %s (%s) on %s...", key, ckpt_path, target_dev)
+                scaling, measured_w_gb, engine_str = profile_vllm_model_live(
+                    model_path=str(ckpt_path),
+                    concurrency_users=users_list,
+                    prompt_tokens=int(vllm_cfg.get("prompt_tokens", 512)),
+                    max_new_tokens=int(vllm_cfg.get("max_new_tokens", 256)),
+                    gpu_memory_utilization=float(vllm_cfg.get("gpu_memory_utilization", 0.90)),
+                    weights_vram_gb=default_w_gb,
+                    device=target_dev,
+                    require_vllm=True,
+                )
+                profile["models"][key]["concurrency_scaling"] = scaling
+                profile["models"][key]["weights_vram_gb"] = measured_w_gb
+                profile["engine"] = engine_str
 
     json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    atomic_write_json(json_path, profile)
 
     md_report = render_vllm_markdown_report(profile)
     md_path.parent.mkdir(parents=True, exist_ok=True)
@@ -883,7 +1028,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     summary = {
         "status": "completed",
-        "mode": "dry_run" if args.dry_run else ("live_vllm" if args.live_vllm else "reference"),
+        "mode": mode_str,
         "concurrency_users": users_list,
         "output_json": str(json_path),
         "output_markdown": str(md_path),

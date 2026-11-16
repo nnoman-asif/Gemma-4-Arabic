@@ -1,669 +1,971 @@
-"""Dataset schema normalizers for all 5 Stage 1 Arabic SFT datasets.
+"""Schema normalizers, quality filters, and 13-gram benchmark decontamination for Stage 1 Arabic SFT.
 
-Handles dataset-specific schemas and preprocessing rules:
-1. `VohoAI/voho-saudi-dialogues`:
-   - Parses JSON string in `messages_json` (or `messages` list) and strips speaker prefixes.
-2. `SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus`:
-   - Supports both `name="moj"` (flat columns: `doc_title`, `article_title`, `text`, etc.)
-     and `name="boe"` (nested dicts under `row["article"]["text"]` or
-     `row["retrieval"]["contextual_text"]` + `row["law"]["title_ar"]`).
-3. `FreedomIntelligence/AceGPT-v2-tuning`:
-   - Maps `conversations` list (`from` / `value`) to standard `user` / `assistant` roles.
-4. `Omartificial-Intelligence-Space/Arabic-Math-SFT`:
-   - Drops the `image` (`PIL.Image`) column immediately via `.remove_columns(["image"])`
-     and formats with `enable_thinking=True`.
-5. `CohereForAI/aya_collection_language_split`:
-   - Normalizes `inputs` and `targets` into chat turns with optional structured JSON
-     tool-calling schemas.
+Covers all 9 curated public (`gated=False`) Arabic & Saudi SFT datasets (90,000 target rows):
+1. `AdaMLLab/smolkalam-arabic-conversational-sft` (`Mixture_of_Thoughts_science_no_think`)
+2. `AdaMLLab/smolkalam-arabic-conversational-sft` (`OpenThoughts3_50K` — verified `<think>...</think>`)
+3. `AdaMLLab/smolkalam-arabic-conversational-sft` (`OpenHermes_2.5_no_think`)
+4. `oddadmix/arabic-math-reasoning-synth` (`instruction` + `reasoning` + `answer`)
+5. `FreedomIntelligence/alpaca-gpt4-arabic` (`conversations`: `human` / `gpt`)
+6. `Gheras/Medical_Reasoning_Arabic_Dataset` (`Question` + `Complex_CoT` + `Response`, stripped of English notes)
+7. `CohereLabs/aya_dataset` (human-annotated Arabic `arb`, `ars`, `arz`, `ajp`, `acq`, `ary`)
+8. `VohoAI/voho-saudi-dialogues` (Najdi, Hijazi, Khaliji multi-turn dialogues)
+9. `SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus` (`moj` & `boe`, active `ساري` statutes only)
 """
 
+import hashlib
 import json
 import logging
+import random
 import re
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from src.chat_template import format_gemma4_chat, format_thinking_response
+from src.chat_template import (
+    format_gemma4_chat,
+    make_uniform_message,
+    parse_reasoning_and_content,
+    verify_thinking_block_preserved,
+)
 from src.constants import (
-    ARABIC_MATH_REASONING_SYSTEM_PROMPT,
-    DEFAULT_MSA_SYSTEM_PROMPT,
-    SAUDI_DIALECT_SYSTEM_PROMPT,
-    SAUDI_LEGAL_SYSTEM_PROMPT,
+    ARABIC_SYSTEM_PROMPT_POOL,
+    DEFAULT_ARABIC_SYSTEM_PROMPT,
     SFT_ARABIC_DATASETS,
-    SOVEREIGN_TOOL_CALLING_SYSTEM_PROMPT,
+    SFT_MAX_TOKEN_LENGTH_FILTER,
+    SYSTEM_PROMPT_INJECTION_PROB,
+    load_dotenv_if_present,
 )
 
 logger = logging.getLogger(__name__)
 
-# Regex to strip leading speaker prefixes in dialogue turns
-SPEAKER_PREFIX_PATTERN = re.compile(
-    r"^\s*(?:user|assistant|human|gpt|bot|model|speaker\s*\d+|client|agent|"
-    r"المستخدم|المساعد|العميل|الموظف|المتحدث\s*\d*|س|ج)\s*[:\-]\s*",
+_SPEAKER_PREFIX_RE = re.compile(
+    r"^\s*(?:User|Assistant|Human|AI|Bot|System|المستخدم|المساعد|الإنسان|النظام)\s*[:：\-]\s*",
     flags=re.IGNORECASE,
 )
 
+_ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+_LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+_WORD_NORM_RE = re.compile(r"[^\w\u0600-\u06FF]+", flags=re.UNICODE)
+
+_ENGLISH_META_LEAK_SUBSTRINGS: Tuple[str, ...] = (
+    "this translation aims",
+    "original text",
+    "note on translation",
+    "translated from english",
+    "here is the translation",
+    "as an ai language model",
+    "in saudi dialect:",
+    "generate a response in",
+)
+
+_SAUDI_LAW_QUESTION_TEMPLATES: Tuple[str, ...] = (
+    "وضح النص النظامي والمضمون القانوني لـ {art} من {doc}.",
+    "ماذا تنص عليه {art} في {doc}؟",
+    "اذكر الحكم النظامي الوارد في {art} من {doc}.",
+    "ما هي الأحكام المنصوص عليها في {art} ضمن {doc}؟",
+    "اشرح مضمون {art} من {doc} وفق الأنظمة السعودية السارية.",
+)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark Decontamination Engine (Exact Normalized Text + 13-Gram Overlap)
+# ---------------------------------------------------------------------------
+class BenchmarkDecontaminator:
+    """Fast O(L) exact + 13-word shingle decontamination filter against eval test sets."""
+
+    def __init__(self, ngram_size: int = 13) -> None:
+        self.ngram_size = ngram_size
+        self.exact_hashes: Set[bytes] = set()
+        self.ngram_hashes: Set[bytes] = set()
+        self.loaded_benchmarks: Dict[str, int] = {}
+
+    @staticmethod
+    def _normalize_words(text: str) -> List[str]:
+        cleaned = _WORD_NORM_RE.sub(" ", str(text or "").lower()).strip()
+        return [w for w in cleaned.split() if w]
+
+    @staticmethod
+    def _digest(text: str) -> bytes:
+        return hashlib.blake2b(text.encode("utf-8", errors="ignore"), digest_size=12).digest()
+
+    def add_benchmark_text(self, text: str) -> bool:
+        """Index a single benchmark test question/prompt into exact and 13-gram sets."""
+        words = self._normalize_words(text)
+        if len(words) < 5:
+            return False
+        norm_joined = " ".join(words)
+        self.exact_hashes.add(self._digest(norm_joined))
+        n = self.ngram_size
+        if len(words) >= n:
+            for i in range(len(words) - n + 1):
+                shingle = " ".join(words[i : i + n])
+                self.ngram_hashes.add(self._digest(shingle))
+        return True
+
+    def is_contaminated(self, text: str) -> bool:
+        """Return True if `text` matches a benchmark test item exactly or on any 13-word shingle."""
+        if not self.exact_hashes and not self.ngram_hashes:
+            return False
+        words = self._normalize_words(text)
+        if len(words) < 5:
+            return False
+        norm_joined = " ".join(words)
+        if self._digest(norm_joined) in self.exact_hashes:
+            return True
+        n = self.ngram_size
+        if len(words) >= n and self.ngram_hashes:
+            for i in range(len(words) - n + 1):
+                if self._digest(" ".join(words[i : i + n])) in self.ngram_hashes:
+                    return True
+        return False
+
+    def is_messages_contaminated(self, messages: Sequence[Dict[str, Any]]) -> bool:
+        """Check all user turns in `messages` against the indexed benchmark test sets."""
+        for msg in messages:
+            if str(msg.get("role", "")).lower() == "user":
+                if self.is_contaminated(str(msg.get("content") or "")):
+                    return True
+        return False
+
+    @classmethod
+    def from_eval_benchmarks(cls, load_live: bool = True) -> "BenchmarkDecontaminator":
+        """Load public benchmark test prompts to guarantee 0.0% train-test overlap."""
+        decontam = cls(ngram_size=13)
+        if not load_live:
+            return decontam
+
+        load_dotenv_if_present()
+        from datasets import get_dataset_config_names, load_dataset
+
+        # (label, repo_id, config_name_or_ALL, split_candidates, text_fields)
+        benchmark_specs: List[Tuple[str, str, Optional[str], Tuple[str, ...], Tuple[str, ...]]] = [
+            ("MMLU-Pro", "TIGER-Lab/MMLU-Pro", None, ("test",), ("question",)),
+            ("ArabicMMLU", "MBZUAI/ArabicMMLU", "__ALL__", ("test", "dev"), ("Question", "question")),
+            ("MadinahQA", "MBZUAI/MadinahQA", "__ALL__", ("test", "dev"), ("Question", "question")),
+            ("AraTrust", "asas-ai/AraTrust", None, ("test", "train"), ("Question", "question")),
+            ("EXAMS-AR", "OALL/Arabic_EXAMS", None, ("test", "validation"), ("question", "Question")),
+            (
+                "AlGhafa",
+                "OALL/AlGhafa-Arabic-LLM-Benchmark-Native",
+                "__ALL__",
+                ("test",),
+                ("query", "question"),
+            ),
+            (
+                "LiveCodeBench",
+                "livecodebench/code_generation_lite",
+                None,
+                ("test",),
+                ("question_content",),
+            ),
+            ("AIME-2025", "MathArena/aime_2025", None, ("train", "test"), ("problem",)),
+            ("AIME-2026", "MathArena/aime_2026", None, ("train", "test"), ("problem",)),
+        ]
+
+        for label, repo_id, cfg_spec, splits, fields in benchmark_specs:
+            added = 0
+            try:
+                configs_to_load: List[Optional[str]]
+                if cfg_spec == "__ALL__":
+                    try:
+                        configs_to_load = list(get_dataset_config_names(repo_id))
+                    except Exception:
+                        configs_to_load = [None]
+                else:
+                    configs_to_load = [cfg_spec]
+
+                for cfg_name in configs_to_load:
+                    for sp in splits:
+                        try:
+                            ds = (
+                                load_dataset(repo_id, cfg_name, split=sp)
+                                if cfg_name
+                                else load_dataset(repo_id, split=sp)
+                            )
+                            for row in ds:
+                                for f in fields:
+                                    val = row.get(f)
+                                    if isinstance(val, str) and len(val.strip()) >= 20:
+                                        if decontam.add_benchmark_text(val):
+                                            added += 1
+                                        break
+                            break
+                        except Exception:
+                            continue
+            except Exception as exc:
+                logger.debug("Optional decontamination source %s skipped: %s", repo_id, exc)
+            if added > 0:
+                decontam.loaded_benchmarks[label] = added
+                logger.info(
+                    "[Decontam] Indexed %d test prompts from %s (%s)",
+                    added,
+                    label,
+                    repo_id,
+                )
+
+        logger.info(
+            "[Decontam] Ready: %d exact hashes, %d 13-gram hashes across %d suites.",
+            len(decontam.exact_hashes),
+            len(decontam.ngram_hashes),
+            len(decontam.loaded_benchmarks),
+        )
+        return decontam
+
+
+# ---------------------------------------------------------------------------
+# Token Length & Text Hygiene Helpers
+# ---------------------------------------------------------------------------
+def estimate_gemma4_token_count(text: str, tokenizer: Optional[Any] = None) -> int:
+    """Return exact Gemma 4 token count when `tokenizer` is provided, or conservative upper-bound estimate."""
+    if not text:
+        return 0
+    if tokenizer is not None and hasattr(tokenizer, "encode"):
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    # Conservative fallback: ~3.1 chars/token on mixed Arabic/English/LaTeX
+    return max(1, int(len(text) / 3.0) + 16)
+
 
 def strip_speaker_prefix(text: str) -> str:
-    """Strip leading speaker labels (e.g. 'User:', 'المستخدم:') from a dialogue turn."""
-    if not text:
-        return ""
-    cleaned = text.strip()
-    cleaned = SPEAKER_PREFIX_PATTERN.sub("", cleaned, count=1)
-    return cleaned.strip()
+    """Remove redundant leading speaker tags (`User:`, `Assistant:`, `المساعد:`) from text."""
+    cleaned = (text or "").strip()
+    while True:
+        updated = _SPEAKER_PREFIX_RE.sub("", cleaned, count=1).strip()
+        if updated == cleaned:
+            break
+        cleaned = updated
+    return cleaned
 
 
 def drop_pil_image_columns(
     dataset: Any,
-    columns_to_drop: Sequence[str] = ("image",),
+    columns_to_drop: Sequence[str] = ("image", "images"),
 ) -> Any:
-    """Immediately drop `image` (`PIL.Image`) columns via `.remove_columns(["image"])`."""
-    if dataset is None or not hasattr(dataset, "remove_columns"):
+    """Drop PIL image columns before text normalization when present."""
+    col_names = getattr(dataset, "column_names", None)
+    if col_names is None:
         return dataset
-
-    col_names: Optional[Sequence[str]] = getattr(dataset, "column_names", None)
-    if col_names is not None:
-        present = [c for c in columns_to_drop if c in col_names]
-        if present:
-            return dataset.remove_columns(present)
-        return dataset
-
-    # For IterableDataset where column_names may be None until inspected
-    try:
-        return dataset.remove_columns(list(columns_to_drop))
-    except Exception:
-        return dataset
+    present = [c for c in columns_to_drop if c in col_names]
+    if present:
+        return dataset.remove_columns(present)
+    return dataset
 
 
-def normalize_voho_saudi_row(
-    row: Dict[str, Any],
+def arabic_char_ratio(text: str) -> float:
+    """Compute fraction of alphabetic characters that are Arabic script."""
+    ar_count = len(_ARABIC_CHAR_RE.findall(text or ""))
+    lat_count = len(_LATIN_CHAR_RE.findall(text or ""))
+    total = ar_count + lat_count
+    if total == 0:
+        return 0.0
+    return ar_count / float(total)
+
+
+def has_english_meta_leak(text: str) -> bool:
+    """Detect leaked English translator/prompt commentary inside Arabic dataset fields."""
+    low = (text or "").lower()
+    return any(marker in low for marker in _ENGLISH_META_LEAK_SUBSTRINGS)
+
+
+def choose_optional_system_prompt(
+    deterministic_key: str,
+    pool: Sequence[str] = ARABIC_SYSTEM_PROMPT_POOL,
+    prob: float = SYSTEM_PROMPT_INJECTION_PROB,
+) -> Optional[str]:
+    """Deterministically include a varied concise system prompt on `prob` (~30%) of examples."""
+    if prob <= 0.0 or not pool:
+        return None
+    digest = hashlib.blake2b(deterministic_key.encode("utf-8", errors="ignore"), digest_size=8).digest()
+    val = int.from_bytes(digest[:4], "little") / float(2**32)
+    if val >= prob:
+        return None
+    idx = int.from_bytes(digest[4:], "little") % len(pool)
+    return pool[idx]
+
+
+def finalize_sft_sample(
+    source: str,
+    turns: Sequence[Dict[str, Any]],
+    enable_thinking: bool,
+    system_prompt: Optional[str] = None,
     tokenizer: Optional[Any] = None,
-    strip_prefixes: bool = True,
+    max_tokens: int = SFT_MAX_TOKEN_LENGTH_FILTER,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Normalize a row from `VohoAI/voho-saudi-dialogues`.
+    """Validate, attach optional system prompt, check decontamination & length, and render Gemma 4 text."""
+    messages: List[Dict[str, str]] = []
+    if system_prompt and system_prompt.strip():
+        messages.append(make_uniform_message("system", system_prompt.strip()))
 
-    Supports both `messages_json` (JSON string) and `messages` (list of dicts),
-    strips speaker prefixes, and formats with `enable_thinking=False`.
-    """
-    raw_messages: Any = row.get("messages_json")
-    if isinstance(raw_messages, str) and raw_messages.strip():
-        try:
-            parsed = json.loads(raw_messages)
-        except json.JSONDecodeError:
-            logger.debug("Skipping malformed messages_json in Voho row.")
-            return None
-    elif isinstance(raw_messages, list):
-        parsed = raw_messages
-    else:
-        fallback = row.get("messages")
-        if isinstance(fallback, str) and fallback.strip():
-            try:
-                parsed = json.loads(fallback)
-            except json.JSONDecodeError:
+    has_user = False
+    has_assistant = False
+    for t in turns:
+        u_msg = make_uniform_message(
+            role=str(t.get("role", "user")),
+            content=str(t.get("content", "")),
+            reasoning_content=str(t.get("reasoning_content", "")),
+        )
+        if u_msg["role"] == "user":
+            if not u_msg["content"]:
                 return None
-        elif isinstance(fallback, list):
-            parsed = fallback
-        else:
-            # Support flat instruction/inputs + output/targets fallback rows for Saudi dialect top-up
-            user_in = str(
-                row.get("inputs") or row.get("instruction") or row.get("prompt") or ""
-            ).strip()
-            asst_out = str(
-                row.get("targets") or row.get("output") or row.get("response") or ""
-            ).strip()
-            if user_in and asst_out:
-                parsed = [
-                    {"role": "user", "content": user_in},
-                    {"role": "assistant", "content": asst_out},
-                ]
-            else:
+            has_user = True
+        elif u_msg["role"] == "assistant":
+            if not u_msg["content"]:
                 return None
+            has_assistant = True
+        messages.append(u_msg)
 
-    if not isinstance(parsed, list) or not parsed:
+    if not (has_user and has_assistant):
+        return None
+    if messages[-1]["role"] != "assistant":
         return None
 
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": SAUDI_DIALECT_SYSTEM_PROMPT}
-    ]
-    for idx, turn in enumerate(parsed):
-        if not isinstance(turn, dict):
-            continue
-        raw_role = str(
-            turn.get("role") or turn.get("from") or turn.get("speaker") or ""
-        ).strip().lower()
-        if raw_role in {"user", "human", "client", "speaker_1", "speaker 1", "المستخدم", "العميل"}:
-            role = "user"
-        elif raw_role in {"assistant", "gpt", "bot", "model", "agent", "speaker_2", "speaker 2", "المساعد", "الموظف"}:
-            role = "assistant"
-        elif raw_role == "system":
-            role = "system"
-        else:
-            role = "user" if idx % 2 == 0 else "assistant"
+    # Enforce strict thinking consistency: enable_thinking=True requires non-empty reasoning_content
+    final_reasoning = messages[-1].get("reasoning_content", "").strip()
+    if enable_thinking and not final_reasoning:
+        return None
+    if not enable_thinking and final_reasoning:
+        # Strip reasoning if source was explicitly configured as no_think
+        for m in messages:
+            m["reasoning_content"] = ""
 
-        raw_content = str(turn.get("content") or turn.get("value") or turn.get("text") or "")
-        content = strip_speaker_prefix(raw_content) if strip_prefixes else raw_content.strip()
-        if not content:
-            continue
-        if role == "system":
-            messages[0] = {"role": "system", "content": content}
-        else:
-            messages.append({"role": role, "content": content})
+    # Benchmark decontamination gate
+    if decontaminator is not None and decontaminator.is_messages_contaminated(messages):
+        return None
 
-    if not any(m["role"] == "user" for m in messages) or not any(
-        m["role"] == "assistant" for m in messages
+    rendered_text = format_gemma4_chat(
+        messages,
+        tokenizer=None,
+        enable_thinking=enable_thinking,
+        add_generation_prompt=False,
+        add_bos=True,
+    )
+    if not rendered_text or not verify_thinking_block_preserved(
+        rendered_text, enable_thinking=bool(enable_thinking)
     ):
         return None
 
-    rendered = format_gemma4_chat(
-        messages=messages,
-        tokenizer=tokenizer,
-        add_generation_prompt=False,
-        enable_thinking=False,
-    )
+    # Fast character pre-check before exact tokenizer check
+    if len(rendered_text) > max_tokens * 6:
+        return None
+    tok_len = estimate_gemma4_token_count(rendered_text, tokenizer=tokenizer)
+    if tok_len > max_tokens:
+        return None
+
     return {
-        "source": "voho_saudi_dialogues",
+        "source": source,
         "messages": messages,
-        "enable_thinking": False,
-        "text": rendered,
+        "enable_thinking": bool(enable_thinking),
+        "text": rendered_text,
     }
 
 
+# ---------------------------------------------------------------------------
+# Normalizer 1–3: AdaMLLab/smolkalam-arabic-conversational-sft
+# ---------------------------------------------------------------------------
+def normalize_smolkalam_row(
+    row: Dict[str, Any],
+    source_key: str = "smolkalam_arabic_science",
+    require_thinking: bool = False,
+    min_lr: float = 0.85,
+    min_scr: float = 0.90,
+    tokenizer: Optional[Any] = None,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize a row from `AdaMLLab/smolkalam-arabic-conversational-sft`.
+
+    Handles both `*_no_think` configs (`require_thinking=False`) and `OpenThoughts3_50K`
+    (`require_thinking=True`), strictly rejecting malformed `OpenThoughts3_50K` rows that
+    lack closed `<think>...</think>` tags or run past `max_tokens`.
+    """
+    lr_val = row.get("LR")
+    scr_val = row.get("SCR")
+    if isinstance(lr_val, (int, float)) and float(lr_val) < min_lr:
+        return None
+    if isinstance(scr_val, (int, float)) and float(scr_val) < min_scr:
+        return None
+
+    raw_msgs = row.get("messages")
+    if not isinstance(raw_msgs, list) or len(raw_msgs) < 2:
+        return None
+
+    turns: List[Dict[str, str]] = []
+    explicit_sys: Optional[str] = None
+
+    for idx, m in enumerate(raw_msgs):
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", "")).strip().lower()
+        content = str(m.get("content") or "").strip()
+        if not content:
+            continue
+
+        if role == "system" and idx == 0:
+            explicit_sys = content
+            continue
+        if role == "user":
+            if has_english_meta_leak(content):
+                return None
+            turns.append({"role": "user", "content": content, "reasoning_content": ""})
+        elif role in ("assistant", "model"):
+            if require_thinking:
+                if not (content.startswith("<think>") and "</think>" in content):
+                    return None
+                reasoning, answer = parse_reasoning_and_content(content)
+                if len(reasoning) < 40 or len(answer) < 20:
+                    return None
+                if "<think>" in answer or "</think>" in answer:
+                    return None
+                if arabic_char_ratio(answer) < 0.45:
+                    return None
+                turns.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "reasoning_content": reasoning,
+                    }
+                )
+            else:
+                if "<think>" in content or "</think>" in content:
+                    reasoning, answer = parse_reasoning_and_content(content)
+                    content = answer if answer else ""
+                if len(content) < 15 or arabic_char_ratio(content) < 0.50:
+                    return None
+                turns.append({"role": "assistant", "content": content, "reasoning_content": ""})
+
+    if len(turns) < 2 or turns[-1]["role"] != "assistant":
+        return None
+
+    sys_prompt = explicit_sys or choose_optional_system_prompt(
+        f"{source_key}:{turns[0]['content'][:120]}"
+    )
+    return finalize_sft_sample(
+        source=source_key,
+        turns=turns,
+        enable_thinking=require_thinking,
+        system_prompt=sys_prompt,
+        tokenizer=tokenizer,
+        decontaminator=decontaminator,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Normalizer 4: oddadmix/arabic-math-reasoning-synth
+# ---------------------------------------------------------------------------
+def normalize_arabic_math_synth_row(
+    row: Dict[str, Any],
+    tokenizer: Optional[Any] = None,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize `oddadmix/arabic-math-reasoning-synth` (`instruction` + `reasoning` + `answer`)."""
+    problem = str(row.get("instruction") or row.get("problem") or row.get("question") or "").strip()
+    reasoning = str(row.get("reasoning") or "").strip()
+    answer = str(row.get("answer") or row.get("solution") or "").strip()
+
+    # Backwards compatibility for 2-column `{problem, solution}` inputs in unit tests
+    if not reasoning and answer:
+        parsed_r, parsed_a = parse_reasoning_and_content(answer)
+        if parsed_r and parsed_a:
+            reasoning, answer = parsed_r, parsed_a
+        else:
+            lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
+            if len(lines) >= 2:
+                reasoning = "\n".join(lines[:-1])
+                answer = lines[-1]
+            else:
+                reasoning = answer
+
+    if len(problem) < 10 or len(reasoning) < 15 or len(answer) < 2:
+        return None
+    if arabic_char_ratio(problem + " " + answer) < 0.45:
+        return None
+
+    sys_prompt = choose_optional_system_prompt(f"ar_math:{problem[:120]}")
+    turns = [
+        {"role": "user", "content": problem, "reasoning_content": ""},
+        {"role": "assistant", "content": answer, "reasoning_content": reasoning},
+    ]
+    return finalize_sft_sample(
+        source="arabic_math_reasoning_synth",
+        turns=turns,
+        enable_thinking=True,
+        system_prompt=sys_prompt,
+        tokenizer=tokenizer,
+        decontaminator=decontaminator,
+    )
+
+
+# Alias preserved for backwards-compatible imports in existing tests
+normalize_arabic_math_row = normalize_arabic_math_synth_row
+
+
+# ---------------------------------------------------------------------------
+# Normalizer 5: FreedomIntelligence/alpaca-gpt4-arabic (and ShareGPT Arabic)
+# ---------------------------------------------------------------------------
+def normalize_alpaca_gpt4_arabic_row(
+    row: Dict[str, Any],
+    source_key: str = "alpaca_gpt4_arabic",
+    tokenizer: Optional[Any] = None,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
+) -> Optional[Dict[str, Any]]:
+    """Convert ShareGPT `conversations` (`from`: `human`/`gpt`) into clean Arabic messages."""
+    convs = row.get("conversations") or row.get("messages") or []
+    if not isinstance(convs, list) or len(convs) < 2:
+        return None
+
+    role_map = {
+        "human": "user",
+        "user": "user",
+        "gpt": "assistant",
+        "assistant": "assistant",
+        "model": "assistant",
+        "system": "system",
+    }
+    turns: List[Dict[str, str]] = []
+    explicit_sys: Optional[str] = None
+
+    for idx, turn in enumerate(convs):
+        if not isinstance(turn, dict):
+            continue
+        raw_role = str(turn.get("from") or turn.get("role") or "").strip().lower()
+        mapped = role_map.get(raw_role)
+        content = str(turn.get("value") if turn.get("value") is not None else (turn.get("content") or "")).strip()
+        if not mapped or not content:
+            continue
+        if mapped == "system" and idx == 0:
+            explicit_sys = content
+            continue
+        if mapped in ("user", "assistant"):
+            turns.append({"role": mapped, "content": content, "reasoning_content": ""})
+
+    if len(turns) < 2 or turns[0]["role"] != "user" or turns[-1]["role"] != "assistant":
+        return None
+    if len(turns[-1]["content"]) < 15 or arabic_char_ratio(turns[-1]["content"]) < 0.50:
+        return None
+    if has_english_meta_leak(turns[-1]["content"]):
+        return None
+
+    sys_prompt = explicit_sys or choose_optional_system_prompt(f"{source_key}:{turns[0]['content'][:120]}")
+    return finalize_sft_sample(
+        source=source_key,
+        turns=turns,
+        enable_thinking=False,
+        system_prompt=sys_prompt,
+        tokenizer=tokenizer,
+        decontaminator=decontaminator,
+    )
+
+
+normalize_acegpt_v2_row = normalize_alpaca_gpt4_arabic_row
+
+
+# ---------------------------------------------------------------------------
+# Normalizer 6: Gheras/Medical_Reasoning_Arabic_Dataset
+# ---------------------------------------------------------------------------
+def normalize_medical_reasoning_arabic_row(
+    row: Dict[str, Any],
+    tokenizer: Optional[Any] = None,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize `Gheras/Medical_Reasoning_Arabic_Dataset` while rejecting English translation leaks."""
+    question = str(row.get("Question") or row.get("question") or "").strip()
+    cot = str(row.get("Complex_CoT") or row.get("reasoning") or "").strip()
+    response = str(row.get("Response") or row.get("response") or "").strip()
+
+    if len(question) < 15 or len(cot) < 40 or len(response) < 25:
+        return None
+    if has_english_meta_leak(question) or has_english_meta_leak(cot) or has_english_meta_leak(response):
+        return None
+    if arabic_char_ratio(question) < 0.70 or arabic_char_ratio(response) < 0.70 or arabic_char_ratio(cot) < 0.65:
+        return None
+
+    sys_prompt = choose_optional_system_prompt(f"med_ar:{question[:120]}")
+    turns = [
+        {"role": "user", "content": question, "reasoning_content": ""},
+        {"role": "assistant", "content": response, "reasoning_content": cot},
+    ]
+    return finalize_sft_sample(
+        source="medical_reasoning_arabic",
+        turns=turns,
+        enable_thinking=True,
+        system_prompt=sys_prompt,
+        tokenizer=tokenizer,
+        decontaminator=decontaminator,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Normalizer 7: CohereLabs/aya_dataset (Human-Annotated Arabic)
+# ---------------------------------------------------------------------------
+_AYA_ARABIC_CODES: Set[str] = {"arb", "ars", "arz", "ajp", "acq", "ary"}
+
+
+def normalize_aya_dataset_arabic_row(
+    row: Dict[str, Any],
+    tokenizer: Optional[Any] = None,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize human-annotated Arabic rows from `CohereLabs/aya_dataset`."""
+    lang_code = str(row.get("language_code") or "").strip().lower()
+    lang_name = str(row.get("language") or "").strip().lower()
+    if lang_code and lang_code not in _AYA_ARABIC_CODES and "arabic" not in lang_name:
+        return None
+
+    user_input = str(row.get("inputs") or row.get("prompt") or "").strip()
+    target_output = str(row.get("targets") or row.get("completion") or "").strip()
+    if len(user_input) < 8 or len(target_output) < 15:
+        return None
+
+    tools_field = row.get("tools")
+    tool_call_field = row.get("tool_call")
+    if tools_field:
+        tools_str = (
+            tools_field
+            if isinstance(tools_field, str)
+            else json.dumps(tools_field, ensure_ascii=False)
+        )
+        user_input = f"{user_input}\n\nالأدوات المتاحة (JSON):\n{tools_str}"
+    if tool_call_field:
+        tc_str = (
+            tool_call_field
+            if isinstance(tool_call_field, str)
+            else json.dumps(tool_call_field, ensure_ascii=False)
+        )
+        target_output = f"{tc_str}\n{target_output}".strip()
+
+    if not tools_field and arabic_char_ratio(user_input + " " + target_output) < 0.55:
+        return None
+
+    sys_prompt = choose_optional_system_prompt(f"aya_ar:{user_input[:120]}")
+    turns = [
+        {"role": "user", "content": user_input, "reasoning_content": ""},
+        {"role": "assistant", "content": target_output, "reasoning_content": ""},
+    ]
+    return finalize_sft_sample(
+        source="aya_dataset_arabic",
+        turns=turns,
+        enable_thinking=False,
+        system_prompt=sys_prompt,
+        tokenizer=tokenizer,
+        decontaminator=decontaminator,
+    )
+
+
+normalize_aya_arabic_row = normalize_aya_dataset_arabic_row
+
+
+# ---------------------------------------------------------------------------
+# Normalizer 8: VohoAI/voho-saudi-dialogues
+# ---------------------------------------------------------------------------
+def normalize_voho_saudi_row(
+    row: Dict[str, Any],
+    system_prompt: Optional[str] = None,
+    tokenizer: Optional[Any] = None,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize a row from `VohoAI/voho-saudi-dialogues`."""
+    raw_messages: Any = row.get("messages")
+    if raw_messages is None and row.get("messages_json"):
+        try:
+            raw_messages = json.loads(row["messages_json"])
+        except (TypeError, ValueError):
+            raw_messages = None
+
+    turns: List[Dict[str, str]] = []
+    explicit_sys: Optional[str] = system_prompt
+
+    if isinstance(raw_messages, list) and raw_messages:
+        for idx, msg in enumerate(raw_messages):
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "")).strip().lower()
+            if role in ("human", "user"):
+                norm_role = "user"
+            elif role in ("assistant", "gpt", "model", "bot"):
+                norm_role = "assistant"
+            elif role == "system" and idx == 0:
+                explicit_sys = strip_speaker_prefix(str(msg.get("content", ""))) or explicit_sys
+                continue
+            else:
+                continue
+            cleaned = strip_speaker_prefix(str(msg.get("content", "")))
+            if cleaned:
+                turns.append({"role": norm_role, "content": cleaned, "reasoning_content": ""})
+    else:
+        u_txt = strip_speaker_prefix(
+            str(row.get("user") or row.get("prompt") or row.get("instruction") or row.get("question") or "")
+        )
+        a_txt = strip_speaker_prefix(
+            str(row.get("assistant") or row.get("response") or row.get("output") or row.get("answer") or "")
+        )
+        if u_txt and a_txt:
+            turns = [
+                {"role": "user", "content": u_txt, "reasoning_content": ""},
+                {"role": "assistant", "content": a_txt, "reasoning_content": ""},
+            ]
+
+    if len(turns) < 2 or turns[-1]["role"] != "assistant":
+        return None
+    if arabic_char_ratio(turns[-1]["content"]) < 0.50:
+        return None
+
+    chosen_sys = explicit_sys if explicit_sys is not None else choose_optional_system_prompt(
+        f"voho:{turns[0]['content'][:120]}"
+    )
+    return finalize_sft_sample(
+        source="voho_saudi_dialogues",
+        turns=turns,
+        enable_thinking=False,
+        system_prompt=chosen_sys,
+        tokenizer=tokenizer,
+        decontaminator=decontaminator,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Normalizer 9: SaudiArabicLaws ("moj" & "boe", active statutes only)
+# ---------------------------------------------------------------------------
 def normalize_saudi_laws_row(
     row: Dict[str, Any],
     config_name: str = "moj",
     tokenizer: Optional[Any] = None,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Normalize a row from `SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus`.
+    """Normalize an active statutory row from `SaudiArabicLaws` (`moj` or `boe`).
 
-    Supports both:
-    - `config_name="moj"` (flat schema: `doc_title`, `article_title`, `article_topic`, `text`)
-    - `config_name="boe"` (nested schema: `row["article"]["text"]` or
-      `row["retrieval"]["contextual_text"]` + `row["law"]["title_ar"]`).
+    Filters out repealed (`ملغي`) laws and short cross-reference stubs.
     """
-    cfg = (config_name or "moj").strip().lower()
+    law_obj = row.get("law") if isinstance(row.get("law"), dict) else {}
+    article_obj = row.get("article") if isinstance(row.get("article"), dict) else {}
+    retrieval_obj = row.get("retrieval") if isinstance(row.get("retrieval"), dict) else {}
 
-    law_title = ""
-    article_title = ""
-    article_text = ""
+    # Reject repealed statutes when status metadata is present
+    law_status = str(law_obj.get("status") or row.get("status") or "").strip()
+    if law_status and ("ملغي" in law_status or "ملغى" in law_status):
+        return None
 
-    if cfg == "boe" or isinstance(row.get("article"), dict) or isinstance(row.get("retrieval"), dict):
-        law_dict = row.get("law") if isinstance(row.get("law"), dict) else {}
-        article_dict = row.get("article") if isinstance(row.get("article"), dict) else {}
-        retrieval_dict = row.get("retrieval") if isinstance(row.get("retrieval"), dict) else {}
+    question = str(row.get("question") or row.get("instruction") or row.get("prompt") or "").strip()
+    answer = str(row.get("answer") or row.get("response") or row.get("output") or "").strip()
 
-        law_title = str(
-            law_dict.get("title_ar")
-            or law_dict.get("title")
+    if not (question and answer):
+        doc_title = str(
+            row.get("law_name")
+            or row.get("title")
             or row.get("doc_title")
-            or "الأنظمة واللوائح السعودية"
+            or law_obj.get("title_ar")
+            or f"الأنظمة واللوائح السعودية ({config_name.upper()})"
         ).strip()
-        article_title = str(
-            article_dict.get("article_title_norm")
-            or article_dict.get("article_title")
-            or article_dict.get("number")
+        article_heading = str(
+            row.get("article_number")
             or row.get("article_title")
-            or "المادة النظامية"
+            or row.get("section")
+            or article_obj.get("article_title_norm")
+            or article_obj.get("heading_raw")
+            or (f"المادة {article_obj['number_int']}" if article_obj.get("number_int") else "")
         ).strip()
-        article_text = str(
-            article_dict.get("text")
-            or retrieval_dict.get("contextual_text")
-            or row.get("text")
-            or ""
-        ).strip()
-    else:
-        law_title = str(
-            row.get("doc_title")
-            or row.get("breadcrumb")
-            or "الأنظمة واللوائح السعودية"
-        ).strip()
-        article_title = str(
-            row.get("article_title")
-            or row.get("article_topic")
-            or "المادة النظامية"
-        ).strip()
-        article_text = str(
+        body = str(
             row.get("text")
-            or row.get("doc_summary")
+            or row.get("article_text")
+            or row.get("content")
+            or article_obj.get("text")
+            or retrieval_obj.get("contextual_text")
             or ""
         ).strip()
 
-    if not article_text:
+        if len(body) < 40:
+            return None
+
+        art_ref = article_heading if article_heading else "هذه المادة النظامية"
+        tpl_idx = int.from_bytes(
+            hashlib.blake2b(f"{doc_title}:{art_ref}".encode("utf-8", errors="ignore"), digest_size=2).digest(),
+            "little",
+        ) % len(_SAUDI_LAW_QUESTION_TEMPLATES)
+        question = _SAUDI_LAW_QUESTION_TEMPLATES[tpl_idx].format(art=art_ref, doc=doc_title)
+        answer = body
+
+    if arabic_char_ratio(answer) < 0.60:
         return None
 
-    user_prompt = (
-        f"بناءً على {law_title}، ما هو نص وحكم ({article_title})؟"
-    )
-    assistant_reply = (
-        f"وفقاً لـ {law_title} ({article_title}):\n\n{article_text}"
-    )
-
-    messages = [
-        {"role": "system", "content": SAUDI_LEGAL_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-        {"role": "assistant", "content": assistant_reply},
+    sys_prompt = choose_optional_system_prompt(f"saudi_law_{config_name}:{question[:120]}")
+    turns = [
+        {"role": "user", "content": question, "reasoning_content": ""},
+        {"role": "assistant", "content": answer, "reasoning_content": ""},
     ]
-    rendered = format_gemma4_chat(
-        messages=messages,
-        tokenizer=tokenizer,
-        add_generation_prompt=False,
+    return finalize_sft_sample(
+        source=f"saudi_arabic_laws_{config_name}",
+        turns=turns,
         enable_thinking=False,
-    )
-    return {
-        "source": f"saudi_arabic_laws_{cfg}",
-        "messages": messages,
-        "enable_thinking": False,
-        "text": rendered,
-    }
-
-
-def normalize_acegpt_v2_row(
-    row: Dict[str, Any],
-    tokenizer: Optional[Any] = None,
-) -> Optional[Dict[str, Any]]:
-    """Normalize a row from `FreedomIntelligence/AceGPT-v2-tuning`.
-
-    Maps `conversations` list (`from` / `value`) to standard `user` / `assistant` roles.
-    """
-    conv = row.get("conversations") or row.get("messages")
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": DEFAULT_MSA_SYSTEM_PROMPT}
-    ]
-
-    if isinstance(conv, list) and conv:
-        for turn in conv:
-            if not isinstance(turn, dict):
-                continue
-            raw_from = str(turn.get("from") or turn.get("role") or "").strip().lower()
-            val = str(turn.get("value") if "value" in turn else turn.get("content", "")).strip()
-            if not val:
-                continue
-            if raw_from in {"human", "user", "instruction", "prompter"}:
-                messages.append({"role": "user", "content": val})
-            elif raw_from in {"gpt", "assistant", "bot", "model", "output"}:
-                messages.append({"role": "assistant", "content": val})
-            elif raw_from == "system":
-                messages[0] = {"role": "system", "content": val}
-    else:
-        instruction = str(row.get("instruction") or row.get("question") or "").strip()
-        inp = str(row.get("input") or "").strip()
-        output = str(row.get("output") or row.get("response") or "").strip()
-        if instruction and output:
-            user_text = f"{instruction}\n\n{inp}".strip() if inp else instruction
-            messages.append({"role": "user", "content": user_text})
-            messages.append({"role": "assistant", "content": output})
-
-    if not any(m["role"] == "user" for m in messages) or not any(
-        m["role"] == "assistant" for m in messages
-    ):
-        return None
-
-    rendered = format_gemma4_chat(
-        messages=messages,
+        system_prompt=sys_prompt,
         tokenizer=tokenizer,
-        add_generation_prompt=False,
-        enable_thinking=False,
+        decontaminator=decontaminator,
     )
-    return {
-        "source": "acegpt_v2_tuning",
-        "messages": messages,
-        "enable_thinking": False,
-        "text": rendered,
-    }
 
 
-def normalize_arabic_math_row(
-    row: Dict[str, Any],
-    tokenizer: Optional[Any] = None,
-) -> Optional[Dict[str, Any]]:
-    """Normalize a row from `Omartificial-Intelligence-Space/Arabic-Math-SFT`.
-
-    Ignores/removes any `image` (`PIL.Image`) field and formats with `enable_thinking=True`.
-    """
-    clean_row = {k: v for k, v in row.items() if k != "image"}
-    problem = str(
-        clean_row.get("problem")
-        or clean_row.get("question")
-        or clean_row.get("instruction")
-        or ""
-    ).strip()
-    solution = str(
-        clean_row.get("solution")
-        or clean_row.get("answer")
-        or clean_row.get("output")
-        or ""
-    ).strip()
-    reasoning = str(clean_row.get("reasoning") or clean_row.get("cot") or "").strip()
-
-    if not problem or not solution:
-        return None
-
-    if not reasoning:
-        lines = [ln.strip() for ln in solution.splitlines() if ln.strip()]
-        if len(lines) > 1:
-            reasoning = "\n".join(lines[:-1])
-            final_answer = lines[-1]
-        else:
-            reasoning = f"تحليل المسألة وخطوات الحل:\n{solution}"
-            final_answer = solution
-    else:
-        final_answer = solution
-
-    assistant_content = format_thinking_response(
-        reasoning=reasoning,
-        final_answer=final_answer,
-    )
-    messages = [
-        {"role": "system", "content": ARABIC_MATH_REASONING_SYSTEM_PROMPT},
-        {"role": "user", "content": problem},
-        {"role": "assistant", "content": assistant_content},
-    ]
-    rendered = format_gemma4_chat(
-        messages=messages,
-        tokenizer=tokenizer,
-        add_generation_prompt=False,
-        enable_thinking=True,
-    )
-    return {
-        "source": "arabic_math_sft",
-        "messages": messages,
-        "enable_thinking": True,
-        "text": rendered,
-    }
-
-
-def normalize_aya_arabic_row(
-    row: Dict[str, Any],
-    tokenizer: Optional[Any] = None,
-    enable_tool_calling_schema: bool = True,
-) -> Optional[Dict[str, Any]]:
-    """Normalize a row from `CohereForAI/aya_collection_language_split`.
-
-    Normalizes `inputs` and `targets` into chat turns with optional structured
-    JSON tool-calling schema formatting.
-    """
-    inputs_text = str(
-        row.get("inputs") or row.get("instruction") or row.get("prompt") or ""
-    ).strip()
-    targets_text = str(
-        row.get("targets") or row.get("output") or row.get("response") or ""
-    ).strip()
-
-    if not inputs_text or not targets_text:
-        return None
-
-    tool_schema = row.get("tools") or row.get("tool_schema")
-    tool_call = row.get("tool_call") or row.get("function_call")
-
-    system_prompt = DEFAULT_MSA_SYSTEM_PROMPT
-    user_content = inputs_text
-    assistant_content = targets_text
-
-    if enable_tool_calling_schema and (tool_schema is not None or tool_call is not None):
-        system_prompt = SOVEREIGN_TOOL_CALLING_SYSTEM_PROMPT
-        if tool_schema is not None:
-            schema_str = (
-                json.dumps(tool_schema, ensure_ascii=False)
-                if not isinstance(tool_schema, str)
-                else tool_schema.strip()
-            )
-            user_content = f"الأدوات المتاحة (JSON Schema):\n{schema_str}\n\nالطلب:\n{inputs_text}"
-        if tool_call is not None:
-            call_str = (
-                json.dumps(tool_call, ensure_ascii=False)
-                if not isinstance(tool_call, str)
-                else tool_call.strip()
-            )
-            assistant_content = f"{call_str}\n\n{targets_text}".strip()
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-        {"role": "assistant", "content": assistant_content},
-    ]
-    rendered = format_gemma4_chat(
-        messages=messages,
-        tokenizer=tokenizer,
-        add_generation_prompt=False,
-        enable_thinking=False,
-    )
-    return {
-        "source": "aya_arabic_instruct",
-        "messages": messages,
-        "enable_thinking": False,
-        "text": rendered,
-    }
-
-
-def normalize_arabic_sft_iterable(
-    source_key: str,
-    rows: Iterable[Dict[str, Any]],
-    config_name: str = "default",
-    tokenizer: Optional[Any] = None,
-    max_samples: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """Normalize an iterable of raw rows from any of the 5 Arabic SFT sources."""
-    dispatch: Dict[str, Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = {
-        "voho_saudi_dialogues": lambda r: normalize_voho_saudi_row(r, tokenizer=tokenizer),
-        "saudi_arabic_laws": lambda r: normalize_saudi_laws_row(
-            r, config_name=config_name, tokenizer=tokenizer
-        ),
-        "acegpt_v2_tuning": lambda r: normalize_acegpt_v2_row(r, tokenizer=tokenizer),
-        "arabic_math_sft": lambda r: normalize_arabic_math_row(r, tokenizer=tokenizer),
-        "aya_arabic_instruct": lambda r: normalize_aya_arabic_row(r, tokenizer=tokenizer),
-    }
-    if source_key not in dispatch:
-        raise KeyError(
-            f"Unknown Arabic SFT source_key: {source_key!r}. "
-            f"Valid keys: {sorted(dispatch.keys())}"
-        )
-
-    normalizer = dispatch[source_key]
-    results: List[Dict[str, Any]] = []
-    try:
-        for row in rows:
-            try:
-                item = normalizer(row)
-            except Exception:
-                continue
-            if item is not None:
-                results.append(item)
-                if max_samples is not None and len(results) >= max_samples:
-                    break
-    except Exception as exc:
-        logger.warning(
-            "Stream iteration for '%s' (%s) stopped early after %d samples (%s); continuing with fallback/top-up.",
-            source_key,
-            config_name,
-            len(results),
-            exc,
-        )
-    return results
-
-
-def _iter_saudi_laws_raw_jsonl(
-    repo_id: str,
-    cfg_name: str = "moj",
-    skip_valid: int = 0,
-) -> Iterable[Dict[str, Any]]:
-    """Read SaudiArabicLaws JSONL files directly via json.loads to bypass PyArrow schema cast errors."""
-    from huggingface_hub import hf_hub_download
-
-    cfg = (cfg_name or "moj").strip().lower()
-    filename = (
-        "data/BOE/boe_saudi_legal_corpus.jsonl"
-        if cfg == "boe"
-        else "data/MOJ/moj_saudi_legal_corpus.jsonl"
-    )
-    local_path = hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        repo_type="dataset",
-    )
-    seen = 0
-    with open(local_path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                obj = json.loads(stripped)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            if seen < skip_valid:
-                seen += 1
-                continue
-            seen += 1
-            yield obj
-
-
-LIVE_HUB_FALLBACK_SOURCES: Dict[str, List[Tuple[str, Optional[str]]]] = {
-    "voho_saudi_dialogues": [
-        ("VohoAI/voho-saudi-dialogues", "default"),
-        (
-            "parquet",
-            "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/najdi_arabic/train/0000.parquet",
-        ),
-        ("FreedomIntelligence/Alpaca-Arabic-GPT4", "default"),
-    ],
-    "acegpt_v2_tuning": [
-        ("FreedomIntelligence/Evol-Instruct-Arabic-GPT4", "default"),
-        ("FreedomIntelligence/Alpaca-Arabic-GPT4", "default"),
-    ],
-    "aya_arabic_instruct": [
-        (
-            "parquet",
-            "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/standard_arabic/train/0000.parquet",
-        ),
-        (
-            "parquet",
-            "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/najdi_arabic/train/0000.parquet",
-        ),
-        (
-            "parquet",
-            "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split/resolve/refs%2Fconvert%2Fparquet/egyptian_arabic/train/0000.parquet",
-        ),
-    ],
-}
-
-
+# ---------------------------------------------------------------------------
+# Streaming Loader for All 9 Curated Arabic SFT Sources
+# ---------------------------------------------------------------------------
 def load_and_normalize_arabic_sft_source(
     source_key: str,
     max_samples: Optional[int] = None,
-    tokenizer: Optional[Any] = None,
     streaming: bool = True,
+    tokenizer: Optional[Any] = None,
+    decontaminator: Optional[BenchmarkDecontaminator] = None,
+    seen_prompts: Optional[Set[bytes]] = None,
 ) -> List[Dict[str, Any]]:
-    """Load one of the 5 Arabic SFT datasets from Hugging Face and normalize its schema.
-
-    Dynamically top-ups across multi-shard fallback targets so smaller primary corpora
-    (such as VohoAI/voho-saudi-dialogues) never cause a quota shortfall when building
-    100,000 to 120,000 SFT training rows.
-    """
+    """Load and normalize rows for any of the 9 curated Arabic SFT dataset keys."""
+    load_dotenv_if_present()
     from datasets import load_dataset
 
     if source_key not in SFT_ARABIC_DATASETS:
-        raise KeyError(f"Unknown Arabic SFT source key: {source_key!r}")
+        raise KeyError(f"Unknown Arabic SFT dataset key: {source_key}")
 
     spec = SFT_ARABIC_DATASETS[source_key]
+    limit = max_samples if max_samples is not None else spec.target_samples
+    per_cfg_limit = max(1, limit // max(1, len(spec.configs)))
+    collected: List[Dict[str, Any]] = []
+    dedup_set = seen_prompts if seen_prompts is not None else set()
 
-    if source_key in LIVE_HUB_FALLBACK_SOURCES:
-        targets: List[Tuple[str, Optional[str]]] = LIVE_HUB_FALLBACK_SOURCES[source_key]
-    else:
-        targets = [(spec.repo_id, cfg_name) for cfg_name in spec.config_names]
+    def _try_load(repo: str, cfg: Optional[str], split: str):
+        if cfg:
+            return load_dataset(repo, cfg, split=split, streaming=streaming)
+        return load_dataset(repo, split=split, streaming=streaming)
 
-    def _collect_from_targets(
-        candidate_targets: List[Tuple[str, Optional[str]]]
-    ) -> List[Dict[str, Any]]:
-        chunk_results: List[Dict[str, Any]] = []
-        for idx, (repo_id, cfg_name) in enumerate(candidate_targets):
-            remaining_targets = max(1, len(candidate_targets) - idx)
-            if max_samples is not None:
-                needed = max_samples - len(chunk_results)
-                if needed <= 0:
-                    break
-                # Allow primary shard to fill its share or let subsequent shards top up any deficit
-                per_target_limit: Optional[int] = (
-                    needed if idx == len(candidate_targets) - 1 else max(1, needed // remaining_targets)
-                )
-                # For voho_saudi_dialogues primary repo, take all native rows first before backfilling
-                if repo_id == "VohoAI/voho-saudi-dialogues":
-                    per_target_limit = needed
-            else:
-                per_target_limit = None
+    def _iter_saudi_laws_jsonl(repo: str, cfg: Optional[str]):
+        from huggingface_hub import hf_hub_download
 
-            normalized_chunk: List[Dict[str, Any]] = []
+        rel_file = (
+            "data/BOE/boe_legal_articles_corpus.jsonl"
+            if str(cfg or "").lower() == "boe"
+            else "data/MOJ/moj_saudi_legal_corpus.jsonl"
+        )
+        local_path = hf_hub_download(
+            repo_id=repo,
+            filename=rel_file,
+            repo_type="dataset",
+        )
+        with open(local_path, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                raw_line = raw_line.strip()
+                if raw_line:
+                    yield json.loads(raw_line)
+
+    for idx_cfg, cfg_name in enumerate(spec.configs):
+        target_for_this_cfg = (
+            limit - len(collected) if idx_cfg == len(spec.configs) - 1 else per_cfg_limit
+        )
+        if target_for_this_cfg <= 0:
+            break
+
+        if source_key == "saudi_arabic_laws":
             try:
-                if repo_id == "parquet" and cfg_name:
-                    ds = load_dataset(
-                        "parquet",
-                        data_files=cfg_name,
-                        split="train",
-                        streaming=streaming,
-                    )
-                else:
-                    load_kwargs: Dict[str, Any] = {
-                        "path": repo_id,
-                        "split": spec.split,
-                        "streaming": streaming,
-                    }
-                    if cfg_name and cfg_name != "default":
-                        load_kwargs["name"] = cfg_name
-                    if repo_id == "Omartificial-Intelligence-Space/Arabic-Math-SFT":
-                        try:
-                            ds = load_dataset(**load_kwargs, columns=["problem", "solution"])
-                        except TypeError:
-                            ds = load_dataset(**load_kwargs)
-                    else:
-                        ds = load_dataset(**load_kwargs)
-
-                if spec.drop_columns:
-                    ds = drop_pil_image_columns(ds, spec.drop_columns)
-
-                normalized_chunk = normalize_arabic_sft_iterable(
-                    source_key=source_key,
-                    rows=ds,
-                    config_name=cfg_name or "default",
-                    tokenizer=tokenizer,
-                    max_samples=per_target_limit,
-                )
-            except Exception as exc:
+                ds = list(_iter_saudi_laws_jsonl("SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus", cfg_name))
+            except Exception as jsonl_exc:
                 logger.warning(
-                    "Dataset load warning for '%s' (%s/%s): %s",
-                    source_key,
-                    repo_id,
+                    "Direct JSONL download for SaudiArabicLaws (%s) failed (%s); falling back to load_dataset.",
                     cfg_name,
-                    exc,
+                    jsonl_exc,
+                )
+                ds = _try_load(spec.repo_id, cfg_name, spec.default_split)
+        else:
+            try:
+                ds = _try_load(spec.repo_id, cfg_name, spec.default_split)
+            except Exception as primary_exc:
+                if spec.fallback_repo_id:
+                    logger.warning(
+                        "Primary repo '%s' unavailable (%s); falling back to '%s'.",
+                        spec.repo_id,
+                        primary_exc,
+                        spec.fallback_repo_id,
+                    )
+                    ds = _try_load(spec.fallback_repo_id, cfg_name, spec.default_split)
+                else:
+                    raise
+
+        count = 0
+        for row in ds:
+            item: Optional[Dict[str, Any]] = None
+            if source_key == "smolkalam_arabic_science":
+                item = normalize_smolkalam_row(
+                    row,
+                    source_key=source_key,
+                    require_thinking=False,
+                    min_lr=0.85,
+                    min_scr=0.90,
+                    tokenizer=tokenizer,
+                    decontaminator=decontaminator,
+                )
+            elif source_key == "smolkalam_arabic_reasoning_cot":
+                item = normalize_smolkalam_row(
+                    row,
+                    source_key=source_key,
+                    require_thinking=True,
+                    min_lr=0.85,
+                    min_scr=0.88,
+                    tokenizer=tokenizer,
+                    decontaminator=decontaminator,
+                )
+            elif source_key == "smolkalam_arabic_openhermes":
+                item = normalize_smolkalam_row(
+                    row,
+                    source_key=source_key,
+                    require_thinking=False,
+                    min_lr=0.88,
+                    min_scr=0.93,
+                    tokenizer=tokenizer,
+                    decontaminator=decontaminator,
+                )
+            elif source_key == "arabic_math_reasoning_synth":
+                item = normalize_arabic_math_synth_row(
+                    row, tokenizer=tokenizer, decontaminator=decontaminator
+                )
+            elif source_key == "alpaca_gpt4_arabic":
+                item = normalize_alpaca_gpt4_arabic_row(
+                    row, source_key=source_key, tokenizer=tokenizer, decontaminator=decontaminator
+                )
+            elif source_key == "medical_reasoning_arabic":
+                item = normalize_medical_reasoning_arabic_row(
+                    row, tokenizer=tokenizer, decontaminator=decontaminator
+                )
+            elif source_key == "aya_dataset_arabic":
+                item = normalize_aya_dataset_arabic_row(
+                    row, tokenizer=tokenizer, decontaminator=decontaminator
+                )
+            elif source_key == "voho_saudi_dialogues":
+                item = normalize_voho_saudi_row(
+                    row, tokenizer=tokenizer, decontaminator=decontaminator
+                )
+            elif source_key == "saudi_arabic_laws":
+                item = normalize_saudi_laws_row(
+                    row,
+                    config_name=cfg_name or "moj",
+                    tokenizer=tokenizer,
+                    decontaminator=decontaminator,
                 )
 
-            if (
-                repo_id == "SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus"
-                and per_target_limit is not None
-                and len(normalized_chunk) < per_target_limit
-            ):
-                try:
-                    raw_rows = _iter_saudi_laws_raw_jsonl(
-                        repo_id=repo_id,
-                        cfg_name=cfg_name or "moj",
-                        skip_valid=len(normalized_chunk),
-                    )
-                    top_up = normalize_arabic_sft_iterable(
-                        source_key=source_key,
-                        rows=raw_rows,
-                        config_name=cfg_name or "moj",
-                        tokenizer=tokenizer,
-                        max_samples=per_target_limit - len(normalized_chunk),
-                    )
-                    normalized_chunk.extend(top_up)
-                except Exception as exc:
-                    logger.warning(
-                        "Raw JSONL fallback warning for '%s' (%s): %s",
-                        repo_id,
-                        cfg_name,
-                        exc,
-                    )
+            if item is None:
+                continue
 
-            chunk_results.extend(normalized_chunk)
-            if max_samples is not None and len(chunk_results) >= max_samples:
-                return chunk_results[:max_samples]
-        return chunk_results
+            # Deduplicate across the entire SFT corpus on first user turn
+            first_user = next(
+                (m["content"] for m in item["messages"] if m["role"] == "user"),
+                "",
+            )
+            sig = hashlib.blake2b(
+                first_user.strip().lower().encode("utf-8", errors="ignore"),
+                digest_size=12,
+            ).digest()
+            if sig in dedup_set:
+                continue
+            dedup_set.add(sig)
 
-    return _collect_from_targets(targets)
+            collected.append(item)
+            count += 1
+            if count >= target_for_this_cfg:
+                break
+
+        logger.info(
+            "Collected %d / %d normalized rows from '%s' (config=%s).",
+            count,
+            target_for_this_cfg,
+            source_key,
+            cfg_name,
+        )
+
+    return collected

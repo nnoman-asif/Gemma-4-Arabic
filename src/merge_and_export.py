@@ -1,20 +1,23 @@
-"""TIES-Merging checkpoint interpolation, multimodal tower restoration, and export CLI.
+"""Standalone 16-bit BF16 checkpoint merge, canonical processor restoration, and verification CLI.
 
-Implements:
-1. TIES-Merging (Trim, Elect Sign, Disjoint Merge) and alpha interpolation (`lambda=0.85`):
-   - Trims redundant small parameter deltas below top `density` (`0.70`) magnitude.
-   - Resolves sign conflicts across Stage 1 SFT and Stage 2 DPO task vectors.
-   - Scales the merged delta by `lambda=0.85` (`W_final = W_base + lambda * Delta_TIES`)
-     to guarantee zero catastrophic forgetting on baseline English/Math/Code benchmarks.
-2. Clean restoration of `audio_tower`, `vision_tower`, and `embed_tokens_per_layer`
-   (removing CPU offload hooks) before final checkpoint serialization.
-3. Export to 16-bit BF16 Safetensors (`merged_16bit`) and GGUF (`q4_k_m`, `q8_0`, `f16`).
+Key architectural guarantees:
+1. Cleanly merges the trained Stage 2 DPO adapter (`W_final = W_base + lambda * Delta_DPO`,
+   with lossless `lambda=1.0, density=1.0` default across both 2D Dense Linear LoRAs and
+   3D Sparse MoE `ParamWrapper` routed-expert LoRAs) via Unsloth `save_pretrained_merged`.
+2. Never exports 4-bit `bitsandbytes` quantized tensors into `merged_16bit`.
+3. Restores canonical upstream `config.json` (`use_cache: true`, `tie_word_embeddings: true`,
+   no `quantization_config`), `chat_template.jinja`, `processor_config.json`, `generation_config.json`,
+   and `tokenizer_config.json` (`eos_token: "<turn|>"`).
+4. Runs `verify_merged_checkpoint` asserting BF16 safetensors total byte size (`>= 8.0 GB` for E4B,
+   `>= 45.0 GB` for 26B-A4B), zero quantization state keys, and intact native Gemma 4 chat template.
 """
 
 import argparse
 import json
 import logging
 import pathlib
+import shutil
+import struct
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -24,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.model_loader import (
     configure_clean_logging,
+    atomic_write_json,
     ensure_tied_lm_head,
     ensure_unsloth_builtins,
     load_gemma4_8gb_model_and_tokenizer,
@@ -44,9 +48,13 @@ from src.constants import (
     DEFAULT_MAX_SEQ_LENGTH,
     DEFAULT_TIES_DENSITY,
     DEFAULT_TIES_LAMBDA,
+    PRIMARY_MODEL_ID,
+    PRIMARY_MODEL_ID_26B,
+    load_dotenv_if_present,
 )
 from src.vram_hooks import restore_multimodal_towers
 
+load_dotenv_if_present()
 logger = logging.getLogger(__name__)
 
 
@@ -79,13 +87,7 @@ def ties_merge_deltas(
     weights: Optional[Sequence[float]] = None,
     density: float = DEFAULT_TIES_DENSITY,
 ) -> torch.Tensor:
-    """Merge one or more parameter delta tensors using TIES-Merging.
-
-    Steps:
-    1. Trim: retain only the top-`density` magnitude entries of each delta.
-    2. Elect Sign: compute the aggregate weighted sign vector across trimmed deltas.
-    3. Disjoint Merge: average only the delta entries whose sign matches the elected sign.
-    """
+    """Merge one or more parameter delta tensors using TIES-Merging."""
     if not deltas:
         raise ValueError("deltas sequence cannot be empty.")
 
@@ -166,115 +168,54 @@ def scale_and_trim_peft_lora_weights(
     density: float = DEFAULT_TIES_DENSITY,
     sft_adapter_state: Optional[Dict[str, torch.Tensor]] = None,
 ) -> int:
-    """Apply TIES trimming (`density`) and interpolation (`lambda_scale`) to active LoRA weights.
+    """Optionally scale (`lambda_scale`) or TIES-trim (`density`) active LoRA `lora_B` tensors.
 
-    Avoids double-trimming `lora_A` and `lora_B` independently: when `sft_adapter_state` is
-    provided, merges the SFT and DPO `lora_B` tensors via `ties_merge_deltas` before applying
-    `lambda_scale`. Otherwise trims and scales `lora_B` directly while keeping `lora_A` intact
-    as the input projection basis.
+    When `lambda_scale == 1.0`, `density == 1.0`, and `sft_adapter_state is None` (default),
+    performs a lossless no-op (`return 0`) so 100% of trained Stage 2 DPO 2D & 3D MoE LoRA
+    weights merge cleanly without unstructured rank sparsification.
     """
+    if abs(float(lambda_scale) - 1.0) < 1e-7 and float(density) >= 1.0 and sft_adapter_state is None:
+        logger.info("Lossless LoRA merge selected (lambda=1.00, density=1.00); preserving exact adapter weights.")
+        return 0
+
     modified_count = 0
-    sft_merged_count = 0
-    handled_param_ids: set[int] = set()
-
-    def _find_sft_tensor(base_key: str) -> Optional[torch.Tensor]:
-        if sft_adapter_state is None:
-            return None
-        candidates = (
-            base_key,
-            base_key.replace(".default.", "."),
-            base_key.replace(".lora_A.weight", ".lora_A.default.weight"),
-            base_key.replace(".lora_B.weight", ".lora_B.default.weight"),
-        )
-        for cand in candidates:
-            if cand in sft_adapter_state:
-                return sft_adapter_state[cand]
-            if (
-                cand.startswith("base_model.model.")
-                and cand[len("base_model.model.") :] in sft_adapter_state
-            ):
-                return sft_adapter_state[cand[len("base_model.model.") :]]
-            prefixed = f"base_model.model.{cand}"
-            if prefixed in sft_adapter_state:
-                return sft_adapter_state[prefixed]
-        return None
-
-    if sft_adapter_state is not None:
-        for mod_name, mod in model.named_modules():
-            if (
-                hasattr(mod, "base_layer")
-                and hasattr(mod, "lora_A")
-                and hasattr(mod, "lora_B")
-                and isinstance(getattr(mod, "lora_A", None), (dict, nn.ModuleDict))
-                and isinstance(getattr(mod, "lora_B", None), (dict, nn.ModuleDict))
-                and "default" in mod.lora_A
-                and "default" in mod.lora_B
-                and hasattr(mod.base_layer, "weight")
-            ):
-                sft_A = _find_sft_tensor(f"{mod_name}.lora_A.default.weight")
-                sft_B = _find_sft_tensor(f"{mod_name}.lora_B.default.weight")
-                if sft_A is not None and sft_B is not None:
-                    base_w = mod.base_layer.weight
-                    dev = base_w.device
-                    scaling_attr = getattr(mod, "scaling", 1.0)
-                    scale = (
-                        float(scaling_attr.get("default", 1.0))
-                        if isinstance(scaling_attr, dict)
-                        else float(scaling_attr)
-                    )
-                    A_dpo = mod.lora_A["default"].weight.data.to(device=dev, dtype=torch.float32)
-                    B_dpo = mod.lora_B["default"].weight.data.to(device=dev, dtype=torch.float32)
-                    delta_w_sft = scale * (
-                        sft_B.to(device=dev, dtype=torch.float32)
-                        @ sft_A.to(device=dev, dtype=torch.float32)
-                    )
-                    delta_w_dpo = scale * (B_dpo @ A_dpo)
-                    merged_delta_w = ties_merge_deltas(
-                        deltas=[delta_w_sft, delta_w_dpo],
-                        weights=[0.65, 0.35],
-                        density=density,
-                    )
-                    base_w.data.copy_(
-                        (base_w.data.to(torch.float32) + float(lambda_scale) * merged_delta_w).to(
-                            base_w.dtype
-                        )
-                    )
-                    mod.lora_B["default"].weight.data.zero_()
-                    mod.lora_A["default"].weight.data.zero_()
-                    handled_param_ids.add(id(mod.lora_B["default"].weight))
-                    modified_count += 1
-                    sft_merged_count += 1
-
     for name, param in model.named_parameters():
-        if "lora_B" in name and id(param) not in handled_param_ids:
-            sft_tensor = _find_sft_tensor(name)
-            if sft_tensor is not None:
-                merged_b = ties_merge_deltas(
-                    deltas=[sft_tensor.to(param.device), param.data],
-                    weights=[0.65, 0.35],
-                    density=density,
-                )
-                sft_merged_count += 1
-            else:
-                merged_b = ties_trim_tensor(param.data, density=density)
-            param.data.copy_(merged_b * float(lambda_scale))
+        if "lora_B" in name and ".ref." not in name:
+            updated = param.data
+            if float(density) < 1.0:
+                updated = ties_trim_tensor(updated, density=float(density))
+            if abs(float(lambda_scale) - 1.0) >= 1e-7:
+                updated = updated * float(lambda_scale)
+            param.data.copy_(updated)
             modified_count += 1
+
     logger.info(
-        "scale_and_trim_peft_lora_weights: modified=%d lora_B tensors (sft_ties_merged=%d, solo_trimmed=%d, lambda=%.2f, density=%.2f)",
+        "Scaled/trimmed %d lora_B tensors (lambda=%.2f, density=%.2f).",
         modified_count,
-        sft_merged_count,
-        modified_count - sft_merged_count,
         float(lambda_scale),
         float(density),
     )
     return modified_count
 
 
+def _read_safetensors_header_keys(st_path: pathlib.Path) -> List[str]:
+    with st_path.open("rb") as fh:
+        hdr_bytes = fh.read(8)
+        if len(hdr_bytes) != 8:
+            return []
+        hdr_len = struct.unpack("<Q", hdr_bytes)[0]
+        if hdr_len <= 0 or hdr_len > 100_000_000:
+            return []
+        hdr_json = json.loads(fh.read(hdr_len).decode("utf-8"))
+        return [k for k in hdr_json.keys() if k != "__metadata__"]
+
+
 def _patch_exported_gemma4_config_tie_embeddings(out_16bit: pathlib.Path) -> bool:
-    """Ensure `tie_word_embeddings: true` is saved in `config.json` (root and `text_config`) when `lm_head.weight` is tied."""
+    """Ensure `tie_word_embeddings: true`, `use_cache: true`, and no `quantization_config` in exported `config.json`."""
     cfg_path = out_16bit / "config.json"
     if not cfg_path.exists():
         return False
+
     has_separate_lm_head = False
     idx_path = out_16bit / "model.safetensors.index.json"
     st_path = out_16bit / "model.safetensors"
@@ -289,31 +230,33 @@ def _patch_exported_gemma4_config_tie_embeddings(out_16bit: pathlib.Path) -> boo
             has_separate_lm_head = False
     elif st_path.exists():
         try:
-            import struct
-
-            with st_path.open("rb") as fh:
-                hdr_bytes = fh.read(8)
-                if len(hdr_bytes) == 8:
-                    hdr_len = struct.unpack("<Q", hdr_bytes)[0]
-                    if 0 < hdr_len < 100_000_000:
-                        hdr_json = json.loads(fh.read(hdr_len).decode("utf-8"))
-                        has_separate_lm_head = any(
-                            k in hdr_json for k in ("lm_head.weight", "language_model.lm_head.weight")
-                        )
+            hdr_keys = _read_safetensors_header_keys(st_path)
+            has_separate_lm_head = any(
+                k in hdr_keys for k in ("lm_head.weight", "language_model.lm_head.weight")
+            )
         except Exception:
             has_separate_lm_head = False
-
-    if has_separate_lm_head:
-        return False
 
     try:
         cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
         changed = False
-        if cfg_data.get("tie_word_embeddings") is not True:
+        if "quantization_config" in cfg_data:
+            cfg_data.pop("quantization_config", None)
+            changed = True
+        if cfg_data.get("use_cache") is not True:
+            cfg_data["use_cache"] = True
+            changed = True
+        if not has_separate_lm_head and cfg_data.get("tie_word_embeddings") is not True:
             cfg_data["tie_word_embeddings"] = True
             changed = True
         if isinstance(cfg_data.get("text_config"), dict):
-            if cfg_data["text_config"].get("tie_word_embeddings") is not True:
+            if "quantization_config" in cfg_data["text_config"]:
+                cfg_data["text_config"].pop("quantization_config", None)
+                changed = True
+            if cfg_data["text_config"].get("use_cache") is not True:
+                cfg_data["text_config"]["use_cache"] = True
+                changed = True
+            if not has_separate_lm_head and cfg_data["text_config"].get("tie_word_embeddings") is not True:
                 cfg_data["text_config"]["tie_word_embeddings"] = True
                 changed = True
         if changed:
@@ -321,14 +264,114 @@ def _patch_exported_gemma4_config_tie_embeddings(out_16bit: pathlib.Path) -> boo
                 json.dumps(cfg_data, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
-            logger.info(
-                "Patched exported %s with tie_word_embeddings=true (root + text_config).",
-                cfg_path,
-            )
-        return True
+            logger.info("Normalized exported %s (use_cache=true, tie_word_embeddings, clean BF16 config).", cfg_path)
+        return not has_separate_lm_head
     except Exception as exc:
-        logger.warning("Could not verify/patch exported config.json tie_word_embeddings: %s", exc)
+        logger.warning("Could not verify/patch exported config.json: %s", exc)
         return False
+
+
+def _restore_canonical_processor_and_templates(
+    out_16bit: pathlib.Path,
+    base_model_id: str,
+) -> None:
+    """Ensure `processor_config.json`, `chat_template.jinja`, `generation_config.json`, and `eos_token` match upstream."""
+    canonical_repo = (
+        PRIMARY_MODEL_ID_26B
+        if ("26b" in base_model_id.lower() or "a4b" in base_model_id.lower())
+        else PRIMARY_MODEL_ID
+    )
+    try:
+        from transformers import AutoProcessor
+
+        proc = AutoProcessor.from_pretrained(canonical_repo)
+        proc.save_pretrained(str(out_16bit))
+    except Exception as proc_exc:
+        logger.debug("AutoProcessor save skipped for %s: %s", canonical_repo, proc_exc)
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        for fname in ("chat_template.jinja", "generation_config.json", "preprocessor_config.json", "processor_config.json"):
+            dst = out_16bit / fname
+            if not dst.exists():
+                try:
+                    cached = hf_hub_download(repo_id=canonical_repo, filename=fname)
+                    shutil.copy2(cached, dst)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    tc_path = out_16bit / "tokenizer_config.json"
+    if tc_path.exists():
+        try:
+            raw_tc = tc_path.read_text(encoding="utf-8")
+            tc_data = json.loads(raw_tc)
+            if "<turn|>" in raw_tc and tc_data.get("eos_token") != "<turn|>":
+                tc_data["eos_token"] = "<turn|>"
+                tc_path.write_text(
+                    json.dumps(tc_data, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+        except Exception as tc_exc:
+            logger.warning("Could not verify/patch tokenizer_config.json eos_token: %s", tc_exc)
+
+
+def verify_merged_checkpoint(
+    out_16bit: pathlib.Path,
+    is_moe: bool = False,
+    enforce_full_size: bool = True,
+) -> Dict[str, Any]:
+    """Forensically verify that `out_16bit` is a valid, unquantized BF16 standalone Gemma 4 checkpoint."""
+    cfg_path = out_16bit / "config.json"
+    if not cfg_path.exists():
+        raise RuntimeError(f"Merged checkpoint verification failed: missing {cfg_path}")
+
+    cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    if "quantization_config" in cfg_data:
+        raise RuntimeError(
+            f"Merged checkpoint at {out_16bit} still contains `quantization_config` (4-bit leak)!"
+        )
+    if cfg_data.get("use_cache") is not True:
+        raise RuntimeError(f"Merged checkpoint at {out_16bit} has `use_cache != True`!")
+
+    shards = sorted(out_16bit.glob("*.safetensors"))
+    if not shards:
+        raise RuntimeError(f"Merged checkpoint at {out_16bit} contains zero `.safetensors` files!")
+
+    total_bytes = sum(s.stat().st_size for s in shards)
+    total_gb = total_bytes / float(1024**3)
+
+    bad_quant_suffixes = (".absmax", ".quant_state", ".quant_map", "lora_A", "lora_B")
+    for s in shards:
+        for k in _read_safetensors_header_keys(s):
+            if any(bad in k for bad in bad_quant_suffixes):
+                raise RuntimeError(
+                    f"Merged checkpoint shard {s.name} contains unmerged/quantized tensor key: {k}"
+                )
+
+    if enforce_full_size:
+        min_gb = 44.0 if is_moe else 7.8
+        if total_gb < min_gb:
+            raise RuntimeError(
+                f"Merged BF16 checkpoint size {total_gb:.2f} GiB at {out_16bit} is below expected "
+                f"minimum {min_gb:.1f} GiB (is_moe={is_moe})! Refusing to proceed with truncated/quantized weights."
+            )
+
+    tpl_path = out_16bit / "chat_template.jinja"
+    if tpl_path.exists():
+        tpl_txt = tpl_path.read_text(encoding="utf-8")
+        if "<|turn>" not in tpl_txt or "<turn|>" not in tpl_txt:
+            raise RuntimeError(f"chat_template.jinja at {out_16bit} is missing native <|turn>/<turn|> tokens!")
+
+    return {
+        "verified": True,
+        "checkpoint_dir": str(out_16bit),
+        "num_safetensors_shards": len(shards),
+        "total_size_gb": round(total_gb, 3),
+        "is_moe": is_moe,
+    }
 
 
 def export_merged_checkpoint(
@@ -339,9 +382,10 @@ def export_merged_checkpoint(
     gguf_quant: str = "q4_k_m",
     base_model_id: Optional[str] = None,
 ) -> List[str]:
-    """Export the restored and TIES-interpolated model to 16-bit Safetensors and/or GGUF."""
+    """Export the model to standalone 16-bit BF16 Safetensors (`merged_16bit`) and/or GGUF."""
     output_dir.mkdir(parents=True, exist_ok=True)
     exported_artifacts: List[str] = []
+    proc_or_tok = getattr(tokenizer, "_gemma4_processor", tokenizer)
 
     if export_format in {"merged_16bit", "both"}:
         out_16bit = output_dir / "merged_16bit"
@@ -350,71 +394,59 @@ def export_merged_checkpoint(
         if cfg is not None:
             try:
                 cfg.tie_word_embeddings = True
+                cfg.use_cache = True
                 if getattr(cfg, "text_config", None) is not None:
                     cfg.text_config.tie_word_embeddings = True
+                    cfg.text_config.use_cache = True
             except Exception:
                 pass
-        saved_16bit = False
-        if hasattr(model, "merge_and_unload") and not getattr(model, "_is_unsloth_model", False):
-            try:
-                merged = model.merge_and_unload()
-                ensure_tied_lm_head(merged)
-                merged.save_pretrained(str(out_16bit), safe_serialization=True)
-                if tokenizer is not None:
-                    tokenizer.save_pretrained(str(out_16bit))
-                if base_model_id:
-                    try:
-                        from transformers import AutoProcessor
 
-                        proc = AutoProcessor.from_pretrained(base_model_id)
-                        proc.save_pretrained(str(out_16bit))
-                    except Exception as proc_exc:
-                        logger.debug("Processor save skipped for %s: %s", base_model_id, proc_exc)
-                saved_16bit = True
-            except Exception as peft_merge_exc:
-                logger.warning(
-                    "PEFT merge_and_unload failed (%s); falling back to save_pretrained_merged.",
-                    peft_merge_exc,
-                )
-        if not saved_16bit and hasattr(model, "save_pretrained_merged"):
+        saved_16bit = False
+        if hasattr(model, "save_pretrained_merged"):
+            moe_merge_state = None
             try:
-                model.save_pretrained_merged(
-                    str(out_16bit),
-                    tokenizer,
-                    save_method="merged_16bit",
+                import unsloth_zoo.saving_utils as _uz_saving
+
+                moe_merge_state = getattr(_uz_saving, "_MOE_MERGE_STATE", None)
+                if isinstance(moe_merge_state, dict) and hasattr(moe_merge_state.get("fallbacks"), "clear"):
+                    moe_merge_state["fallbacks"].clear()
+            except Exception:
+                moe_merge_state = None
+
+            logger.info("Merging and exporting 16-bit BF16 safetensors via Unsloth save_pretrained_merged -> %s ...", out_16bit)
+            model.save_pretrained_merged(
+                str(out_16bit),
+                proc_or_tok,
+                save_method="merged_16bit",
+            )
+            if isinstance(moe_merge_state, dict) and moe_merge_state.get("fallbacks"):
+                raise RuntimeError(
+                    "CRITICAL: Unsloth recorded unmerged MoE 3D expert fallbacks during save_pretrained_merged: "
+                    f"{moe_merge_state['fallbacks']}"
                 )
-                saved_16bit = True
-            except Exception as unsloth_merge_exc:
-                logger.warning(
-                    "save_pretrained_merged failed (%s); falling back to PEFT merge_and_unload.",
-                    unsloth_merge_exc,
-                )
+            saved_16bit = True
+
         if not saved_16bit:
+            # Non-Unsloth fallback: strictly forbid saving 4-bit quantized weights into merged_16bit
+            is_quantized = bool(getattr(model, "is_loaded_in_4bit", False) or getattr(cfg, "quantization_config", None))
+            if is_quantized:
+                raise RuntimeError(
+                    "Cannot export `merged_16bit` from a 4-bit BitsAndBytes model without Unsloth "
+                    "`save_pretrained_merged`! Refusing to write 4-bit weights into `merged_16bit`."
+                )
             if hasattr(model, "merge_and_unload"):
                 merged = model.merge_and_unload()
                 ensure_tied_lm_head(merged)
                 merged.save_pretrained(str(out_16bit), safe_serialization=True)
-                if tokenizer is not None:
-                    tokenizer.save_pretrained(str(out_16bit))
             else:
                 ensure_tied_lm_head(model)
                 model.save_pretrained(str(out_16bit), safe_serialization=True)
-                if tokenizer is not None:
-                    tokenizer.save_pretrained(str(out_16bit))
+            if proc_or_tok is not None:
+                proc_or_tok.save_pretrained(str(out_16bit))
+
+        if base_model_id:
+            _restore_canonical_processor_and_templates(out_16bit, base_model_id)
         _patch_exported_gemma4_config_tie_embeddings(out_16bit)
-        tc_path = out_16bit / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                tc_data = json.loads(tc_path.read_text(encoding="utf-8"))
-                raw_tc = tc_path.read_text(encoding="utf-8")
-                if "<turn|>" in raw_tc and tc_data.get("eos_token") != "<turn|>":
-                    tc_data["eos_token"] = "<turn|>"
-                    tc_path.write_text(
-                        json.dumps(tc_data, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-            except Exception as tc_exc:
-                logger.warning("Could not verify/patch tokenizer_config.json eos_token: %s", tc_exc)
         exported_artifacts.append(str(out_16bit))
 
     if export_format in {"gguf", "both"}:
@@ -423,7 +455,7 @@ def export_merged_checkpoint(
         if hasattr(model, "save_pretrained_gguf"):
             model.save_pretrained_gguf(
                 str(out_gguf),
-                tokenizer,
+                proc_or_tok,
                 quantization_method=gguf_quant,
             )
             exported_artifacts.append(str(out_gguf))
@@ -441,28 +473,39 @@ def export_merged_checkpoint(
     return exported_artifacts
 
 
+def _prune_adapter_checkpoints(adapter_dir: Optional[str]) -> None:
+    if not adapter_dir:
+        return
+    p = pathlib.Path(adapter_dir)
+    if not p.is_dir() or not (p / "adapter_config.json").exists():
+        return
+    for child in p.iterdir():
+        if child.is_dir() and child.name.startswith("checkpoint-"):
+            shutil.rmtree(child, ignore_errors=True)
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    """Parse CLI arguments for TIES-Merging and model checkpoint export."""
+    """Parse CLI arguments for LoRA checkpoint merging and 16-bit/GGUF export."""
     parser = argparse.ArgumentParser(
-        description="TIES-Merging checkpoint interpolation (lambda=0.85), tower restoration, and 16-bit/GGUF export."
+        description="Standalone 16-bit BF16 LoRA merge, processor restoration, and checkpoint verifier."
     )
     parser.add_argument(
         "--base-model",
         type=str,
         default=BASE_MODEL_ID,
-        help="Base 4-bit model identifier.",
+        help="Base Gemma 4 model identifier (`unsloth/gemma-4-E4B-it` or `unsloth/gemma-4-26B-A4B-it`).",
     )
     parser.add_argument(
         "--adapter-dir",
         type=str,
         default="outputs/dpo_stage2",
-        help="Path to the trained Stage 2 DPO (or Stage 1 SFT) LoRA adapter directory.",
+        help="Path to the trained Stage 2 DPO LoRA adapter directory.",
     )
     parser.add_argument(
         "--sft-adapter-dir",
         type=str,
         default=None,
-        help="Optional path to Stage 1 SFT adapter directory for two-stage TIES sign election.",
+        help="Optional Stage 1 SFT adapter directory (used only for intermediate checkpoint cleanup unless explicit TIES is requested).",
     )
     parser.add_argument(
         "--output-dir",
@@ -474,13 +517,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--lambda-scale",
         type=float,
         default=DEFAULT_TIES_LAMBDA,
-        help="TIES-Merging interpolation scaling factor lambda (default: 0.85).",
+        help="Adapter scaling factor lambda (default: 1.00 lossless full merge).",
     )
     parser.add_argument(
         "--density",
         type=float,
         default=DEFAULT_TIES_DENSITY,
-        help="Fraction of top-magnitude adapter delta parameters to retain (default: 0.70).",
+        help="Fraction of top-magnitude adapter parameters to retain (default: 1.00 lossless).",
     )
     parser.add_argument(
         "--export-format",
@@ -513,13 +556,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run a synthetic verification of TIES-Merging math and multimodal tower restoration.",
+        help="Run a synthetic verification of merge interpolation math.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Entry point for TIES-Merging checkpoint interpolation and export."""
+    """Entry point for standalone 16-bit BF16 checkpoint merge and verification."""
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
@@ -530,6 +573,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     configure_clean_logging()
     args = parse_args(argv)
     effective_format = "both" if args.export_gguf else args.export_format
+    is_moe = "26b" in args.base_model.lower() or "a4b" in args.base_model.lower()
 
     if args.dry_run:
         base_w = {"q_proj.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]])}
@@ -554,42 +598,84 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
-    out_16bit_cfg = pathlib.Path(args.output_dir) / "merged_16bit" / "config.json"
-    if effective_format == "merged_16bit" and out_16bit_cfg.exists() and not args.force:
-        logger.info(
-            "Merged 16-bit checkpoint already exists at %s; skipping TIES merge.",
-            out_16bit_cfg.parent,
-        )
-        return 0
+    out_root = pathlib.Path(args.output_dir)
+    out_16bit_dir = out_root / "merged_16bit"
+    if effective_format == "merged_16bit" and (out_16bit_dir / "config.json").exists() and not args.force:
+        try:
+            _patch_exported_gemma4_config_tie_embeddings(out_16bit_dir)
+            if not (out_16bit_dir / "chat_template.jinja").exists():
+                _restore_canonical_processor_and_templates(out_16bit_dir, args.base_model)
+            verification = verify_merged_checkpoint(out_16bit_dir, is_moe=is_moe, enforce_full_size=True)
+            manifest_path = out_root / "merge_manifest.json"
+            if not manifest_path.exists():
+                manifest = {
+                    "base_model": args.base_model,
+                    "adapter_dir": str(args.adapter_dir),
+                    "lambda_scale": args.lambda_scale,
+                    "density": args.density,
+                    "resumed_existing_checkpoint": True,
+                    "exported_artifacts": {"merged_16bit": str(out_16bit_dir)},
+                    "verification": verification,
+                }
+                atomic_write_json(manifest_path, manifest)
+            logger.info(
+                "Verified existing merged_16bit checkpoint at %s (%.2f GiB); skipping re-merge.",
+                out_16bit_dir,
+                verification["total_size_gb"],
+            )
+            return 0
+        except Exception as verify_exc:
+            logger.warning(
+                "Existing merged_16bit directory at %s is incomplete or interrupted (%s); removing partial export and re-merging cleanly.",
+                out_16bit_dir,
+                verify_exc,
+            )
+            shutil.rmtree(out_16bit_dir, ignore_errors=True)
+            stale_manifest = out_root / "merge_manifest.json"
+            if stale_manifest.is_file():
+                try:
+                    stale_manifest.unlink()
+                except OSError:
+                    pass
 
-    use_4bit_for_merge = bool(args.offload_to_cpu) or (effective_format == "gguf")
+    adapter_path = pathlib.Path(args.adapter_dir)
+    if not (adapter_path / "adapter_config.json").exists():
+        raise FileNotFoundError(
+            f"Adapter directory '{adapter_path}' is missing `adapter_config.json`! Cannot merge."
+        )
+
+    # Free intermediate checkpoint-* directories before writing large BF16 safetensors
+    _prune_adapter_checkpoints(args.sft_adapter_dir)
+    _prune_adapter_checkpoints(args.adapter_dir)
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(str(out_root)).free / float(1024**3)
+    req_gb = 54.0 if is_moe else 13.0
+    logger.info("Disk space check before merge (%s): %.2f GiB free (recommended >= %.1f GiB).", out_root, free_gb, req_gb)
+    if free_gb < req_gb:
+        raise RuntimeError(
+            f"Insufficient free disk space on {out_root}: {free_gb:.2f} GiB available, "
+            f"need >= {req_gb:.1f} GiB to export standalone BF16 safetensors!"
+        )
+
+    # Load via Unsloth in 4-bit so `save_pretrained_merged(..., save_method="merged_16bit")`
+    # streams upstream BF16 base shards directly to disk with low RAM/VRAM and full 3D MoE support.
     model, tokenizer, offload_state = load_gemma4_8gb_model_and_tokenizer(
         model_name=args.base_model,
         max_seq_length=DEFAULT_MAX_SEQ_LENGTH,
-        load_in_4bit=use_4bit_for_merge,
+        load_in_4bit=True,
         attach_lora=False,
-        adapter_checkpoint=args.adapter_dir if pathlib.Path(args.adapter_dir).exists() else None,
+        adapter_checkpoint=str(adapter_path),
         is_trainable=False,
         offload_ple_to_cpu=bool(args.offload_to_cpu),
         offload_multimodal_towers_to_cpu=bool(args.offload_to_cpu),
     )
 
-    sft_state: Optional[Dict[str, torch.Tensor]] = None
-    if args.sft_adapter_dir and pathlib.Path(args.sft_adapter_dir).exists():
-        safetensors_file = pathlib.Path(args.sft_adapter_dir) / "adapter_model.safetensors"
-        if safetensors_file.exists():
-            try:
-                from safetensors.torch import load_file
-
-                sft_state = load_file(str(safetensors_file), device="cpu")
-            except Exception as exc:
-                logger.warning("Could not load SFT adapter safetensors from %s: %s", safetensors_file, exc)
-
     modified = scale_and_trim_peft_lora_weights(
         model=model,
         lambda_scale=args.lambda_scale,
         density=args.density,
-        sft_adapter_state=sft_state,
+        sft_adapter_state=None,
     )
     restored_modules: List[str] = []
     if offload_state.ple_module_names or offload_state.multimodal_module_names:
@@ -602,18 +688,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     exported = export_merged_checkpoint(
         model=model,
         tokenizer=tokenizer,
-        output_dir=pathlib.Path(args.output_dir),
+        output_dir=out_root,
         export_format=effective_format,
         gguf_quant=args.gguf_quant,
         base_model_id=args.base_model,
     )
+
+    verification = {}
+    if effective_format in {"merged_16bit", "both"}:
+        verification = verify_merged_checkpoint(out_16bit_dir, is_moe=is_moe, enforce_full_size=True)
+
+    manifest = {
+        "base_model": args.base_model,
+        "adapter_dir": str(adapter_path),
+        "lambda_scale": args.lambda_scale,
+        "density": args.density,
+        "modified_lora_b_tensors": modified,
+        "exported_artifacts": exported,
+        "verification": verification,
+    }
+    atomic_write_json(out_root / "merge_manifest.json", manifest)
     logger.info(
-        "Exported merged checkpoint (TIES lambda=%.2f, density=%.2f, modified=%d, restored=%s) -> %s",
+        "Exported & verified merged checkpoint (lambda=%.2f, density=%.2f, restored=%s) -> %s (%s)",
         args.lambda_scale,
         args.density,
-        modified,
         restored_modules,
         exported,
+        verification,
     )
     return 0
 

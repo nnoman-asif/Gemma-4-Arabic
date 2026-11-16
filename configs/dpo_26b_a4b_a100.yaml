@@ -1,13 +1,13 @@
-# Stage 2 Trust-Region Direct Preference Optimization (TR-DPO) for Gemma-4-26B-A4B-Arabic (MoE) on A100 80 GB
-# Aligns the 128-expert Gemma-4-26B-A4B MoE on Saudi dialect and MSA preference pairs with router gates frozen.
+# Stage 2 Direct Preference Optimization (DPO) Configuration for Gemma-4-26B-A4B-Arabic (MoE) on A100 80 GB
+# Aligns the 128-expert Gemma-4-26B-A4B MoE (`r=16, alpha=16`, frozen router) against the frozen Stage 1 SFT reference adapter (`peft>=0.21.3`).
 
 model:
   base_model_id: "unsloth/gemma-4-26B-A4B-it"
   reference_model_id: "google/gemma-4-26B-A4B-it"
   hf_hub_repo_id: "noman-asif/Gemma-4-26B-A4B-Arabic-It"
   architecture_type: "moe"
-  sft_adapter_dir: "outputs/sft_26b_a4b_stage1"
-  max_seq_length: 2048
+  sft_adapter_dir: "outputs/sft_26b_a4b_a100"
+  max_seq_length: 3072
   dtype: "bfloat16"
   load_in_4bit: true
 
@@ -25,21 +25,14 @@ vram_optimization:
   precompute_ref_log_probs: false
 
 lora:
-  use_rslora: true
-  r: 32
-  lora_alpha: 64
+  use_rslora: false
+  r: 16
+  lora_alpha: 16
   lora_dropout: 0.0
   bias: "none"
-  use_gradient_checkpointing: false
+  use_gradient_checkpointing: "unsloth"
   random_state: 3407
-  target_modules:
-    - "q_proj"
-    - "k_proj"
-    - "v_proj"
-    - "o_proj"
-    - "mlp.gate_proj"
-    - "mlp.up_proj"
-    - "mlp.down_proj"
+  target_modules: null
   exclude_modules:
     - "vision_tower"
     - "multi_modal_projector"
@@ -49,25 +42,25 @@ lora:
 dpo:
   beta: 0.1
   tr_alpha: 0.6
-  tr_update_steps: 50
+  tr_update_steps: 0
   loss_type: "sigmoid"
-  max_length: 2048
-  max_prompt_length: 1024
-  max_completion_length: 1024
+  max_length: 3072
+  max_prompt_length: 1536
+  max_completion_length: 1536
   label_smoothing: 0.0
 
 training:
-  output_dir: "outputs/dpo_26b_a4b_stage2"
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 6
+  output_dir: "outputs/dpo_26b_a4b_a100"
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
   optim: "adamw_bnb_8bit"
-  learning_rate: 4.0e-7
+  learning_rate: 5.0e-6
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.10
   weight_decay: 0.01
   max_grad_norm: 1.0
-  num_train_epochs: 1
+  num_train_epochs: 1.0
   bf16: true
   tf32: true
   fp16: false
