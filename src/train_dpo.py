@@ -16,9 +16,11 @@ Key architectural guarantees:
 """
 
 import argparse
+import contextlib
 import inspect
 import json
 import logging
+import math
 import pathlib
 import shutil
 import sys
@@ -123,6 +125,117 @@ class TrustRegionDPOCallback(TrainerCallback):
         self.update_steps = max(1, int(update_steps))
         self.ref_adapter_state: Dict[str, torch.Tensor] = {}
         self.num_updates: int = 0
+
+
+class DPORefSanityCallback(TrainerCallback):
+    """Fail-fast guard verifying Step-1 DPO reference log-probabilities and gradient norm.
+
+    When KL is anchored to the frozen Stage 1 SFT adapter (`precompute_ref_log_probs=True`),
+    initial DPO loss at step 0 is `ln(2) = 0.6931` and the first logged step sits near `0.45..0.85`
+    with bounded `grad_norm`. If reference log-probabilities ever desynchronize (e.g. `loss > 0.98`
+    or `grad_norm > 50.0`), training aborts immediately instead of corrupting the checkpoint.
+    """
+
+    def __init__(self, max_initial_loss: float = 0.98, max_initial_grad_norm: float = 50.0) -> None:
+        self.max_initial_loss = float(max_initial_loss)
+        self.max_initial_grad_norm = float(max_initial_grad_norm)
+        self.checked_first_log = False
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        if self.checked_first_log or not logs or "loss" not in logs:
+            return
+        self.checked_first_log = True
+        loss_val = float(logs["loss"])
+        grad_norm_val = float(logs.get("grad_norm", 0.0) or 0.0)
+        if not math.isfinite(loss_val) or not math.isfinite(grad_norm_val):
+            raise RuntimeError(
+                f"DPO NaN/Inf detected on first logged step (step={state.global_step}): "
+                f"loss={loss_val}, grad_norm={grad_norm_val}"
+            )
+        if state.global_step <= max(15, int(getattr(args, "logging_steps", 10)) * 2):
+            if loss_val > self.max_initial_loss or grad_norm_val > self.max_initial_grad_norm:
+                raise RuntimeError(
+                    f"DPO reference logprob sanity gate FAILED at step {state.global_step}: "
+                    f"loss={loss_val:.4f} (expected ~0.6931, max={self.max_initial_loss}), "
+                    f"grad_norm={grad_norm_val:.4f} (max={self.max_initial_grad_norm}). "
+                    "Reference log-probabilities are misaligned with Stage 1 SFT policy!"
+                )
+            logger.info(
+                "[DPO Sanity Gate PASSED] step=%d | loss=%.4f (~ln2=0.6931) | grad_norm=%.4f",
+                state.global_step,
+                loss_val,
+                grad_norm_val,
+            )
+
+
+@contextlib.contextmanager
+def preserve_stage1_adapter_for_ref_precompute(model: Any, trainer_box: Dict[str, Any]):
+    """Keep the untouched Stage 1 SFT `"default"` adapter active during `precompute_ref_log_probs=True`
+    without duplicating `"ref"` LoRA adapters (which corrupt nested 3D `ParamWrapper` layers when
+    `target_parameters=['experts.gate_up_proj', 'experts.down_proj']` on `Gemma-4-26B-A4B`) and without
+    allowing `use_adapter(model, None)` / `model.disable_adapter()` to revert $\\pi_{\\text{ref}}$ to the
+    untuned base model.
+    """
+    orig_disable = getattr(model, "disable_adapter", None)
+    orig_add_adapter = getattr(model, "add_adapter", None)
+    orig_get_parameter = getattr(model, "get_parameter", None)
+
+    @contextlib.contextmanager
+    def _guarded_disable_adapter():
+        tr = trainer_box.get("trainer")
+        step = int(getattr(getattr(tr, "state", None), "global_step", 0) or 0)
+        if step == 0:
+            # Keep Stage 1 SFT "default" adapter active during reference logprob precomputation
+            yield
+        elif orig_disable is not None:
+            with orig_disable():
+                yield
+        else:
+            yield
+
+    def _guarded_add_adapter(adapter_name: str, peft_config: Any, *args: Any, **kwargs: Any) -> Any:
+        if adapter_name == "ref":
+            logger.info(
+                "Skipping duplicate 'ref' PEFT adapter allocation during precompute_ref_log_probs=True "
+                "(computing exact Stage 1 SFT reference log-probs directly from active 'default' adapter)."
+            )
+            return None
+        if orig_add_adapter is not None:
+            return orig_add_adapter(adapter_name, peft_config, *args, **kwargs)
+        return None
+
+    def _guarded_get_parameter(target: str) -> Any:
+        if orig_get_parameter is None:
+            raise AttributeError("Model does not implement get_parameter")
+        try:
+            return orig_get_parameter(target)
+        except AttributeError:
+            if ".ref." in target:
+                return orig_get_parameter(target.replace(".ref.", ".default."))
+            raise
+
+    if orig_disable is not None:
+        model.disable_adapter = _guarded_disable_adapter
+    if orig_add_adapter is not None:
+        model.add_adapter = _guarded_add_adapter
+    if orig_get_parameter is not None:
+        model.get_parameter = _guarded_get_parameter
+    try:
+        yield
+    finally:
+        if orig_disable is not None:
+            model.disable_adapter = orig_disable
+        if orig_add_adapter is not None:
+            model.add_adapter = orig_add_adapter
+        if orig_get_parameter is not None:
+            model.get_parameter = orig_get_parameter
 
 
 def align_26b_chat_template_for_dpo(chat_template: Optional[str]) -> Optional[str]:
@@ -388,10 +501,16 @@ def build_dpo_training_arguments(
             common_kwargs["max_prompt_length"] = int(
                 dpo_cfg.get("max_prompt_length", DPO_MAX_PROMPT_LENGTH)
             )
+        if "max_completion_length" in sig.parameters and dpo_cfg.get("max_completion_length") is not None:
+            common_kwargs["max_completion_length"] = int(dpo_cfg["max_completion_length"])
         if "precompute_ref_log_probs" in sig.parameters:
             common_kwargs["precompute_ref_log_probs"] = bool(
-                vram_cfg.get("precompute_ref_log_probs", False)
+                vram_cfg.get("precompute_ref_log_probs", True)
             )
+        if "precompute_ref_batch_size" in sig.parameters and vram_cfg.get("precompute_ref_batch_size") is not None:
+            common_kwargs["precompute_ref_batch_size"] = int(vram_cfg["precompute_ref_batch_size"])
+        if "router_aux_loss_coef" in sig.parameters and bool(vram_cfg.get("freeze_moe_router", True)):
+            common_kwargs["router_aux_loss_coef"] = 0.0
         if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
             common_kwargs = {k: v for k, v in common_kwargs.items() if k in sig.parameters}
         return DPOConfig(**common_kwargs)
@@ -433,6 +552,8 @@ def load_or_build_dpo_dataset(
         saudi_dpo_samples=pools["saudi"],
         arcee_dpo_samples=pools["arcee"],
         english_dpo_samples=pools.get("english", []),
+        arabic_thinking_samples=pools.get("arabic_thinking", []),
+        english_thinking_samples=pools.get("english_thinking", []),
     )
     return Dataset.from_list(mixed_pairs)
 
@@ -629,7 +750,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             proc.chat_template = tokenizer.chat_template
 
     # Hard pre-train verification that `prompt_ids` is an exact prefix of `prompt + chosen/rejected`
-    verify_dpo_prefix_alignment(train_dataset[0], tokenizer)
+    # across BOTH non-thinking (`enable_thinking=False`) and thinking (`enable_thinking=True`) pairs.
+    checked_modes = set()
+    for check_idx in range(min(len(train_dataset), 200)):
+        row_sample = train_dataset[check_idx]
+        mode_flag = bool((row_sample.get("chat_template_kwargs") or {}).get("enable_thinking", False))
+        if mode_flag not in checked_modes:
+            verify_dpo_prefix_alignment(row_sample, tokenizer)
+            checked_modes.add(mode_flag)
+            if len(checked_modes) >= 2:
+                break
+
+    last_ckpt = None
+    if not args.smoke_test and out_dir_path.exists():
+        last_ckpt = find_latest_valid_checkpoint(out_dir_path)
+        if last_ckpt is not None:
+            logger.info("Resuming Stage 2 DPO from latest verified checkpoint: %s", last_ckpt)
+
+    dpo_callbacks: List[TrainerCallback] = []
+    if not args.smoke_test and last_ckpt is None:
+        dpo_callbacks.append(DPORefSanityCallback())
 
     trainer_kwargs: Dict[str, Any] = {
         "model": model,
@@ -637,6 +777,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "args": dpo_args,
         "train_dataset": train_dataset,
     }
+    if dpo_callbacks:
+        trainer_kwargs["callbacks"] = dpo_callbacks
     if eval_dataset is not None:
         trainer_kwargs["eval_dataset"] = eval_dataset
 
@@ -646,19 +788,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif "tokenizer" in trainer_sig.parameters:
         trainer_kwargs["tokenizer"] = tokenizer
 
-    trainer = DPOTrainer(**trainer_kwargs)
+    trainer_box: Dict[str, Any] = {}
+    precompute_guard = (
+        preserve_stage1_adapter_for_ref_precompute(model, trainer_box)
+        if bool(getattr(dpo_args, "precompute_ref_log_probs", False))
+        else contextlib.nullcontext()
+    )
+    with precompute_guard:
+        trainer = DPOTrainer(**trainer_kwargs)
+        trainer_box["trainer"] = trainer
+        if bool(getattr(dpo_args, "precompute_ref_log_probs", False)) and getattr(
+            trainer, "_precomputed_train_ref_log_probs", True
+        ) is False:
+            # Force TRL 1.15.x lazy precomputation to execute now while `model` holds untouched Stage 1 SFT weights
+            trainer.get_train_dataloader()
     install_dpo_default_adapter_resume_hook(
         trainer,
         freeze_moe_router=bool(vram_cfg.get("freeze_moe_router", True)),
     )
     log_vram_telemetry(model, stage="pre_dpo_train")
-
-    last_ckpt = None
-    if not args.smoke_test and out_dir_path.exists():
-        last_ckpt = find_latest_valid_checkpoint(out_dir_path)
-        if last_ckpt is not None:
-            logger.info("Resuming Stage 2 DPO from latest verified checkpoint: %s", last_ckpt)
-
     train_result = trainer.train(resume_from_checkpoint=last_ckpt)
     log_vram_telemetry(model, stage="post_dpo_train")
 

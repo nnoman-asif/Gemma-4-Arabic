@@ -8,10 +8,10 @@ End-to-end continual instruction tuning (`QLoRA` across dense + 128 3D MoE exper
 
 | Artifact Type | Hugging Face Repository | Architecture / Size | Description |
 | :--- | :--- | :---: | :--- |
-| **Edge / Workstation Model** | [`noman-asif/Gemma-4-E4B-Arabic-It`](https://huggingface.co/noman-asif/Gemma-4-E4B-Arabic-It) | **4.5B Total / 4.0B Active** (Dense) | Standalone 16-bit (`bfloat16`) `safetensors` checkpoint (`r=32, alpha=32`) for laptops & single-GPU workstations |
+| **Edge / Workstation Model** | [`noman-asif/Gemma-4-E4B-Arabic-It`](https://huggingface.co/noman-asif/Gemma-4-E4B-Arabic-It) | **4.5B Total / 4.0B Active** (Dense) | Standalone 16-bit (`bfloat16`) `safetensors` checkpoint (`r=16, alpha=16`) for laptops & single-GPU workstations |
 | **Enterprise MoE Flagship** | [`noman-asif/Gemma-4-26B-A4B-Arabic-It`](https://huggingface.co/noman-asif/Gemma-4-26B-A4B-Arabic-It) | **25.2B Total / 3.8B Active** (128 Experts, Top-8 + 1 Shared) | Standalone 16-bit (`bfloat16`) `safetensors` MoE flagship (`r=16, alpha=16` across attention + shared MLP + all 128 3D experts) |
-| **Stage 1 SFT Dataset** | [`noman-asif/Arabic-Reasoning-Instruct-120k`](https://huggingface.co/datasets/noman-asif/Arabic-Reasoning-Instruct-120k) | **120,000 rows** (75% Arabic / 25% Replay) | 15-source 13-gram de-contaminated Arabic, Saudi dialect, legal (`moj` + `boe`), and native Gemma 4 reasoning curriculum |
-| **Stage 2 DPO Dataset** | [`noman-asif/Arabic-Preference-DPO-20k`](https://huggingface.co/datasets/noman-asif/Arabic-Preference-DPO-20k) | **20,000 pairs** (85% Arabic/Saudi / 15% English Replay) | Conversational preference alignment dataset with unified prompt verification and length-ratio hygiene |
+| **Stage 1 SFT Dataset** | [`noman-asif/Arabic-Reasoning-Instruct-120k`](https://huggingface.co/datasets/noman-asif/Arabic-Reasoning-Instruct-120k) | **30,000 rows** (V3 High-Purity: 75% Arabic / 25% Replay, 55% CoT) | 13-gram de-contaminated Arabic, Saudi dialect, legal (`moj` + `boe`), and native Gemma 4 `<\|channel>thought` reasoning curriculum |
+| **Stage 2 DPO Dataset** | [`noman-asif/Arabic-Preference-DPO-20k`](https://huggingface.co/datasets/noman-asif/Arabic-Preference-DPO-20k) | **6,000 pairs** (V3 Length-Balanced: 70% Arabic / 30% English+Math, 43.3% CoT) | Thinking-aware conversational preference alignment dataset (`0.55..1.75` length balance, 0% SFT prompt overlap) |
 
 ---
 
@@ -45,39 +45,40 @@ By pairing **`Gemma-4-E4B-it` (`4.0B` active / `4.5B` total)** with **`Gemma-4-2
 Running `bash scripts/run_dual_a100_pipeline.sh` executes a 4-phase, barrier-synchronized workflow designed for maximum 2-GPU efficiency and zero race conditions:
 
 1. **Phase 0 (Upfront Environment & Dependency Verification):** Loads `.env` if present, verifies `>= 2` CUDA GPUs and `>= 110 GB` free disk space, and verifies/installs `transformers==5.17.0`, `peft>=0.21.3`, `trl==1.15.0`, `unsloth`, `vllm`, `lm-eval>=0.4.13`, `inspect-evals>=0.29.0`, and `lighteval@main` before training starts.
-2. **Phase 1 & Phase 2A/2B (Parallel Dual-GPU Training + Hard Merge Barrier):**
-   - Pulls the pre-built `120,000` SFT and `20,000` DPO datasets onto local disk once.
-   - **`GPU 0`** trains **`Gemma-4-E4B-Arabic-It`** (`Stage 1 SFT` -> `Stage 2 DPO`, `r=32, alpha=32`) while **`GPU 1`** simultaneously trains **`Gemma-4-26B-A4B-Arabic-It`** (`Stage 1 SFT` -> `Stage 2 DPO`, `r=16, alpha=16`).
-   - **Hard Barrier:** Benchmarking does **not** start until **both** models finish training and **both** adapters are merged into standalone `merged_16bit` (`bfloat16`, `lambda=1.0`) checkpoints on disk.
+2. **Phase 1 & Phase 2A/2B/2C (Parallel Dual-GPU Training + Hard Merge Barrier + Pre-Flight Gate):**
+   - Pulls the pre-built V3 `30,000` SFT and `6,000` DPO datasets onto local disk once.
+   - **`GPU 0`** trains **`Gemma-4-E4B-Arabic-It`** (`Stage 1 SFT` -> `Stage 2 DPO`, `r=16, alpha=16, beta=0.2, precompute_ref_log_probs=True`) while **`GPU 1`** simultaneously trains **`Gemma-4-26B-A4B-Arabic-It`** (`Stage 1 SFT` -> `Stage 2 DPO`, `r=16, alpha=16, beta=0.2, precompute_ref_log_probs=True`).
+   - **Hard Merge Barrier & 5-Minute Pre-Flight Gate (`--preflight-gate`):** Both models are merged into standalone `merged_16bit` (`bfloat16`, `lambda=1.0`) checkpoints and immediately tested on `ArabicMMLU` + `AlGhafa` + `MMLU-Pro` before full benchmarking begins, with automatic `--lambda-scale 0.70 --force` fallback re-merge on mild retention dip and hard abort on regression.
 3. **Phase 3 (Parallel Base-vs-Tuned Benchmarking per Model):**
    - Prewarms all 10 benchmark datasets in one foreground process.
    - **Step 3A (`E4B`):** Loads **`Base E4B`** on **`GPU 0`** (`--only-role base`) and **`Tuned E4B`** on **`GPU 1`** (`--only-role tuned`) simultaneously, waits for both, and combines `live_raw_e4b.json` + `benchmark_comparison_e4b.md`.
    - **Step 3B (`26B-A4B`):** Once `E4B` finishes, loads **`Base 26B-A4B`** on **`GPU 0`** (`--only-role base`) and **`Tuned 26B-A4B`** on **`GPU 1`** (`--only-role tuned`) simultaneously, waits for both, and combines `live_raw_26b_a4b.json` + `family_benchmark_comparison.md`.
 4. **Phase 4 (Latency, 50-User vLLM Concurrency & Sync Bundle):** Profiles single-stream TTFT/decode speed, 1–50 concurrent user vLLM scaling, and packages `outputs/gemma4_arabic_local_sync_bundle.tar.gz`.
-5. **Automatic Interruption & Spot-Preemption Resume:** Re-running `bash scripts/run_dual_a100_pipeline.sh` automatically resumes from the exact interrupted stage — Stage 1 SFT and Stage 2 DPO save rolling checkpoints (`save_steps=100, save_total_limit=2`) with multi-adapter policy/reference verification and disk-cached pre-tokenization, Phase 2B auto-recovers incomplete `merged_16bit` exports, and Phase 3/4 atomically checkpoint completed benchmark suites into `outputs/eval_reports/live_raw_*.json` with zero synthetic fallbacks.
+5. **Automatic Interruption & Spot-Preemption Resume:** Re-running `bash scripts/run_dual_a100_pipeline.sh` automatically resumes from the exact interrupted stage — Stage 1 SFT and Stage 2 DPO save rolling checkpoints (`save_steps=100, save_total_limit=2`) with Stage 1 SFT reference logprob precomputation and disk-cached pre-tokenization, Phase 2B auto-recovers incomplete `merged_16bit` exports, and Phase 3/4 atomically checkpoint completed benchmark suites into `outputs/eval_reports/live_raw_*.json` with zero synthetic fallbacks.
 
 ---
 
-## Verified V2 Curriculum (`120,000` SFT + `20,000` DPO — 13-Gram Decontaminated)
+## Verified V3 High-Purity Curriculum (`30,000` SFT + `6,000` DPO — 13-Gram Decontaminated)
 
-### Stage 1: Continual Instruction Tuning (`120,000` Samples | 75% Arabic / 25% Replay)
+### Stage 1: Continual Instruction Tuning (`30,000` Samples | 75% Arabic / 25% Replay | 55% Thinking CoT)
 
 | Bucket | Curated Hugging Face Sources | Target Rows (`Share`) | Key Engineering Invariants |
 | :--- | :--- | :---: | :--- |
-| **Arabic Reasoning CoT** | `AdaMLLab/smolkalam-arabic-conversational-sft` (`OpenThoughts3_50K`), `oddadmix/arabic-math-reasoning-synth`, `Gheras/Medical_Reasoning_Arabic_Dataset` | `30,000` (`25.00%`) | Explicit `reasoning_content` separated into Gemma 4 `<\|channel>thought\n...<channel\|>`, zero raw `<think>` tags |
-| **Saudi Dialect & Legal** | `VohoAI/voho-saudi-dialogues`, `SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus` (`moj` + `boe`), `CohereLabs/aya_dataset` (`ars` / `arb`) | `18,000` (`15.00%`) | Najdi/Hijazi/Khaliji dialogues, active Saudi statutory law QA, human-annotated Arabic |
-| **MSA Science & Instruction** | `AdaMLLab/smolkalam-arabic-conversational-sft` (`Mixture_of_Thoughts_science_no_think` + `OpenHermes_2.5_no_think`), `FreedomIntelligence/alpaca-gpt4-arabic` | `42,000` (`35.00%`) | High-complexity MSA STEM & instruction following, 70% zero-system-prompt alignment for 0-shot OALL v2 |
-| **Code Generation Replay** | `nvidia/OpenCodeReasoning` (`split_0`), `open-r1/codeforces-cots` (`solutions_py_decontaminated`), `m-a-p/CodeFeedback-Filtered-Instruction` | `12,000` (`10.00%`) | Competitive programming CoT (`LiveCodeBench-v6` retention shield) |
-| **Competition Math & Science Replay** | `nvidia/OpenMathInstruct-2` (`train_1M`), `nvidia/OpenScienceReasoning-2` | `13,500` (`11.25%`) | Preserves full reasoning trace **and** final `\boxed{answer}` (`AIME-2026` & `GPQA-Diamond` shield) |
-| **General English Multi-Turn Replay** | `HuggingFaceH4/ultrachat_200k` (`train_sft`) | `4,500` (`3.75%`) | Multi-turn English instruction following (`MMLU-Pro` shield) |
+| **Arabic Reasoning CoT** | `AdaMLLab/smolkalam-arabic-conversational-sft` (`s1k_1.1_think`, `OpenThoughts3_50K`, `*_think`), `Gheras/Medical_Reasoning_Arabic_Dataset` | `10,500` (`35.00%`) | Explicit `reasoning_content` separated into Gemma 4 `<\|channel>thought\n...<channel\|>`, zero raw `<think>` tags |
+| **MSA Science & Instruction** | `AdaMLLab/smolkalam-arabic-conversational-sft` (`Mixture_of_Thoughts_science_no_think` + `OpenHermes_2.5_no_think`), `FreedomIntelligence/alpaca-gpt4-arabic` | `7,000` (`23.33%`) | High-complexity MSA STEM & instruction following, 70% zero-system-prompt alignment for 0-shot OALL v2 |
+| **Saudi Dialect, Legal & Human Arabic** | `VohoAI/voho-saudi-dialogues`, `SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus` (`moj` + `boe`), `CohereLabs/aya_dataset` (`ars` / `arb`) | `5,000` (`16.67%`) | Najdi/Hijazi/Khaliji dialogues, active Saudi statutory law QA, human-annotated Arabic |
+| **Code Generation Replay** | `nvidia/OpenCodeReasoning` (`split_0`), `open-r1/codeforces-cots` (`solutions_py_decontaminated`), `m-a-p/CodeFeedback-Filtered-Instruction` | `2,500` (`8.33%`) | Competitive programming CoT (`LiveCodeBench-v6` retention shield) |
+| **Competition Math & Science Replay** | `nvidia/OpenMathInstruct-2` (`train_1M`), `nvidia/OpenScienceReasoning-2` | `4,000` (`13.33%`) | Preserves full reasoning trace **and** final `\boxed{answer}` (`AIME-2026` & `GPQA-Diamond` shield) |
+| **General English Multi-Turn Replay** | `HuggingFaceH4/ultrachat_200k` (`train_sft`) | `1,000` (`3.33%`) | Multi-turn English instruction following (`MMLU-Pro` shield) |
 
-### Stage 2: Conversational DPO Preference Alignment (`20,000` Pairs)
+### Stage 2: Thinking-Aware Conversational DPO Alignment (`6,000` Length-Balanced Pairs | 43.3% Thinking CoT)
 
-| Subset | Hugging Face Source | Share | Hygiene & Formatting (`src/dpo_formatter.py`) |
+| Subset | Hugging Face Source | Target Pairs (`Share`) | Hygiene & Formatting (`src/dpo_formatter.py`) |
 | :--- | :--- | :---: | :--- |
-| **Saudi Dialect Preferences** | `HeshamHaroon/arabic-dialect-dpo` (`saudi`) | `20%` | Conversational `{prompt, chosen, rejected}`, strips prompt leakage & `<start_of_turn>` artifacts |
-| **MSA & Cultural Safety** | `arcee-globe/arabic-orpo-dpo-mix-40k-filtered` | `65%` | Unifies user prompts across `chosen`/`rejected`, enforces length-ratio hygiene (`<= 2.5x`) |
-| **English Preference Replay** | `argilla/ultrafeedback-binarized-preferences-cleaned` | `15%` | High-margin (`>= 1.5`, `chosen_rating >= 4.5`) English anchor preventing Stage 2 English drift |
+| **MSA & Cultural Alignment** | `arcee-globe/arabic-orpo-dpo-mix-40k-filtered` (non-thinking) | `2,600` (`43.33%`) | Unifies user prompts, strict terminal sentence punctuation, `0.55..1.75` length balance, 0% SFT prompt overlap |
+| **Arabic Thinking CoT DPO** | `arcee-globe/arabic-orpo-dpo-mix-40k-filtered` (`enable_thinking=True`) | `1,600` (`26.67%`) | Multi-step Arabic reasoning separated into `<\|channel>thought` + concise final answer |
+| **Competition Math Thinking CoT DPO** | `argilla/distilabel-math-preference-dpo` (`enable_thinking=True`) | `1,000` (`16.67%`) | High-margin (`chosen >= 9.0, margin >= 2.0`) STEM CoT alignment preserving thinking mode |
+| **English Preference Replay** | `argilla/ultrafeedback-binarized-preferences-cleaned` | `800` (`13.33%`) | High-margin (`>= 1.5`, `chosen_rating >= 4.5`) English anchor preventing Stage 2 English drift |
 
 ---
 
@@ -117,7 +118,7 @@ bash scripts/run_dual_a100_pipeline.sh
 ### 3. Modular CLI Execution
 
 ```bash
-# Pull pre-built V2 datasets (or build locally on CPU):
+# Pull pre-built V3 datasets (or build locally on CPU):
 python scripts/build_sft_dataset.py --config configs/sft_26b_a4b_a100.yaml --output-dir data/sft_mixed --pull-from-hub
 python scripts/build_dpo_dataset.py --config configs/dpo_26b_a4b_a100.yaml --output-dir data/dpo_mixed --pull-from-hub
 

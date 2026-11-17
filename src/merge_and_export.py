@@ -390,6 +390,12 @@ def export_merged_checkpoint(
     if export_format in {"merged_16bit", "both"}:
         out_16bit = output_dir / "merged_16bit"
         out_16bit.mkdir(parents=True, exist_ok=True)
+        for stale_file in list(out_16bit.glob("*.safetensors")) + [out_16bit / "model.safetensors.index.json"]:
+            if stale_file.is_file():
+                try:
+                    stale_file.unlink()
+                except OSError:
+                    pass
         cfg = getattr(model, "config", None)
         if cfg is not None:
             try:
@@ -643,6 +649,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise FileNotFoundError(
             f"Adapter directory '{adapter_path}' is missing `adapter_config.json`! Cannot merge."
         )
+
+    if args.force and out_16bit_dir.exists():
+        logger.info("--force enabled: removing existing %s before disk space check and re-merge.", out_16bit_dir)
+        shutil.rmtree(out_16bit_dir, ignore_errors=True)
+        stale_manifest = out_root / "merge_manifest.json"
+        if stale_manifest.is_file():
+            try:
+                stale_manifest.unlink()
+            except OSError:
+                pass
 
     # Free intermediate checkpoint-* directories before writing large BF16 safetensors
     _prune_adapter_checkpoints(args.sft_adapter_dir)

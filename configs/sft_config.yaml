@@ -59,9 +59,9 @@ training:
   per_device_eval_batch_size: 1
   gradient_accumulation_steps: 16
   optim: "paged_adamw_8bit"
-  learning_rate: 5.0e-5
+  learning_rate: 2.0e-5
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.05
+  warmup_ratio: 0.08
   weight_decay: 0.01
   max_grad_norm: 1.0
   neftune_noise_alpha: null
@@ -88,7 +88,7 @@ chat_template:
   empty_thinking_block: "<|channel>thought\n<channel|>"
 
 datasets:
-  total_target_samples: 120000
+  total_target_samples: 30000
   arabic_mix_ratio: 0.75
   replay_mix_ratio: 0.25
   output_dataset_dir: "data/sft_mixed"
@@ -99,56 +99,62 @@ datasets:
       repo_id: "AdaMLLab/smolkalam-arabic-conversational-sft"
       config_name: "Mixture_of_Thoughts_science_no_think"
       split: "train"
-      target_samples: 15000
+      target_samples: 3000
       enable_thinking: false
 
     smolkalam_arabic_reasoning_cot:
       repo_id: "AdaMLLab/smolkalam-arabic-conversational-sft"
-      config_name: "OpenThoughts3_50K"
+      config_names:
+        - "s1k_1.1_think"
+        - "OpenThoughts3_50K"
+        - "multi_turn_reasoning_if_think"
+        - "smoltalk_systemchats_Qwen3_32B_think"
+        - "smoltalk_everyday_convs_reasoning_Qwen3_32B_think"
+        - "aya_dataset_Qwen3_32B_think"
       split: "train"
-      target_samples: 12000
+      target_samples: 7500
       enable_thinking: true
 
     smolkalam_arabic_openhermes:
       repo_id: "AdaMLLab/smolkalam-arabic-conversational-sft"
       config_name: "OpenHermes_2.5_no_think"
       split: "train"
-      target_samples: 15000
+      target_samples: 2500
       enable_thinking: false
 
     arabic_math_reasoning_synth:
       repo_id: "oddadmix/arabic-math-reasoning-synth"
       config_name: "default"
       split: "train"
-      target_samples: 12000
+      target_samples: 0
       enable_thinking: true
 
     alpaca_gpt4_arabic:
       repo_id: "FreedomIntelligence/alpaca-gpt4-arabic"
       config_name: "default"
       split: "train"
-      target_samples: 12000
+      target_samples: 1500
       enable_thinking: false
 
     medical_reasoning_arabic:
       repo_id: "Gheras/Medical_Reasoning_Arabic_Dataset"
       config_name: "default"
       split: "train"
-      target_samples: 6000
+      target_samples: 3000
       enable_thinking: true
 
     aya_dataset_arabic:
       repo_id: "CohereLabs/aya_dataset"
       config_name: "default"
       split: "train"
-      target_samples: 6000
+      target_samples: 1500
       enable_thinking: false
 
     voho_saudi_dialogues:
       repo_id: "VohoAI/voho-saudi-dialogues"
       config_name: "default"
       split: "train"
-      target_samples: 6000
+      target_samples: 1750
       enable_thinking: false
       strip_speaker_prefixes: true
       json_column: "messages_json"
@@ -159,7 +165,7 @@ datasets:
         - "moj"
         - "boe"
       split: "train"
-      target_samples: 6000
+      target_samples: 1750
       enable_thinking: false
 
   replay_sources:
@@ -167,40 +173,40 @@ datasets:
       repo_id: "nvidia/OpenCodeReasoning"
       config_name: "split_0"
       split: "split_0"
-      target_samples: 7500
+      target_samples: 1500
       enable_thinking: true
 
     codeforces_python_cot:
       repo_id: "open-r1/codeforces-cots"
       config_name: "solutions_py_decontaminated"
       split: "train"
-      target_samples: 2500
+      target_samples: 500
       enable_thinking: true
 
     codefeedback_instruction:
       repo_id: "m-a-p/CodeFeedback-Filtered-Instruction"
       config_name: "default"
       split: "train"
-      target_samples: 2000
+      target_samples: 500
       enable_thinking: false
 
     openmath_instruct2_cot:
       repo_id: "nvidia/OpenMathInstruct-2"
       config_name: "default"
       split: "train_1M"
-      target_samples: 7500
+      target_samples: 2250
       enable_thinking: true
 
     openscience_reasoning2_cot:
       repo_id: "nvidia/OpenScienceReasoning-2"
       config_name: "default"
       split: "train"
-      target_samples: 6000
+      target_samples: 1750
       enable_thinking: true
 
     ultrachat_english_replay:
       repo_id: "HuggingFaceH4/ultrachat_200k"
       config_name: "default"
       split: "train_sft"
-      target_samples: 4500
+      target_samples: 1000
       enable_thinking: false

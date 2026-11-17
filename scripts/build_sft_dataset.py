@@ -461,7 +461,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     total_target = int(
         args.max_samples
         if args.max_samples is not None
-        else (24 if args.dry_run else ds_cfg.get("total_target_samples", 120000))
+        else (24 if args.dry_run else ds_cfg.get("total_target_samples", 30000))
     )
     output_dir = pathlib.Path(
         args.output_dir or ds_cfg.get("output_dataset_dir", "data/sft_mixed")
@@ -608,12 +608,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             )
 
-        # Top up any strict-hygiene / deduplication deficit from high-signal Arabic pools
+        # Top up any strict-hygiene / deduplication deficit from high-purity Arabic pools
+        # (thinking-first so any Arabic CoT shortfall is replenished by CoT rows, never noisy synth)
         for topup_key in (
-            "smolkalam_arabic_openhermes",
+            "smolkalam_arabic_reasoning_cot",
             "smolkalam_arabic_science",
+            "smolkalam_arabic_openhermes",
             "alpaca_gpt4_arabic",
-            "arabic_math_reasoning_synth",
         ):
             deficit = arabic_target_total - len(arabic_samples)
             if deficit <= 0:

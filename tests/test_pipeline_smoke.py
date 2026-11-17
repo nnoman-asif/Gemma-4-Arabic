@@ -194,8 +194,11 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(sft_cfg["datasets"]["arabic_mix_ratio"], 0.75)
         self.assertEqual(sft_cfg["datasets"]["replay_mix_ratio"], 0.25)
 
-        self.assertEqual(dpo_cfg["dpo"]["beta"], 0.1)
-        self.assertEqual(dpo_cfg["training"]["learning_rate"], 5.0e-6)
+        self.assertEqual(dpo_cfg["dpo"]["beta"], 0.2)
+        self.assertEqual(dpo_cfg["training"]["learning_rate"], 2.0e-6)
+        self.assertTrue(dpo_cfg["vram_optimization"]["precompute_ref_log_probs"])
+        self.assertTrue(dpo_e4b_cfg["vram_optimization"]["precompute_ref_log_probs"])
+        self.assertTrue(dpo_26b_cfg["vram_optimization"]["precompute_ref_log_probs"])
         self.assertEqual(dpo_cfg["dpo"]["max_length"], 1536)
         self.assertEqual(dpo_e4b_cfg["dpo"]["max_length"], 3072)
         self.assertEqual(dpo_26b_cfg["dpo"]["max_length"], 3072)
@@ -678,15 +681,16 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         sft_e4b = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "sft_e4b_a100.yaml").read_text(encoding="utf-8")
         )
-        self.assertEqual(sft_e4b["lora"]["r"], 32)
-        self.assertEqual(sft_e4b["lora"]["lora_alpha"], 32)
+        self.assertEqual(sft_e4b["lora"]["r"], 16)
+        self.assertEqual(sft_e4b["lora"]["lora_alpha"], 16)
+        self.assertEqual(sft_e4b["datasets"]["total_target_samples"], 30000)
         self.assertFalse(sft_e4b["lora"]["use_rslora"])
 
         sft_26b = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "sft_26b_a4b_a100.yaml").read_text(encoding="utf-8")
         )
         self.assertEqual(sft_26b["model"]["base_model_id"], PRIMARY_MODEL_ID_26B)
-        self.assertEqual(sft_26b["datasets"]["total_target_samples"], 120000)
+        self.assertEqual(sft_26b["datasets"]["total_target_samples"], 30000)
         self.assertEqual(sft_26b["lora"]["r"], 16)
         self.assertEqual(sft_26b["lora"]["lora_alpha"], 16)
         self.assertFalse(sft_26b["lora"]["use_rslora"])
@@ -1987,6 +1991,207 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         for idx, raw_snip in enumerate(py_snippets):
             unescaped = raw_snip.replace('\\"', '"').replace("\\$", "$")
             compile(unescaped, f"run_dual_a100_pipeline.sh:snippet_{idx}", "exec")
+
+    def test_14_v3_end_to_end_fixes(self) -> None:
+        """Verify all V3 root-cause fixes across 26B masking, DPO ref precompute, LightEval spacing, GPU env, and preflight gate."""
+        import os
+        from transformers import TrainerControl, TrainerState, TrainingArguments
+        from scripts.run_benchmarks import (
+            evaluate_preflight_gate_metrics,
+            normalize_lighteval_mcq_continuation_space,
+        )
+        from src.dpo_formatter import (
+            _has_complete_terminal_ending,
+            normalize_arabic_reasoning_thinking_dpo_row,
+            normalize_distilabel_math_thinking_dpo_row,
+        )
+        from src.train_dpo import DPORefSanityCallback, preserve_stage1_adapter_for_ref_precompute
+
+        # 1. Verify 26B-A4B EMPTY_THOUGHT_CHANNEL is strictly masked out (assistant_masks = 0)
+        class _ExactCharTok:
+            def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+                return [ord(ch) for ch in text]
+
+        msgs_26b_direct = [
+            {"role": "user", "content": "سؤال؟", "reasoning_content": ""},
+            {"role": "assistant", "content": "الجواب.", "reasoning_content": ""},
+        ]
+        tok_out = build_tokenized_sft_Turn_masks(
+            msgs_26b_direct,
+            tokenizer=_ExactCharTok(),
+            max_seq_length=512,
+            enable_thinking=False,
+            is_26b_moe=True,
+        )
+        self.assertIsNotNone(tok_out)
+        assert tok_out is not None
+        supervised_text = "".join(
+            chr(tid) for tid, m in zip(tok_out["input_ids"], tok_out["assistant_masks"]) if m == 1
+        )
+        unsupervised_text = "".join(
+            chr(tid) for tid, m in zip(tok_out["input_ids"], tok_out["assistant_masks"]) if m == 0
+        )
+        self.assertEqual(supervised_text, "الجواب.<turn|>\n")
+        self.assertIn(EMPTY_THINKING_BLOCK, unsupervised_text)
+        self.assertNotIn(EMPTY_THINKING_BLOCK, supervised_text)
+
+        # 2. Verify LightEval VLLMModel SentencePiece leading-space normalization
+        self.assertEqual(
+            normalize_lighteval_mcq_continuation_space("الإجابة:", "أ"),
+            " أ",
+        )
+        self.assertEqual(
+            normalize_lighteval_mcq_continuation_space("Answer:", "B"),
+            " B",
+        )
+        self.assertEqual(
+            normalize_lighteval_mcq_continuation_space("الإجابة: ", "أ"),
+            "أ",
+        )
+        self.assertEqual(
+            normalize_lighteval_mcq_continuation_space("الإجابة:\n", "أ"),
+            "أ",
+        )
+
+        # 3. Verify strict DPO terminal-ending filter & thinking-mode CoT DPO normalizers
+        self.assertFalse(_has_complete_terminal_ending("تبدأ الإجراءات بالذهاب إلى مكتب"))
+        self.assertTrue(_has_complete_terminal_ending("تبدأ الإجراءات بالذهاب إلى المكتب."))
+        self.assertIsNone(
+            normalize_arcee_arabic_dpo_row(
+                {
+                    "prompt": "ما هي خطوات التسجيل في المنصة الوطنية الموحدة؟",
+                    "chosen": "تبدأ خطوات التسجيل بالدخول إلى البوابة الإلكترونية ثم إدخال رقم الهوية ولكن النص مقطوع في المنتصف بدون علامة ترقيم",
+                    "rejected": "لا أعرف كيفية التسجيل في المنصة.",
+                },
+                strict_hygiene=True,
+            )
+        )
+        ar_cot = normalize_arabic_reasoning_thinking_dpo_row(
+            {
+                "prompt": "احسب محيط مستطيل طوله 8 سم وعرضه 5 سم مع الشرح.",
+                "chosen": (
+                    "الخطوة الأولى: قانون محيط المستطيل يساوي ضعف مجموع الطول والعرض أي 2 * (الطول + العرض).\n\n"
+                    "الخطوة الثانية: نجمع 8 + 5 فنحصل على 13 ثم نضرب الناتج في 2.\n\n"
+                    "إذن محيط المستطيل يساوي 26 سنتيمتراً."
+                ),
+                "rejected": (
+                    "الخطوة الأولى: لحساب المحيط نضرب الطول في العرض مباشرة دون جمع الأضلاع.\n\n"
+                    "الخطوة الثانية: نضرب 8 في 5 فنحصل على القيمة العددية المطلوبة.\n\n"
+                    "إذن المحيط يساوي 40 سنتيمتراً."
+                ),
+            }
+        )
+        self.assertIsNotNone(ar_cot)
+        assert ar_cot is not None
+        self.assertTrue(ar_cot["enable_thinking"])
+        self.assertIn(CHANNEL_THOUGHT_PREFIX, ar_cot["chosen"])
+        self.assertIn(CHANNEL_THOUGHT_PREFIX, ar_cot["rejected"])
+
+        en_cot = normalize_distilabel_math_thinking_dpo_row(
+            {
+                "instruction": "Find the derivative of f(x) = x^3 + 4x step by step.",
+                "chosen_rating": 9.0,
+                "rejected_rating": 6.0,
+                "chosen_response": (
+                    "Step 1: Apply the power rule d/dx(x^n) = n*x^(n-1) to each term independently.\n\n"
+                    "Step 2: Differentiating x^3 gives 3x^2, and differentiating 4x gives 4.\n\n"
+                    "Therefore, f'(x) = 3x^2 + 4."
+                ),
+                "rejected_response": (
+                    "Step 1: Multiply each exponent by the coefficient without reducing the exponent.\n\n"
+                    "Step 2: For x^3 we write 3x^3 and for 4x we write 4x.\n\n"
+                    "Therefore, f'(x) = 3x^3 + 4x."
+                ),
+            }
+        )
+        self.assertIsNotNone(en_cot)
+        assert en_cot is not None
+        self.assertTrue(en_cot["enable_thinking"])
+
+        # 4. Verify _build_isolated_gpu_env overrides multi-GPU CUDA_VISIBLE_DEVICES="0,1"
+        old_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        try:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+            env0 = _build_isolated_gpu_env("0", "e4b_base")
+            env1 = _build_isolated_gpu_env("1", "e4b_tuned")
+            self.assertEqual(env0["CUDA_VISIBLE_DEVICES"], "0")
+            self.assertEqual(env1["CUDA_VISIBLE_DEVICES"], "1")
+        finally:
+            if old_cvd is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = old_cvd
+
+        # 5. Verify DPO precompute guard & DPORefSanityCallback fail-fast behavior
+        class _MockPeftModel:
+            def __init__(self) -> None:
+                self.disabled_calls = 0
+                self.added_adapters: List[str] = []
+
+            def disable_adapter(self):
+                import contextlib
+
+                @contextlib.contextmanager
+                def _cm():
+                    self.disabled_calls += 1
+                    yield
+
+                return _cm()
+
+            def add_adapter(self, name: str, cfg: Any) -> None:
+                self.added_adapters.append(name)
+
+            def get_parameter(self, name: str) -> torch.Tensor:
+                if ".ref." in name:
+                    raise AttributeError(name)
+                return torch.ones(2)
+
+        mock_pm = _MockPeftModel()
+        tbox: Dict[str, Any] = {}
+        with preserve_stage1_adapter_for_ref_precompute(mock_pm, tbox):
+            mock_pm.add_adapter("ref", {})
+            _ = mock_pm.get_parameter("layer.lora_A.ref.weight")
+            with mock_pm.disable_adapter():
+                pass
+        self.assertEqual(mock_pm.added_adapters, [])
+        self.assertEqual(mock_pm.disabled_calls, 0)
+
+        bad_cb = DPORefSanityCallback()
+        with self.assertRaises(RuntimeError):
+            bad_cb.on_log(
+                TrainingArguments(output_dir="outputs/_tmp_cb", logging_steps=10),
+                TrainerState(global_step=10),
+                TrainerControl(),
+                logs={"loss": 1.53, "grad_norm": 176.3},
+            )
+
+        # 6. Verify Pre-Flight Gate decision matrix (passed vs conservative lambda retry vs hard abort)
+        pf_ok = evaluate_preflight_gate_metrics(
+            {"ArabicMMLU": 52.0, "AlGhafa": 49.0},
+            {"ArabicMMLU": 56.5, "AlGhafa": 53.5},
+            69.5,
+            69.0,
+        )
+        self.assertTrue(pf_ok["gate_passed"])
+        self.assertFalse(pf_ok["needs_conservative_lambda_retry"])
+
+        pf_fb = evaluate_preflight_gate_metrics(
+            {"ArabicMMLU": 52.0, "AlGhafa": 49.0},
+            {"ArabicMMLU": 56.5, "AlGhafa": 53.5},
+            69.5,
+            63.0,
+        )
+        self.assertFalse(pf_fb["gate_passed"])
+        self.assertTrue(pf_fb["needs_conservative_lambda_retry"])
+
+        pf_ab = evaluate_preflight_gate_metrics(
+            {"ArabicMMLU": 52.0, "AlGhafa": 49.0},
+            {"ArabicMMLU": 50.0, "AlGhafa": 47.0},
+            69.5,
+            69.2,
+        )
+        self.assertFalse(pf_ab["gate_passed"])
+        self.assertFalse(pf_ab["needs_conservative_lambda_retry"])
 
 
 if __name__ == "__main__":

@@ -323,17 +323,22 @@ def build_tokenized_sft_Turn_masks(
             input_ids.extend(u_ids)
             assistant_masks.extend([0] * len(u_ids))
         elif role == "assistant":
-            # Prompt header `<|turn>model\n` is masked (0)
-            header_ids = _encode_segment(f"{TURN_START_TOKEN}model\n")
+            clean_answer = strip_embedded_thinking_from_content(content)
+            emit_full_thought = bool(effective_thinking and reasoning and idx > last_user_idx)
+
+            # Prompt header (`<|turn>model\n`, plus `<|channel>thought\n<channel|>` prefill on
+            # non-thinking / prior-turn 26B-A4B turns) is ALWAYS masked (assistant_masks = 0)
+            # so 26B-A4B is never trained to predict an empty `<channel|>` token!
+            header_str = f"{TURN_START_TOKEN}model\n"
+            if is_26b_moe and not emit_full_thought:
+                header_str += EMPTY_THOUGHT_CHANNEL
+            header_ids = _encode_segment(header_str)
             input_ids.extend(header_ids)
             assistant_masks.extend([0] * len(header_ids))
 
-            # Assistant completion body + `<turn|>\n` is supervised (1)
-            clean_answer = strip_embedded_thinking_from_content(content)
-            if effective_thinking and reasoning and idx > last_user_idx:
+            # Assistant completion body + `<turn|>\n` is supervised (assistant_masks = 1)
+            if emit_full_thought:
                 comp_seg = f"{THOUGHT_CHANNEL_OPEN}{reasoning}{THOUGHT_CHANNEL_CLOSE}{clean_answer}{TURN_END_TOKEN}\n"
-            elif not effective_thinking and is_26b_moe:
-                comp_seg = f"{EMPTY_THOUGHT_CHANNEL}{clean_answer}{TURN_END_TOKEN}\n"
             else:
                 comp_seg = f"{clean_answer}{TURN_END_TOKEN}\n"
 

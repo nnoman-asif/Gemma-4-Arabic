@@ -34,8 +34,8 @@ vram_optimization:
 
 lora:
   use_rslora: false
-  r: 32
-  lora_alpha: 32
+  r: 16
+  lora_alpha: 16
   lora_dropout: 0.0
   bias: "none"
   use_gradient_checkpointing: "unsloth"
@@ -60,9 +60,9 @@ training:
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 8
   optim: "adamw_bnb_8bit"
-  learning_rate: 5.0e-5
+  learning_rate: 2.0e-5
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.05
+  warmup_ratio: 0.08
   weight_decay: 0.01
   max_grad_norm: 1.0
   neftune_noise_alpha: null
@@ -89,7 +89,7 @@ chat_template:
   empty_thinking_block: "<|channel>thought\n<channel|>"
 
 datasets:
-  total_target_samples: 120000
+  total_target_samples: 30000
   arabic_mix_ratio: 0.75
   replay_mix_ratio: 0.25
   output_dataset_dir: "data/sft_mixed"

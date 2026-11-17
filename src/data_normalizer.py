@@ -409,11 +409,11 @@ def normalize_smolkalam_row(
                 if not (content.startswith("<think>") and "</think>" in content):
                     return None
                 reasoning, answer = parse_reasoning_and_content(content)
-                if len(reasoning) < 40 or len(answer) < 20:
+                if len(reasoning) < 40 or len(answer) < 15:
                     return None
                 if "<think>" in answer or "</think>" in answer:
                     return None
-                if arabic_char_ratio(answer) < 0.45:
+                if arabic_char_ratio(reasoning + " " + answer) < 0.45 or arabic_char_ratio(answer) < 0.25:
                     return None
                 turns.append(
                     {
@@ -818,7 +818,8 @@ def load_and_normalize_arabic_sft_source(
 
     spec = SFT_ARABIC_DATASETS[source_key]
     limit = max_samples if max_samples is not None else spec.target_samples
-    per_cfg_limit = max(1, limit // max(1, len(spec.configs)))
+    if limit <= 0:
+        return []
     collected: List[Dict[str, Any]] = []
     dedup_set = seen_prompts if seen_prompts is not None else set()
 
@@ -847,11 +848,15 @@ def load_and_normalize_arabic_sft_source(
                     yield json.loads(raw_line)
 
     for idx_cfg, cfg_name in enumerate(spec.configs):
-        target_for_this_cfg = (
-            limit - len(collected) if idx_cfg == len(spec.configs) - 1 else per_cfg_limit
-        )
-        if target_for_this_cfg <= 0:
+        remaining_total = limit - len(collected)
+        if remaining_total <= 0:
             break
+        remaining_cfgs = max(1, len(spec.configs) - idx_cfg)
+        target_for_this_cfg = (
+            remaining_total
+            if remaining_cfgs == 1
+            else (remaining_total + remaining_cfgs - 1) // remaining_cfgs
+        )
 
         if source_key == "saudi_arabic_laws":
             try:
@@ -896,8 +901,8 @@ def load_and_normalize_arabic_sft_source(
                     row,
                     source_key=source_key,
                     require_thinking=True,
-                    min_lr=0.85,
-                    min_scr=0.88,
+                    min_lr=0.78,
+                    min_scr=0.80,
                     tokenizer=tokenizer,
                     decontaminator=decontaminator,
                 )

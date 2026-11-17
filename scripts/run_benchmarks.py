@@ -252,6 +252,70 @@ def _resolve_hf_eval_cache_dir() -> Optional[str]:
     return None
 
 
+def normalize_lighteval_mcq_continuation_space(
+    context: str,
+    continuation: str,
+    start_space: bool = True,
+) -> str:
+    """Ensure log-likelihood MCQ continuations carry a leading space when `context` does not end in whitespace.
+
+    Fixes upstream `lighteval` `VLLMModel` parity with `TransformersModel._check_continuations_start_space`:
+    `VLLMModelConfig(multichoice_continuations_start_space=True)` is ignored by `VLLMModel._loglikelihood_tokens`,
+    which otherwise glues `("الإجابة:", "أ")` into `"الإجابة:أ"` (`[':', 'أ']` medial piece) instead of
+    `"الإجابة: أ"` (`[':', '▁أ']` standalone word-piece) on SentencePiece tokenizers like Gemma 4.
+    """
+    if (
+        start_space
+        and isinstance(context, str)
+        and isinstance(continuation, str)
+        and continuation
+        and not continuation[0].isspace()
+        and (not context or not context[-1].isspace())
+    ):
+        return f" {continuation}"
+    return continuation
+
+
+def _enable_vllm_language_model_only_default() -> bool:
+    """Idempotently default `vllm.LLM(..., language_model_only=True)` in text-only benchmark processes.
+
+    Skips allocating Gemma 4 vision/audio tower weights and bypasses the ~50s 3-video encoder profiling
+    overhead (`EncoderRunner.profile_encoder_cache`) on `vLLM >= 0.30`.
+    """
+    try:
+        import dataclasses
+        import vllm
+        from vllm.engine.arg_utils import EngineArgs
+
+        valid_fields = {f.name for f in dataclasses.fields(EngineArgs)}
+        if "language_model_only" not in valid_fields:
+            return False
+        if getattr(vllm.LLM.__init__, "_gemma4_lm_only_patched", False):
+            return True
+        orig_init = vllm.LLM.__init__
+
+        def _patched_llm_init(self: Any, *args: Any, **kwargs: Any) -> None:
+            kwargs.setdefault("language_model_only", True)
+            orig_init(self, *args, **kwargs)
+
+        setattr(_patched_llm_init, "_gemma4_lm_only_patched", True)
+        vllm.LLM.__init__ = _patched_llm_init  # type: ignore[method-assign]
+        return True
+    except Exception:
+        return False
+
+
+def _vllm_supports_language_model_only() -> bool:
+    """Return True if installed `vllm.engine.arg_utils.EngineArgs` exposes `language_model_only`."""
+    try:
+        import dataclasses
+        from vllm.engine.arg_utils import EngineArgs
+
+        return "language_model_only" in {f.name for f in dataclasses.fields(EngineArgs)}
+    except Exception:
+        return False
+
+
 def _find_free_localhost_port() -> int:
     """Bind to port 0 on 127.0.0.1 momentarily to obtain a collision-free localhost port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -268,9 +332,11 @@ def _build_isolated_gpu_env(device: str = "cuda:0", tag: str = "") -> Dict[str, 
     workers never collide on TCP ports or TorchInductor/Triton JIT compiler locks.
     """
     child_env = os.environ.copy()
-    if ":" in device and "CUDA_VISIBLE_DEVICES" not in os.environ:
-        gpu_idx = device.split(":")[1]
-        child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+    existing_cvd = [x.strip() for x in str(os.environ.get("CUDA_VISIBLE_DEVICES", "")).split(",") if x.strip()]
+    dev_str = str(device).strip()
+    if (":" in dev_str or dev_str.isdigit()) and len(existing_cvd) != 1:
+        gpu_idx = int(dev_str.split(":")[1] if ":" in dev_str else dev_str)
+        child_env["CUDA_VISIBLE_DEVICES"] = existing_cvd[gpu_idx] if gpu_idx < len(existing_cvd) else str(gpu_idx)
 
     vis_gpu = str(child_env.get("CUDA_VISIBLE_DEVICES", "0")).split(",")[0].strip() or "0"
     safe_tag = re.sub(r"[^a-zA-Z0-9_]+", "_", str(tag or "eval")).strip("_").lower()
@@ -2222,7 +2288,12 @@ import inspect, json, logging, os, pathlib, sys
 for _n in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 sys.path.insert(0, {repr(str(PROJECT_ROOT))})
-from scripts.run_benchmarks import _destroy_vllm_and_free_vram, _prepare_gemma4_config_for_load
+from scripts.run_benchmarks import (
+    _destroy_vllm_and_free_vram,
+    _enable_vllm_language_model_only_default,
+    _prepare_gemma4_config_for_load,
+    normalize_lighteval_mcq_continuation_space,
+)
 try:
     _prepare_gemma4_config_for_load({repr(load_target_path)})
 except Exception:
@@ -2244,7 +2315,18 @@ doc_counts = {{}}
 try:
     if use_vllm:
         try:
-            from lighteval.models.vllm.vllm_model import VLLMModelConfig
+            _enable_vllm_language_model_only_default()
+            from lighteval.models.vllm.vllm_model import VLLMModel, VLLMModelConfig
+
+            class Gemma4ArabicVLLMModel(VLLMModel):
+                def tok_encode_pair(self, context, continuation, pairwise=False):
+                    continuation = normalize_lighteval_mcq_continuation_space(
+                        context,
+                        continuation,
+                        start_space=bool(getattr(self, "multichoice_continuations_start_space", True)),
+                    )
+                    return super().tok_encode_pair(context, continuation, pairwise=pairwise)
+
             pipeline_params = PipelineParameters(
                 launcher_type=ParallelismManager.VLLM,
                 custom_tasks_directory="lighteval.tasks.multilingual.tasks.arabic",
@@ -2261,14 +2343,17 @@ try:
                 override_chat_template=False,
                 trust_remote_code=True,
             )
+            if "multichoice_continuations_start_space" in inspect.signature(VLLMModelConfig).parameters:
+                _vllm_kw["multichoice_continuations_start_space"] = True
             if "enable_prefix_caching" in inspect.signature(VLLMModelConfig).parameters:
-                _vllm_kw["enable_prefix_caching"] = True
+                _vllm_kw["enable_prefix_caching"] = False
             model_config = VLLMModelConfig(**_vllm_kw)
+            vllm_ar_model = Gemma4ArabicVLLMModel(model_config)
             pipeline = Pipeline(
                 tasks={repr(tasks_csv)},
                 pipeline_parameters=pipeline_params,
                 evaluation_tracker=evaluation_tracker,
-                model_config=model_config,
+                model=vllm_ar_model,
             )
             doc_counts = {{
                 str(k): len(v)
@@ -2410,6 +2495,7 @@ sys.path.insert(0, {repr(str(PROJECT_ROOT))})
 from scripts.run_benchmarks import (
     _destroy_vllm_and_free_vram,
     _prepare_gemma4_config_for_load,
+    _vllm_supports_language_model_only,
     normalize_inspect_completion_for_scoring,
 )
 try:
@@ -2479,6 +2565,8 @@ try:
                 "trust_remote_code": True,
                 "timeout": 1200,
             }}
+            if _vllm_supports_language_model_only():
+                vllm_args["language_model_only"] = True
             if has_gemma4_parser:
                 vllm_args["reasoning_parser"] = "gemma4"
             gen_cfg = GenerateConfig(
@@ -2506,6 +2594,8 @@ try:
                 "trust_remote_code": True,
                 "timeout": 1200,
             }}
+            if _vllm_supports_language_model_only():
+                vllm_args["language_model_only"] = True
             if has_gemma4_parser:
                 vllm_args["reasoning_parser"] = "gemma4"
             gen_cfg = GenerateConfig(
@@ -2719,6 +2809,7 @@ for _n in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
 sys.path.insert(0, {repr(str(PROJECT_ROOT))})
 from scripts.run_benchmarks import (
     _destroy_vllm_and_free_vram,
+    _enable_vllm_language_model_only_default,
     _prepare_gemma4_config_for_load,
     normalize_lcb_code_completion,
 )
@@ -2747,6 +2838,7 @@ doc_counts = {{}}
 
 try:
     if {repr(bool(use_vllm))}:
+        _enable_vllm_language_model_only_default()
         from lighteval.models.vllm.vllm_model import VLLMModel, VLLMModelConfig
 
         class Gemma4LCBVLLMModel(VLLMModel):
@@ -3105,6 +3197,7 @@ def run_lm_eval_task(
         _install_lm_eval_unclosed_thought_guard()
     model_backend = "vllm" if use_vllm else "hf"
     if use_vllm:
+        _enable_vllm_language_model_only_default()
         model_args: Any = {
             "pretrained": model_path,
             "dtype": "bfloat16",
@@ -3115,6 +3208,8 @@ def run_lm_eval_task(
             "enable_thinking": use_thinking,
             "think_end_token": "<channel|>" if use_thinking else None,
         }
+        if _vllm_supports_language_model_only():
+            model_args["language_model_only"] = True
     else:
         model_args = {
             "pretrained": model_path,
@@ -3377,6 +3472,7 @@ def _evaluate_checkpoint_with_lm_eval(
 
             if effective_use_vllm:
                 try:
+                    _enable_vllm_language_model_only_default()
                     from lm_eval.models.vllm_causallms import VLLM
 
                     model_dir = pathlib.Path(model_path)
@@ -3404,6 +3500,8 @@ def _evaluate_checkpoint_with_lm_eval(
                         "enable_thinking": True,
                         "think_end_token": "<channel|>",
                     }
+                    if _vllm_supports_language_model_only():
+                        vllm_init_kw["language_model_only"] = True
                     if is_peft_vllm:
                         vllm_init_kw["lora_local_path"] = str(model_path)
                     lm_obj = VLLM(**vllm_init_kw)
@@ -4801,6 +4899,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--preflight-gate",
+        action="store_true",
+        default=False,
+        help=(
+            "Run a fast (~4-5 min) paired Base vs. Arabic-Tuned verification gate on ArabicMMLU, AlGhafa, "
+            "and MMLU-Pro (thinking mode) BEFORE launching full 40-suite evaluation, writing exclusively to "
+            "outputs/eval_reports/preflight_gate_report.json without touching live_raw_*.json."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate all 6 OALL v2 Arabic benchmarks, 4 retention anchors, and Markdown report generation.",
@@ -4917,6 +5025,225 @@ def _run_role_parallel_pair_on_dual_gpus(
     )
 
 
+def evaluate_preflight_gate_metrics(
+    base_ar: Dict[str, float],
+    tuned_ar: Dict[str, float],
+    base_mmlu_pro: float,
+    tuned_mmlu_pro: float,
+    min_base_arabic_mmlu: float = 40.0,
+    min_arabic_gain: float = 0.0,
+    max_mmlu_pro_drop: float = 4.5,
+) -> Dict[str, Any]:
+    """Pure decision gate checking paired Base vs. Tuned preflight probe scores."""
+    base_ar_mmlu = float(base_ar.get("ArabicMMLU", 0.0))
+    avg_base_ar = sum(base_ar.values()) / max(1, len(base_ar))
+    avg_tuned_ar = sum(tuned_ar.values()) / max(1, len(tuned_ar))
+    ar_gain = round(avg_tuned_ar - avg_base_ar, 4)
+    ret_delta = round(float(tuned_mmlu_pro) - float(base_mmlu_pro), 4)
+
+    reasons: List[str] = []
+    if base_ar_mmlu < min_base_arabic_mmlu:
+        reasons.append(
+            f"Base ArabicMMLU={base_ar_mmlu:.2f}% < {min_base_arabic_mmlu:.1f}% "
+            "(check LightEval continuation spacing / tokenizer)"
+        )
+    if ar_gain < min_arabic_gain:
+        reasons.append(
+            f"Average Arabic gain={ar_gain:+.2f} pts < {min_arabic_gain:+.2f} pts "
+            f"(Base={avg_base_ar:.2f}%, Tuned={avg_tuned_ar:.2f}%)"
+        )
+    if ret_delta < -abs(max_mmlu_pro_drop):
+        reasons.append(
+            f"Thinking-mode MMLU-Pro delta={ret_delta:+.2f} pts < -{abs(max_mmlu_pro_drop):.2f} pts "
+            f"(Base={base_mmlu_pro:.2f}%, Tuned={tuned_mmlu_pro:.2f}%)"
+        )
+
+    return {
+        "gate_passed": len(reasons) == 0,
+        "needs_conservative_lambda_retry": (ret_delta < -abs(max_mmlu_pro_drop) and ret_delta >= -15.0),
+        "base_arabic_mmlu": round(base_ar_mmlu, 2),
+        "avg_base_arabic": round(avg_base_ar, 2),
+        "avg_tuned_arabic": round(avg_tuned_ar, 2),
+        "arabic_gain_pts": round(ar_gain, 2),
+        "base_mmlu_pro": round(float(base_mmlu_pro), 2),
+        "tuned_mmlu_pro": round(float(tuned_mmlu_pro), 2),
+        "mmlu_pro_delta_pts": round(ret_delta, 2),
+        "failure_reasons": reasons,
+    }
+
+
+def _probe_single_checkpoint_preflight(
+    checkpoint_path: str,
+    device: str,
+    cfg: Dict[str, Any],
+    use_vllm: bool,
+    tag: str,
+) -> Tuple[Dict[str, float], float]:
+    """Run fast isolated Arabic (`ArabicMMLU`, `AlGhafa`) + Thinking (`MMLU-Pro`) preflight probes without touching `live_raw_*.json`."""
+    ar_raw = run_lighteval_tasks_subprocess(
+        model_path=checkpoint_path,
+        suite_names=["ArabicMMLU", "AlGhafa"],
+        device=device,
+        limit=300,
+        batch_size=16,
+        use_vllm=use_vllm,
+        tag=f"{tag}_ar",
+    )
+    ar_scores = {k: float(v["eval_score_pct"]) for k, v in ar_raw.items()}
+
+    mmlu_only_cfg = {
+        "evaluation": dict(cfg.get("evaluation", {})),
+        "models": dict(cfg.get("models", {})),
+        "arabic_benchmarks": {},
+        "retention_anchors": {
+            "MMLU-Pro": dict(cfg.get("retention_anchors", {}).get("MMLU-Pro", {
+                "runner": "lm_eval",
+                "domain": "english_reasoning",
+                "lm_eval_task": "mmlu_pro",
+                "metric": "exact_match,custom-extract",
+                "num_fewshot": 5,
+                "enable_thinking": True,
+            })),
+        },
+    }
+    ret_raw = _run_lm_eval_suites_subprocess(
+        model_path=checkpoint_path,
+        device=device,
+        cfg=mmlu_only_cfg,
+        tag=f"{tag}_ret",
+        limit=112,
+        use_vllm=use_vllm,
+        apply_chat_template=True,
+    )
+    mmlu_pro_pct = float(ret_raw["retention"]["MMLU-Pro"]["eval_score_pct"])
+    return ar_scores, mmlu_pro_pct
+
+
+def run_preflight_gate(
+    args: argparse.Namespace,
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Execute the fast Dual-GPU Pre-Flight Gate across target model(s) before full 40-suite evaluation."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    models_cfg = cfg.get("models", {})
+    target_keys = ["e4b", "26b_a4b"] if args.model_key == "both" else [args.model_key]
+    report_path = PROJECT_ROOT / "outputs" / "eval_reports" / "preflight_gate_report.json"
+
+    if args.dry_run:
+        payload = {
+            "status": "dry_run_preflight_passed",
+            "models_checked": target_keys,
+            "probes": ["ArabicMMLU", "AlGhafa", "MMLU-Pro"],
+        }
+        return payload
+
+    import torch
+
+    dual_gpu = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+    model_reports: Dict[str, Any] = {}
+    all_passed = True
+
+    default_dpo_map = {
+        "e4b": ("unsloth/gemma-4-E4B-it", "outputs/dpo_e4b_a100", "outputs/merged_gemma4_e4b_arabic"),
+        "26b_a4b": ("unsloth/gemma-4-26B-A4B-it", "outputs/dpo_26b_a4b_a100", "outputs/merged_gemma4_26b_a4b_arabic"),
+    }
+
+    for mk in target_keys:
+        entry = models_cfg.get(mk, {})
+        base_id = str(entry.get("base_model_id", "unsloth/gemma-4-E4B-it"))
+        tuned_path = str(
+            (args.model_path if args.model_key != "both" and args.model_path else None)
+            or entry.get("merged_checkpoint_dir")
+            or f"outputs/merged_gemma4_{mk}_arabic/merged_16bit"
+        )
+        if not (pathlib.Path(tuned_path) / "config.json").exists():
+            raise FileNotFoundError(f"[Preflight:{mk}] Merged checkpoint missing at {tuned_path}")
+
+        logger.info("[Preflight:%s] Running paired Base vs. Tuned gate on ArabicMMLU + AlGhafa + MMLU-Pro...", mk)
+        if dual_gpu:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_b = pool.submit(_probe_single_checkpoint_preflight, base_id, "cuda:0", cfg, args.use_vllm, f"{mk}:base_pf")
+                fut_t = pool.submit(_probe_single_checkpoint_preflight, tuned_path, "cuda:1", cfg, args.use_vllm, f"{mk}:tuned_pf")
+                base_ar, base_ret = fut_b.result()
+                tuned_ar, tuned_ret = fut_t.result()
+        else:
+            dev = str(entry.get("device", "cuda:0"))
+            base_ar, base_ret = _probe_single_checkpoint_preflight(base_id, dev, cfg, args.use_vllm, f"{mk}:base_pf")
+            tuned_ar, tuned_ret = _probe_single_checkpoint_preflight(tuned_path, dev, cfg, args.use_vllm, f"{mk}:tuned_pf")
+
+        gate = evaluate_preflight_gate_metrics(base_ar, tuned_ar, base_ret, tuned_ret)
+        gate["merge_lambda_used"] = 1.0
+
+        # Automatic conservative lambda=0.70 fallback re-merge if retention dipped slightly
+        if not gate["gate_passed"] and gate["needs_conservative_lambda_retry"] and mk in default_dpo_map:
+            remerge_base_id, dpo_dir_rel, merge_out_rel = default_dpo_map[mk]
+            dpo_dir_abs = PROJECT_ROOT / dpo_dir_rel
+            if (dpo_dir_abs / "adapter_config.json").exists():
+                logger.warning(
+                    "[Preflight:%s] Mild retention dip detected (%s); automatically re-merging with conservative --lambda-scale 0.70 --force...",
+                    mk,
+                    "; ".join(gate["failure_reasons"]),
+                )
+                remerge_cmd = [
+                    sys.executable,
+                    str(PROJECT_ROOT / "src" / "merge_and_export.py"),
+                    "--base-model",
+                    str(entry.get("base_model_id", remerge_base_id)),
+                    "--adapter-dir",
+                    str(dpo_dir_abs),
+                    "--output-dir",
+                    str(PROJECT_ROOT / merge_out_rel),
+                    "--lambda-scale",
+                    "0.70",
+                    "--export-format",
+                    "merged_16bit",
+                    "--force",
+                ]
+                remerge_rc = subprocess.run(remerge_cmd, cwd=str(PROJECT_ROOT)).returncode
+                if remerge_rc == 0:
+                    probe_dev = "cuda:1" if dual_gpu else str(entry.get("device", "cuda:0"))
+                    tuned_ar, tuned_ret = _probe_single_checkpoint_preflight(
+                        tuned_path, probe_dev, cfg, args.use_vllm, f"{mk}:tuned_l070_pf"
+                    )
+                    gate = evaluate_preflight_gate_metrics(base_ar, tuned_ar, base_ret, tuned_ret)
+                    gate["merge_lambda_used"] = 0.70
+
+        model_reports[mk] = gate
+        logger.info(
+            "[Preflight:%s] %s | Arabic Avg: %.2f%% -> %.2f%% (%+.2f) | MMLU-Pro: %.2f%% -> %.2f%% (%+.2f) | lambda=%.2f",
+            mk,
+            "PASSED" if gate["gate_passed"] else "FAILED",
+            gate["avg_base_arabic"],
+            gate["avg_tuned_arabic"],
+            gate["arabic_gain_pts"],
+            gate["base_mmlu_pro"],
+            gate["tuned_mmlu_pro"],
+            gate["mmlu_pro_delta_pts"],
+            gate["merge_lambda_used"],
+        )
+        if not gate["gate_passed"]:
+            all_passed = False
+
+    summary = {
+        "status": "passed" if all_passed else "failed",
+        "gate_passed": all_passed,
+        "models": model_reports,
+    }
+    _atomic_write_json(report_path, summary)
+    if not all_passed:
+        failed_msgs = [
+            f"{mk}: {'; '.join(rep['failure_reasons'])}"
+            for mk, rep in model_reports.items()
+            if not rep["gate_passed"]
+        ]
+        raise RuntimeError(
+            f"Pre-Flight Benchmark Gate FAILED ({' | '.join(failed_msgs)}). "
+            f"Full evaluation aborted early to prevent wasted GPU compute. See {report_path}."
+        )
+    return summary
+
+
 def _write_family_outputs(
     args: argparse.Namespace,
     eval_cfg: Dict[str, Any],
@@ -5003,6 +5330,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
         else:
             summary = prewarm_eval_datasets(cfg)
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    # Mode 1B: Fast paired Base vs. Tuned Pre-Flight Gate before full 40-suite evaluation
+    if args.preflight_gate:
+        summary = run_preflight_gate(args=args, cfg=cfg)
         print(json.dumps(summary, indent=2))
         return 0
 

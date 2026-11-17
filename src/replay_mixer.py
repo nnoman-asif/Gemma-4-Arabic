@@ -397,8 +397,11 @@ def compute_mix_allocation(
     ar_per_source: Dict[str, int] = {}
     allocated_ar = 0
     ar_keys = list(SFT_ARABIC_DATASETS.keys())
+    last_nonzero_ar = max((i for i, k in enumerate(ar_keys) if SFT_ARABIC_DATASETS[k].target_samples > 0), default=len(ar_keys) - 1)
     for idx, k in enumerate(ar_keys):
-        if idx == len(ar_keys) - 1:
+        if SFT_ARABIC_DATASETS[k].target_samples <= 0:
+            ar_per_source[k] = 0
+        elif idx == last_nonzero_ar:
             ar_per_source[k] = max(0, arabic_total - allocated_ar)
         else:
             share = int(round(arabic_total * (SFT_ARABIC_DATASETS[k].target_samples / ar_base_sum)))
@@ -408,8 +411,11 @@ def compute_mix_allocation(
     rep_per_source: Dict[str, int] = {}
     allocated_rep = 0
     rep_keys = list(SFT_REPLAY_DATASETS.keys())
+    last_nonzero_rep = max((i for i, k in enumerate(rep_keys) if SFT_REPLAY_DATASETS[k].target_samples > 0), default=len(rep_keys) - 1)
     for idx, k in enumerate(rep_keys):
-        if idx == len(rep_keys) - 1:
+        if SFT_REPLAY_DATASETS[k].target_samples <= 0:
+            rep_per_source[k] = 0
+        elif idx == last_nonzero_rep:
             rep_per_source[k] = max(0, replay_total - allocated_rep)
         else:
             share = int(round(replay_total * (SFT_REPLAY_DATASETS[k].target_samples / rep_base_sum)))

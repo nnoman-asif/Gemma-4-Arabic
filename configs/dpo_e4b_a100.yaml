@@ -24,12 +24,13 @@ vram_optimization:
   restore_towers_before_export: false
   free_ref_model_vram: true
   ref_model: null
-  precompute_ref_log_probs: false
+  precompute_ref_log_probs: true
+  precompute_ref_batch_size: 8
 
 lora:
   use_rslora: false
-  r: 32
-  lora_alpha: 32
+  r: 16
+  lora_alpha: 16
   lora_dropout: 0.0
   bias: "none"
   use_gradient_checkpointing: "unsloth"
@@ -44,7 +45,7 @@ lora:
     - "down_proj"
 
 dpo:
-  beta: 0.1
+  beta: 0.2
   tr_alpha: 0.6
   tr_update_steps: 0
   loss_type: "sigmoid"
@@ -59,7 +60,7 @@ training:
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 8
   optim: "adamw_bnb_8bit"
-  learning_rate: 5.0e-6
+  learning_rate: 2.0e-6
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.10
   weight_decay: 0.01
@@ -70,7 +71,7 @@ training:
   fp16: false
   dataloader_pin_memory: true
   dataloader_num_workers: 4
-  logging_steps: 20
+  logging_steps: 10
   save_strategy: "steps"
   save_steps: 100
   save_total_limit: 2
@@ -79,6 +80,18 @@ training:
   seed: 3407
 
 datasets:
-  total_target_pairs: 20000
+  total_target_pairs: 6000
   output_dataset_dir: "data/dpo_mixed"
   hf_hub_dataset_repo: "noman-asif/Arabic-Preference-DPO-20k"
+
+  preference_sources:
+    arabic_dialect_dpo_saudi:
+      weight: 0.0
+    arabic_orpo_dpo_mix_40k:
+      weight: 0.4333
+    arabic_reasoning_thinking_dpo:
+      weight: 0.2667
+    ultrafeedback_english_dpo:
+      weight: 0.1333
+    distilabel_math_thinking_dpo:
+      weight: 0.1667

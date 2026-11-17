@@ -161,8 +161,8 @@ SFT_ARABIC_RATIO: float = 0.75
 SFT_REPLAY_RATIO: float = 0.25
 SFT_MAX_TOKEN_LENGTH_FILTER: int = 3800
 
-DPO_BETA: float = 0.1
-DPO_LEARNING_RATE: float = 5.0e-6
+DPO_BETA: float = 0.2
+DPO_LEARNING_RATE: float = 2.0e-6
 DPO_MAX_SEQ_LENGTH: int = 3072
 DPO_MAX_PROMPT_LENGTH: int = 1536
 DPO_MAX_TOKEN_LENGTH_FILTER: int = 2800
@@ -172,7 +172,7 @@ DPO_TRUST_REGION_ALPHA: float = 0.6  # Legacy constant kept for backwards compat
 DEFAULT_MERGE_LAMBDA: float = 1.0
 DEFAULT_TIES_LAMBDA: float = 1.0
 DEFAULT_TIES_DENSITY: float = 1.0
-TIES_LAMBDA_SWEEP_CANDIDATES: Tuple[float, ...] = (0.85, 0.90, 1.00)
+TIES_LAMBDA_SWEEP_CANDIDATES: Tuple[float, ...] = (0.70, 0.85, 0.90, 1.00)
 
 
 @dataclass(frozen=True)
@@ -191,8 +191,8 @@ class DatasetSpec:
 
 
 # ---------------------------------------------------------------------------
-# Curated V2 Dataset Registry (100% Public `gated=False`, High-Signal, Verified)
-# Stage 1 SFT: 90,000 Arabic (75.0%) + 30,000 Replay (25.0%) = 120,000 Total
+# Curated V3 High-Purity Dataset Registry (100% Public `gated=False`, Verified)
+# Stage 1 SFT: 22,500 Arabic (75.0%) + 7,500 Replay (25.0%) = 30,000 Total (55% Thinking CoT)
 # ---------------------------------------------------------------------------
 SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
     "smolkalam_arabic_science": DatasetSpec(
@@ -202,17 +202,24 @@ SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=15_000,
+        target_samples=3_000,
         enable_thinking=False,
     ),
     "smolkalam_arabic_reasoning_cot": DatasetSpec(
         key="smolkalam_arabic_reasoning_cot",
         repo_id="AdaMLLab/smolkalam-arabic-conversational-sft",
-        configs=("OpenThoughts3_50K",),
+        configs=(
+            "s1k_1.1_think",
+            "OpenThoughts3_50K",
+            "multi_turn_reasoning_if_think",
+            "smoltalk_systemchats_Qwen3_32B_think",
+            "smoltalk_everyday_convs_reasoning_Qwen3_32B_think",
+            "aya_dataset_Qwen3_32B_think",
+        ),
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=12_000,
+        target_samples=7_500,
         enable_thinking=True,
     ),
     "smolkalam_arabic_openhermes": DatasetSpec(
@@ -222,7 +229,7 @@ SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=15_000,
+        target_samples=2_500,
         enable_thinking=False,
     ),
     "arabic_math_reasoning_synth": DatasetSpec(
@@ -232,7 +239,7 @@ SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=12_000,
+        target_samples=0,
         enable_thinking=True,
     ),
     "alpaca_gpt4_arabic": DatasetSpec(
@@ -242,7 +249,7 @@ SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=12_000,
+        target_samples=1_500,
         enable_thinking=False,
     ),
     "medical_reasoning_arabic": DatasetSpec(
@@ -252,7 +259,7 @@ SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=6_000,
+        target_samples=3_000,
         enable_thinking=True,
     ),
     "aya_dataset_arabic": DatasetSpec(
@@ -262,7 +269,7 @@ SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=6_000,
+        target_samples=1_500,
         enable_thinking=False,
     ),
     "voho_saudi_dialogues": DatasetSpec(
@@ -272,7 +279,7 @@ SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=6_000,
+        target_samples=1_750,
         enable_thinking=False,
     ),
     "saudi_arabic_laws": DatasetSpec(
@@ -282,7 +289,7 @@ SFT_ARABIC_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="arabic",
-        target_samples=6_000,
+        target_samples=1_750,
         enable_thinking=False,
         fallback_repo_id=None,
     ),
@@ -296,7 +303,7 @@ SFT_REPLAY_DATASETS: Dict[str, DatasetSpec] = {
         default_split="split_0",
         stage="sft",
         role="replay",
-        target_samples=7_500,
+        target_samples=1_500,
         enable_thinking=True,
     ),
     "codeforces_python_cot": DatasetSpec(
@@ -306,7 +313,7 @@ SFT_REPLAY_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="replay",
-        target_samples=2_500,
+        target_samples=500,
         enable_thinking=True,
     ),
     "codefeedback_instruction": DatasetSpec(
@@ -316,7 +323,7 @@ SFT_REPLAY_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="replay",
-        target_samples=2_000,
+        target_samples=500,
         enable_thinking=False,
     ),
     "openmath_instruct2_cot": DatasetSpec(
@@ -326,7 +333,7 @@ SFT_REPLAY_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train_1M",
         stage="sft",
         role="replay",
-        target_samples=7_500,
+        target_samples=2_250,
         enable_thinking=True,
     ),
     "openscience_reasoning2_cot": DatasetSpec(
@@ -336,7 +343,7 @@ SFT_REPLAY_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="sft",
         role="replay",
-        target_samples=6_000,
+        target_samples=1_750,
         enable_thinking=True,
     ),
     "ultrachat_english_replay": DatasetSpec(
@@ -346,13 +353,15 @@ SFT_REPLAY_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train_sft",
         stage="sft",
         role="replay",
-        target_samples=4_500,
+        target_samples=1_000,
         enable_thinking=False,
     ),
 }
 
 # ---------------------------------------------------------------------------
-# Stage 2 DPO Dataset Registry: 17,000 Arabic/Saudi (85%) + 3,000 English (15%) = 20,000
+# Stage 2 DPO V3 Dataset Registry: 4,200 Arabic (70%) + 1,800 English/STEM (30%) = 6,000
+# Length-balanced (0.55..1.75), strict terminal punctuation, 43.3% thinking-mode pairs.
+# (`arabic_dialect_dpo_saudi` target_samples=0 because ~99.8% of raw rows are mid-sentence truncated.)
 # ---------------------------------------------------------------------------
 DPO_DATASETS: Dict[str, DatasetSpec] = {
     "arabic_dialect_dpo_saudi": DatasetSpec(
@@ -362,7 +371,7 @@ DPO_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="dpo",
         role="preference_saudi",
-        target_samples=4_000,
+        target_samples=0,
         enable_thinking=False,
     ),
     "arabic_orpo_dpo_mix_40k": DatasetSpec(
@@ -372,8 +381,19 @@ DPO_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="dpo",
         role="preference_msa",
-        target_samples=13_000,
+        target_samples=2_600,
         enable_thinking=False,
+    ),
+    "arabic_reasoning_thinking_dpo": DatasetSpec(
+        key="arabic_reasoning_thinking_dpo",
+        repo_id="arcee-globe/arabic-orpo-dpo-mix-40k-filtered",
+        configs=(None,),
+        default_split="train",
+        stage="dpo",
+        role="preference_arabic_thinking",
+        target_samples=1_600,
+        enable_thinking=True,
+        fallback_repo_id="2A2I/argilla-dpo-mix-7k-arabic",
     ),
     "ultrafeedback_english_dpo": DatasetSpec(
         key="ultrafeedback_english_dpo",
@@ -382,8 +402,19 @@ DPO_DATASETS: Dict[str, DatasetSpec] = {
         default_split="train",
         stage="dpo",
         role="preference_english_retention",
-        target_samples=3_000,
+        target_samples=800,
         enable_thinking=False,
+    ),
+    "distilabel_math_thinking_dpo": DatasetSpec(
+        key="distilabel_math_thinking_dpo",
+        repo_id="argilla/distilabel-math-preference-dpo",
+        configs=(None,),
+        default_split="train",
+        stage="dpo",
+        role="preference_english_thinking",
+        target_samples=1_000,
+        enable_thinking=True,
+        fallback_repo_id="argilla/ultrafeedback-binarized-preferences-cleaned",
     ),
 }
 

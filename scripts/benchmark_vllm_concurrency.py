@@ -552,8 +552,16 @@ pathlib.Path({repr(str(out_file))}).write_text(
         "enable_prefix_caching": False,
     }
     try:
+        import dataclasses
+        from vllm.engine.arg_utils import EngineArgs
+
+        if "language_model_only" in {f.name for f in dataclasses.fields(EngineArgs)}:
+            llm_kwargs["language_model_only"] = True
+    except Exception:
+        pass
+    try:
         llm_sig = inspect.signature(LLM.__init__).parameters
-        if "limit_mm_per_prompt" in llm_sig:
+        if "language_model_only" not in llm_kwargs and "limit_mm_per_prompt" in llm_sig:
             llm_kwargs["limit_mm_per_prompt"] = {"image": 0}
         if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in llm_sig.values()):
             llm_kwargs = {k: v for k, v in llm_kwargs.items() if k in llm_sig}
@@ -571,6 +579,7 @@ pathlib.Path({repr(str(out_file))}).write_text(
     try:
         llm = LLM(**llm_kwargs)
     except TypeError:
+        llm_kwargs.pop("language_model_only", None)
         llm_kwargs.pop("limit_mm_per_prompt", None)
         llm_kwargs.pop("enable_prefix_caching", None)
         llm = LLM(**llm_kwargs)

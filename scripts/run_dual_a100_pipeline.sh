@@ -9,7 +9,7 @@
 #   Phase 0: Upfront CUDA, Disk, .env & Dependency Verification (peft>=0.21.3,
 #            unsloth, trl==1.15.0, transformers==5.17.0, vllm, lm-eval,
 #            inspect-evals, lighteval@main) BEFORE spending GPU training hours.
-#   Phase 1: Pull V2 De-contaminated 120k SFT + 20k DPO Datasets from HF Hub.
+#   Phase 1: Pull V3 High-Purity 30k SFT + 6k DPO Datasets from HF Hub.
 #   Phase 2A: Simultaneous Dual-GPU Training:
 #               - GPU 0: Gemma-4-E4B-Arabic-It      (Stage 1 SFT -> Stage 2 DPO)
 #               - GPU 1: Gemma-4-26B-A4B-Arabic-It  (Stage 1 SFT -> Stage 2 DPO)
@@ -92,6 +92,39 @@ trap cleanup_on_signal INT TERM
 
 mkdir -p logs outputs/eval_reports assets/plots
 
+if [[ ! -f "outputs/.v3_pipeline_migrated" ]]; then
+  echo "======================================================================"
+  echo "[V3 Migration] Cleaning stale V2 checkpoints/merges while preserving verified E4B Base retention scores"
+  echo "======================================================================"
+  rm -rf \
+    data/sft_mixed \
+    data/dpo_mixed \
+    outputs/sft_e4b_a100 \
+    outputs/dpo_e4b_a100 \
+    outputs/sft_26b_a4b_a100 \
+    outputs/dpo_26b_a4b_a100 \
+    outputs/merged_gemma4_e4b_arabic \
+    outputs/merged_gemma4_26b_a4b_arabic \
+    unsloth_compiled_cache \
+    unsloth_compiled_cache_gpu0 \
+    unsloth_compiled_cache_gpu1
+  "${PYTHON_BIN}" -c "import json, os, pathlib; rep = pathlib.Path('outputs/eval_reports'); e4b_base = rep / 'live_raw_e4b_base.json';
+if e4b_base.is_file():
+    raw = json.loads(e4b_base.read_text(encoding='utf-8'))
+    if isinstance(raw.get('base'), dict):
+        kept_ret = list((raw['base'].get('retention') or {}).keys())
+        raw['base']['arabic'] = {}
+        tmp = e4b_base.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding='utf-8')
+        os.replace(str(tmp), str(e4b_base))
+        print(f'[V3 Migration] Preserved E4B Base retention suites {kept_ret}; cleared stale V2 E4B Base Arabic cache.')
+for stale in ('live_raw_e4b_tuned.json', 'live_raw_e4b.json', 'live_raw_26b_a4b_base.json', 'live_raw_26b_a4b_tuned.json', 'live_raw_26b_a4b.json', 'benchmark_results.json', 'benchmark_results_e4b.json', 'benchmark_results_26b_a4b.json', 'benchmark_comparison.md', 'benchmark_comparison_e4b.md', 'benchmark_comparison_26b_a4b.md', 'family_benchmark_comparison.json', 'family_benchmark_comparison.md', 'preflight_gate_report.json'):
+    fp = rep / stale
+    if fp.is_file():
+        fp.unlink()"
+  touch outputs/.v3_pipeline_migrated
+fi
+
 echo "======================================================================"
 echo "[Phase 0/4] Upfront Hardware, CUDA Driver, Disk & Dependency Verification"
 echo "======================================================================"
@@ -154,14 +187,14 @@ if "${PYTHON_BIN}" -c "import pathlib, sys; gib = float(1024 ** 3); e4b = pathli
   echo "======================================================================"
 else
   echo "======================================================================"
-  echo "[Phase 1/4] Preparing De-contaminated 120k SFT & 20k DPO V2 Datasets"
+  echo "[Phase 1/4] Preparing De-contaminated 30k SFT & 6k DPO V3 Datasets"
   echo "======================================================================"
 
-  if "${PYTHON_BIN}" -c "import sys; from datasets import load_from_disk; ds = load_from_disk('data/sft_mixed'); sys.exit(0 if len(ds) >= 115000 else 1)" >/dev/null 2>&1; then
-    echo "[Skip] Verified intact data/sft_mixed on disk."
+  if "${PYTHON_BIN}" -c "import sys; from datasets import load_from_disk; ds = load_from_disk('data/sft_mixed'); sys.exit(0 if 28000 <= len(ds) <= 35000 else 1)" >/dev/null 2>&1; then
+    echo "[Skip] Verified intact V3 data/sft_mixed on disk."
   else
     rm -rf data/sft_mixed
-    echo "[Dataset] Pulling pre-built 120k SFT V2 dataset from Hugging Face Hub..."
+    echo "[Dataset] Pulling pre-built 30k SFT V3 dataset from Hugging Face Hub..."
     "${PYTHON_BIN}" scripts/build_sft_dataset.py \
       --config configs/sft_26b_a4b_a100.yaml \
       --output-dir data/sft_mixed \
@@ -169,14 +202,14 @@ else
     "${PYTHON_BIN}" scripts/build_sft_dataset.py \
       --config configs/sft_26b_a4b_a100.yaml \
       --output-dir data/sft_mixed \
-      --max-samples 120000
+      --max-samples 30000
   fi
 
-  if "${PYTHON_BIN}" -c "import sys; from datasets import load_from_disk; ds = load_from_disk('data/dpo_mixed'); sys.exit(0 if len(ds) >= 19000 else 1)" >/dev/null 2>&1; then
-    echo "[Skip] Verified intact data/dpo_mixed on disk."
+  if "${PYTHON_BIN}" -c "import sys; from datasets import load_from_disk; ds = load_from_disk('data/dpo_mixed'); sys.exit(0 if 5500 <= len(ds) <= 7000 else 1)" >/dev/null 2>&1; then
+    echo "[Skip] Verified intact V3 data/dpo_mixed on disk."
   else
     rm -rf data/dpo_mixed
-    echo "[Dataset] Pulling pre-built 20k DPO V2 dataset from Hugging Face Hub..."
+    echo "[Dataset] Pulling pre-built 6k DPO V3 dataset from Hugging Face Hub..."
     "${PYTHON_BIN}" scripts/build_dpo_dataset.py \
       --config configs/dpo_26b_a4b_a100.yaml \
       --output-dir data/dpo_mixed \
@@ -186,11 +219,11 @@ else
       --output-dir data/dpo_mixed
   fi
 
-  "${PYTHON_BIN}" -c "from datasets import load_from_disk; sft = load_from_disk('data/sft_mixed'); dpo = load_from_disk('data/dpo_mixed'); print(f'[Verified Datasets] SFT rows={len(sft)} | DPO pairs={len(dpo)}'); assert len(sft) >= 115000, f'Unexpected SFT count: {len(sft)}'; assert len(dpo) >= 19000, f'Unexpected DPO count: {len(dpo)}'; assert isinstance(dpo[0].get('prompt_messages') or dpo[0].get('prompt'), list), 'DPO dataset must include conversational prompt_messages list'; assert '<start_of_turn>' not in sft[0]['text'], 'Legacy Gemma 2/3 tags detected in SFT'"
+  "${PYTHON_BIN}" -c "from datasets import load_from_disk; sft = load_from_disk('data/sft_mixed'); dpo = load_from_disk('data/dpo_mixed'); print(f'[Verified V3 Datasets] SFT rows={len(sft)} | DPO pairs={len(dpo)}'); assert 28000 <= len(sft) <= 35000, f'Unexpected V3 SFT count: {len(sft)}'; assert 5500 <= len(dpo) <= 7000, f'Unexpected V3 DPO count: {len(dpo)}'; assert isinstance(dpo[0].get('prompt_messages') or dpo[0].get('prompt'), list), 'DPO dataset must include conversational prompt_messages list'; assert '<start_of_turn>' not in sft[0]['text'], 'Legacy Gemma 2/3 tags detected in SFT'"
 
   echo "======================================================================"
   echo "[Phase 2A/4] Simultaneous Dual-GPU Training (SFT -> DPO, save_steps=100)"
-  echo "  - GPU 0: Gemma-4-E4B-Arabic-It      (r=32, alpha=32)          -> logs/train_gpu0_e4b.log"
+  echo "  - GPU 0: Gemma-4-E4B-Arabic-It      (r=16, alpha=16)          -> logs/train_gpu0_e4b.log"
   echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  (r=16, alpha=16, 128 exp) -> logs/train_gpu1_26b_a4b.log"
   echo "======================================================================"
 
@@ -206,7 +239,7 @@ else
     if [[ -f "outputs/sft_e4b_a100/adapter_config.json" && -s "outputs/sft_e4b_a100/adapter_model.safetensors" && -f "outputs/sft_e4b_a100/training_metrics.json" ]]; then
       echo "[GPU 0] [Skip] Verified completed Stage 1 SFT adapter at outputs/sft_e4b_a100."
     else
-      echo "[GPU 0] Starting/resuming Stage 1 QLoRA SFT for Gemma-4-E4B-Arabic-It (r=32, alpha=32)..."
+      echo "[GPU 0] Starting/resuming Stage 1 QLoRA SFT for Gemma-4-E4B-Arabic-It (r=16, alpha=16)..."
       "${PYTHON_BIN}" src/train_sft.py \
         --config configs/sft_e4b_a100.yaml \
         --dataset-dir data/sft_mixed \
@@ -365,6 +398,18 @@ echo "======================================================================"
 "${PYTHON_BIN}" scripts/run_benchmarks.py \
   --config configs/eval_config.yaml \
   --prewarm-datasets
+
+echo "======================================================================"
+echo "[Phase 2C/4] Mandatory 5-Minute Dual-GPU Pre-Flight Gate (Arabic Gain + Retention)"
+echo "  - Verifies Tuned >= Base on ArabicMMLU + AlGhafa and near-zero regression on MMLU-Pro"
+echo "  - Auto-falls back to --lambda-scale 0.70 --force if needed; aborts fast before 90m eval on failure"
+echo "======================================================================"
+
+"${PYTHON_BIN}" scripts/run_benchmarks.py \
+  --config configs/eval_config.yaml \
+  --model-key both \
+  --preflight-gate \
+  --use-vllm
 
 echo "======================================================================"
 echo "[Phase 3A/4] Benchmarking Gemma-4-E4B Family in Parallel across 2 GPUs"
