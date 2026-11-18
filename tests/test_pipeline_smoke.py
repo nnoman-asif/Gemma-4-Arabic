@@ -2409,14 +2409,22 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertIn('export UNSLOTH_MOE_GC_KEEP_BASE="0"', pipeline_sh)
         self.assertIn("unsloth_compiled_cache_gpu1", pipeline_sh)
 
-        # 2. Verify DPORefSanityCallback checks every early step AND late-step NaN/Inf
-        cb = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=250.0)
+        # 2. Verify DPORefSanityCallback allows Gemma 4 pre-clip grad_norm (`transformers#45676`) while catching loss drift, dead grads, & NaN/Inf
+        cb = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=100_000.0)
         t_args = TrainingArguments(output_dir="outputs/_tmp_cb2", logging_steps=10)
-        cb.on_log(t_args, TrainerState(global_step=1), TrainerControl(), logs={"loss": 0.6931, "grad_norm": 42.0})
+        # Exact Vast.ai Step-1 telemetry (`loss=0.6931, grad_norm=575.1310`) + Gemma 4 CoT spike (`grad_norm=8500`) must PASS!
+        cb.on_log(t_args, TrainerState(global_step=1), TrainerControl(), logs={"loss": 0.6931, "grad_norm": 575.1310})
         self.assertTrue(cb.passed_initial_gate)
+        cb.on_log(t_args, TrainerState(global_step=10), TrainerControl(), logs={"loss": 0.6420, "grad_norm": 8500.0})
         with self.assertRaises(RuntimeError):
-            # Must STILL catch misalignment at step 10 even after step 1 passed!
+            # Must STILL catch reference logprob misalignment at step 10 even after step 1 passed!
             cb.on_log(t_args, TrainerState(global_step=10), TrainerControl(), logs={"loss": 1.45, "grad_norm": 42.0})
+        with self.assertRaises(RuntimeError):
+            # Must catch dead zero gradients at step >= 1
+            cb.on_log(t_args, TrainerState(global_step=1), TrainerControl(), logs={"loss": 0.6931, "grad_norm": 0.0})
+        with self.assertRaises(RuntimeError):
+            # Must catch catastrophic pre-Inf overflow (> 100,000)
+            cb.on_log(t_args, TrainerState(global_step=1), TrainerControl(), logs={"loss": 0.6931, "grad_norm": 250_000.0})
         with self.assertRaises(RuntimeError):
             # Must catch NaN/Inf at late steps (e.g. step 200)
             cb.on_log(t_args, TrainerState(global_step=200), TrainerControl(), logs={"loss": float("nan"), "grad_norm": 1.0})

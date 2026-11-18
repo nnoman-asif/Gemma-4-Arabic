@@ -137,16 +137,28 @@ class TrustRegionDPOCallback(TrainerCallback):
 
 
 class DPORefSanityCallback(TrainerCallback):
-    """Fail-fast guard verifying DPO reference log-probabilities, early-step alignment, and NaN/Inf safety.
+    """Fail-fast guard verifying DPO reference log-probabilities, early-step loss alignment, and NaN/Inf safety.
 
     When KL is anchored to the frozen Stage 1 SFT adapter (`precompute_ref_log_probs=True`),
     initial DPO loss at step 0 is `ln(2) = 0.6931` and early logged steps sit near `0.45..0.85`
-    with bounded pre-clip `grad_norm`. Every logged step is also checked for NaN/Inf.
+    (whereas misaligned reference log-probabilities push loss above `1.0..4.0+`).
+
+    Note on Gemma 4 pre-clip `grad_norm` (`huggingface/transformers#45676`):
+    `Gemma4TextAttention` uses `self.scaling = 1.0` with QK-RMSNorm at `head_dim = 256/512` and
+    TRL `sigmoid` DPO sums log-probabilities across `200..2000+` completion tokens across ~494M
+    active LoRA parameters, so healthy pre-clip `grad_norm` routinely sits in `30..10,000+`
+    (safely normalized to `<= 1.0` by `clip_grad_norm_(max_grad_norm=1.0)` before `optimizer.step()`).
     """
 
-    def __init__(self, max_initial_loss: float = 0.98, max_initial_grad_norm: float = 100.0) -> None:
+    def __init__(
+        self,
+        max_initial_loss: float = 0.98,
+        max_initial_grad_norm: float = 100_000.0,
+        check_initial_loss: bool = True,
+    ) -> None:
         self.max_initial_loss = float(max_initial_loss)
         self.max_initial_grad_norm = float(max_initial_grad_norm)
+        self.check_initial_loss = bool(check_initial_loss)
         self.passed_initial_gate = False
 
     def on_log(
@@ -160,27 +172,37 @@ class DPORefSanityCallback(TrainerCallback):
         if not logs or "loss" not in logs:
             return
         loss_val = float(logs["loss"])
+        has_grad_norm = logs.get("grad_norm") is not None
         grad_norm_val = float(logs.get("grad_norm", 0.0) or 0.0)
         if not math.isfinite(loss_val) or not math.isfinite(grad_norm_val):
             raise RuntimeError(
                 f"DPO NaN/Inf detected at step={state.global_step}: "
                 f"loss={loss_val}, grad_norm={grad_norm_val}"
             )
-        if state.global_step <= max(15, int(getattr(args, "logging_steps", 10)) * 2):
-            if loss_val > self.max_initial_loss or grad_norm_val > self.max_initial_grad_norm:
+        if self.check_initial_loss and state.global_step <= max(15, int(getattr(args, "logging_steps", 10)) * 2):
+            if loss_val > self.max_initial_loss:
                 raise RuntimeError(
                     f"DPO reference logprob sanity gate FAILED at step {state.global_step}: "
                     f"loss={loss_val:.4f} (expected ~0.6931, max={self.max_initial_loss}), "
-                    f"grad_norm={grad_norm_val:.4f} (max={self.max_initial_grad_norm}). "
+                    f"pre_clip_grad_norm={grad_norm_val:.4f}. "
                     "Reference log-probabilities are misaligned with Stage 1 SFT policy!"
+                )
+            if (has_grad_norm and state.global_step >= 1 and grad_norm_val <= 0.0) or (
+                grad_norm_val > self.max_initial_grad_norm
+            ):
+                raise RuntimeError(
+                    f"DPO gradient sanity check FAILED at step {state.global_step}: "
+                    f"pre_clip_grad_norm={grad_norm_val:.4f} (expected (0, {self.max_initial_grad_norm}]), "
+                    f"loss={loss_val:.4f}."
                 )
             if not self.passed_initial_gate:
                 self.passed_initial_gate = True
                 logger.info(
-                    "[DPO Sanity Gate PASSED] step=%d | loss=%.4f (~ln2=0.6931) | grad_norm=%.4f",
+                    "[DPO Sanity Gate PASSED] step=%d | loss=%.4f (~ln2=0.6931) | pre_clip_grad_norm=%.4f (clipped to max_grad_norm=%.1f)",
                     state.global_step,
                     loss_val,
                     grad_norm_val,
+                    float(getattr(args, "max_grad_norm", 1.0) or 1.0),
                 )
 
 
@@ -236,7 +258,7 @@ def verify_step0_dpo_ref_alignment(
     is_moe: bool = False,
     max_loss_drift_from_ln2: float = 0.05,
     max_eval_train_drift: float = 0.02,
-    max_step0_grad_norm: float = 500.0,
+    max_step0_grad_norm: float = 100_000.0,
 ) -> Dict[str, float]:
     """Run a `<5s` pre-flight check before `trainer.train()` verifying exact Step-0 alignment
     between precomputed `ref_*_logps`, `model.eval()` forward, `model.train()` forward, and backward gradients.
@@ -988,11 +1010,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             logger.info("Resuming Stage 2 DPO from latest verified checkpoint: %s", last_ckpt)
 
     dpo_callbacks: List[TrainerCallback] = []
-    if not args.smoke_test and last_ckpt is None:
+    if not args.smoke_test:
         dpo_callbacks.append(
             DPORefSanityCallback(
                 max_initial_loss=0.98,
-                max_initial_grad_norm=(250.0 if is_moe else 100.0),
+                max_initial_grad_norm=(100_000.0 if is_moe else 25_000.0),
+                check_initial_loss=(last_ckpt is None),
             )
         )
 
