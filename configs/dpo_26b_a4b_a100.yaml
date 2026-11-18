@@ -23,7 +23,7 @@ vram_optimization:
   free_ref_model_vram: true
   ref_model: null
   precompute_ref_log_probs: true
-  precompute_ref_batch_size: 4
+  precompute_ref_batch_size: 1
 
 lora:
   use_rslora: false
@@ -52,13 +52,13 @@ dpo:
 
 training:
   output_dir: "outputs/dpo_26b_a4b_a100"
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 2
-  gradient_accumulation_steps: 8
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
   optim: "adamw_bnb_8bit"
-  learning_rate: 1.5e-6
+  learning_rate: 5.0e-7
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.10
+  warmup_ratio: 0.15
   weight_decay: 0.01
   max_grad_norm: 1.0
   num_train_epochs: 1.0

@@ -2365,6 +2365,198 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertFalse(pf_ab["gate_passed"])
         self.assertFalse(pf_ab["needs_conservative_lambda_retry"])
 
+    def test_29_moe_dpo_alignment_and_merge_invariants(self) -> None:
+        """Verify 26B-A4B MoE DPO kernel flags, batch=1 invariance, Step-0 alignment, LoRA layout, and merge checks."""
+        import math
+        import os
+        from datasets import Dataset
+        from transformers import TrainerControl, TrainerState, TrainingArguments
+        from src.merge_and_export import scale_and_trim_peft_lora_weights
+        from src.model_loader import (
+            verify_moe_lora_integrity,
+            verify_saved_moe_adapter_config,
+        )
+        from src.train_dpo import (
+            DPORefSanityCallback,
+            build_dpo_training_arguments,
+            salt_dpo_dataset_fingerprint,
+            verify_step0_dpo_ref_alignment,
+        )
+
+        # 1. Verify 26B-A4B and E4B DPO YAML invariants + logging_first_step + shell kernel flags
+        dpo_26b_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "dpo_26b_a4b_a100.yaml").read_text(encoding="utf-8")
+        )
+        dpo_e4b_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "dpo_e4b_a100.yaml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(dpo_26b_cfg["vram_optimization"]["precompute_ref_batch_size"], 1)
+        self.assertEqual(dpo_26b_cfg["training"]["per_device_train_batch_size"], 1)
+        self.assertEqual(dpo_26b_cfg["training"]["per_device_eval_batch_size"], 1)
+        self.assertEqual(dpo_26b_cfg["training"]["gradient_accumulation_steps"], 16)
+        self.assertAlmostEqual(float(dpo_26b_cfg["training"]["learning_rate"]), 5.0e-7, places=12)
+        self.assertAlmostEqual(float(dpo_26b_cfg["training"]["warmup_ratio"]), 0.15, places=6)
+        self.assertEqual(dpo_e4b_cfg["vram_optimization"]["precompute_ref_batch_size"], 2)
+        self.assertEqual(dpo_e4b_cfg["training"]["per_device_train_batch_size"], 2)
+
+        dpo_args = build_dpo_training_arguments(dpo_26b_cfg, output_dir="outputs/_tmp_dpo_args")
+        self.assertTrue(bool(getattr(dpo_args, "logging_first_step", False)))
+        self.assertEqual(os.environ.get("UNSLOTH_MOE_LORA_FOLD"), "0")
+        self.assertEqual(os.environ.get("UNSLOTH_MOE_GC_KEEP_BASE"), "0")
+
+        pipeline_sh = (PROJECT_ROOT / "scripts" / "run_dual_a100_pipeline.sh").read_text(encoding="utf-8")
+        self.assertIn('export UNSLOTH_MOE_LORA_FOLD="0"', pipeline_sh)
+        self.assertIn('export UNSLOTH_MOE_GC_KEEP_BASE="0"', pipeline_sh)
+        self.assertIn("unsloth_compiled_cache_gpu1", pipeline_sh)
+
+        # 2. Verify DPORefSanityCallback checks every early step AND late-step NaN/Inf
+        cb = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=250.0)
+        t_args = TrainingArguments(output_dir="outputs/_tmp_cb2", logging_steps=10)
+        cb.on_log(t_args, TrainerState(global_step=1), TrainerControl(), logs={"loss": 0.6931, "grad_norm": 42.0})
+        self.assertTrue(cb.passed_initial_gate)
+        with self.assertRaises(RuntimeError):
+            # Must STILL catch misalignment at step 10 even after step 1 passed!
+            cb.on_log(t_args, TrainerState(global_step=10), TrainerControl(), logs={"loss": 1.45, "grad_norm": 42.0})
+        with self.assertRaises(RuntimeError):
+            # Must catch NaN/Inf at late steps (e.g. step 200)
+            cb.on_log(t_args, TrainerState(global_step=200), TrainerControl(), logs={"loss": float("nan"), "grad_norm": 1.0})
+
+        # 3. Verify salt_dpo_dataset_fingerprint changes fingerprint across adapters and batch sizes
+        base_ds = Dataset.from_list([{"prompt": "p", "chosen": "c", "rejected": "r"}])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ad1 = pathlib.Path(tmpdir) / "sft1"
+            ad2 = pathlib.Path(tmpdir) / "sft2"
+            ad1.mkdir()
+            ad2.mkdir()
+            (ad1 / "adapter_model.safetensors").write_bytes(b"adapter_v1")
+            (ad2 / "adapter_model.safetensors").write_bytes(b"adapter_v2_longer")
+            ds_fp1 = salt_dpo_dataset_fingerprint(base_ds, PRIMARY_MODEL_ID_26B, str(ad1), 1, True)
+            ds_fp2 = salt_dpo_dataset_fingerprint(base_ds, PRIMARY_MODEL_ID_26B, str(ad2), 1, True)
+            ds_fp3 = salt_dpo_dataset_fingerprint(base_ds, PRIMARY_MODEL_ID_26B, str(ad1), 4, True)
+            self.assertNotEqual(ds_fp1._fingerprint, ds_fp2._fingerprint)
+            self.assertNotEqual(ds_fp1._fingerprint, ds_fp3._fingerprint)
+
+        # 4. Verify verify_moe_lora_integrity & verify_saved_moe_adapter_config
+        class _Mock3DLoRAWeight(nn.Module):
+            def __init__(self, init_val: float) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(torch.full((4, 2, 8), init_val))
+
+        class _MockExpertParamWrapper(nn.Module):
+            def __init__(self, param_name: str, b_val: float) -> None:
+                super().__init__()
+                self.parameter_name = param_name
+                self.lora_A = nn.ModuleDict({"default": _Mock3DLoRAWeight(0.1)})
+                self.lora_B = nn.ModuleDict(
+                    {
+                        "default": _Mock3DLoRAWeight(b_val),
+                        "ref": _Mock3DLoRAWeight(b_val),
+                    }
+                )
+                self.lora_B["ref"].weight.requires_grad_(False)
+
+        class _MockMoEModel(nn.Module):
+            def __init__(self, b_val: float) -> None:
+                super().__init__()
+                self.router = nn.Linear(8, 4, bias=False)
+                self.router.weight.requires_grad_(False)
+                self.experts_gate_up = _MockExpertParamWrapper("gate_up_proj", b_val)
+                self.experts_down = _MockExpertParamWrapper("down_proj", b_val)
+
+        zero_b_moe = _MockMoEModel(0.0)
+        with self.assertRaises(RuntimeError):
+            verify_moe_lora_integrity(
+                zero_b_moe,
+                is_moe=True,
+                smoke_test=True,
+                expect_trained_adapter=True,
+            )
+
+        trained_moe = _MockMoEModel(0.05)
+        info = verify_moe_lora_integrity(
+            trained_moe,
+            is_moe=True,
+            smoke_test=True,
+            expect_trained_adapter=True,
+        )
+        self.assertEqual(info["num_expert_wrappers"], 2)
+        self.assertGreater(info["expert_lora_b_l2_norm"], 0.0)
+
+        # Verify `.ref` exclusion in scale_and_trim_peft_lora_weights (including ParamWrapper `lora_B.ref.weight` / `.ref`)
+        ref_before = trained_moe.experts_gate_up.lora_B["ref"].weight.detach().clone()
+        _ = scale_and_trim_peft_lora_weights(trained_moe, lambda_scale=0.5, density=1.0)
+        self.assertTrue(torch.allclose(trained_moe.experts_gate_up.lora_B["ref"].weight, ref_before))
+        self.assertTrue(torch.allclose(trained_moe.experts_gate_up.lora_B["default"].weight, ref_before * 0.5))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ad_dir = pathlib.Path(tmpdir)
+            (ad_dir / "adapter_config.json").write_text(
+                json.dumps({"target_parameters": ["experts.gate_up_proj", "experts.down_proj"]}),
+                encoding="utf-8",
+            )
+            verify_saved_moe_adapter_config(ad_dir, is_moe=True)
+            saved_cfg = json.loads((ad_dir / "adapter_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_cfg["lora_B_layout"], "rank_major")
+
+            (ad_dir / "adapter_config.json").write_text(
+                json.dumps({"target_parameters": ["experts.gate_up_proj"], "lora_B_layout": "legacy"}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                verify_saved_moe_adapter_config(ad_dir, is_moe=True)
+
+        # 5. Verify verify_step0_dpo_ref_alignment passes at ln(2) and fails on misaligned reference logprobs
+        class _DummyTrainer:
+            def __init__(self, target_loss_eval: float, target_loss_train: float) -> None:
+                self.target_loss_eval = target_loss_eval
+                self.target_loss_train = target_loss_train
+                self.args = type(
+                    "_Args",
+                    (),
+                    {"precompute_ref_log_probs": True, "per_device_train_batch_size": 1},
+                )()
+                self.train_dataset = Dataset.from_list(
+                    [
+                        {
+                            "chosen_input_ids": [1, 2, 3, 4],
+                            "rejected_input_ids": [1, 2, 5, 6],
+                            "ref_chosen_logps": -4.2,
+                            "ref_rejected_logps": -5.1,
+                        }
+                    ]
+                )
+                self._metrics = {"train": {"x": [1.0]}, "eval": {}}
+                self._total_train_tokens = 99
+
+            def data_collator(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+                return {"x": torch.ones(len(items), 8)}
+
+            def _prepare_inputs(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+                return batch
+
+            def compute_loss(self, model: nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
+                target = self.target_loss_train if model.training else self.target_loss_eval
+                reg = (model.experts_gate_up.lora_B["default"].weight.sum() * 0.0) + (
+                    model.experts_gate_up.lora_B["default"].weight.pow(2).mean()
+                )
+                return reg - reg.detach() + torch.tensor(target, dtype=torch.float32)
+
+        step0_ok = verify_step0_dpo_ref_alignment(
+            _DummyTrainer(math.log(2.0), math.log(2.0)),
+            trained_moe,
+            is_moe=True,
+        )
+        self.assertAlmostEqual(step0_ok["loss_eval"], math.log(2.0), places=5)
+        self.assertEqual(step0_ok["eval_train_abs_diff"], 0.0)
+        self.assertGreater(step0_ok["expert_grad_norm"], 0.0)
+
+        with self.assertRaises(RuntimeError):
+            verify_step0_dpo_ref_alignment(
+                _DummyTrainer(math.log(2.0), 1.35),
+                trained_moe,
+                is_moe=True,
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -16,6 +16,7 @@ import gc
 import inspect
 import json
 import logging
+import math
 import os
 import pathlib
 import re
@@ -235,6 +236,10 @@ def ensure_unsloth_builtins() -> None:
     # checkpointing never mixes 2D block-compiled and 4D eager Q/K/V norm activations,
     # while keeping all individual Unsloth Triton/Inductor kernels enabled.
     os.environ.setdefault("UNSLOTH_BLOCK_COMPILE", "0")
+    # Force symmetric separated MoE grouped-GEMM arithmetic across eval (`compute_ref_log_probs`)
+    # and train (`training_step` + GC) on Linux Triton so 128-expert routing never drifts by 1 ULP.
+    os.environ.setdefault("UNSLOTH_MOE_LORA_FOLD", "0")
+    os.environ.setdefault("UNSLOTH_MOE_GC_KEEP_BASE", "0")
     warnings.filterwarnings("ignore", category=SyntaxWarning)
     warnings.filterwarnings("ignore", message=".*torch.jit.script.*")
     warnings.filterwarnings("ignore", message=".*Reading global config value for per-layer attribute.*")
@@ -463,7 +468,9 @@ def freeze_embeddings_and_towers(
         freeze_tokens.extend(MOE_ROUTER_KEYWORDS)
     for name, param in model.named_parameters():
         is_lora_param = "lora_" in name
-        matches_freeze = any(tok in name for tok in freeze_tokens) or (".ref." in name)
+        matches_freeze = any(tok in name for tok in freeze_tokens) or (
+            ".ref." in name or name.endswith(".ref")
+        )
         if matches_freeze:
             param.requires_grad_(False)
             frozen_names.append(name)
@@ -1261,3 +1268,178 @@ def verify_moe_peft_version() -> None:
             )
     except ImportError:
         pass
+
+
+def verify_moe_lora_integrity(
+    model: nn.Module,
+    is_moe: bool = False,
+    smoke_test: bool = False,
+    min_moe_trainable_params: int = 250_000_000,
+    expect_trained_adapter: bool = False,
+    adapter_dir: Optional[Union[str, pathlib.Path]] = None,
+    require_frozen_router: bool = True,
+) -> Dict[str, Any]:
+    """Verify 3D MoE `ParamWrapper` LoRA attachment, `rank_major` layout, and SFT weight loading."""
+    trainable_params = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    if not is_moe:
+        return {
+            "is_moe": False,
+            "trainable_params": trainable_params,
+            "num_expert_wrappers": 0,
+            "lora_b_layout": "n/a",
+            "expert_lora_b_l2_norm": 0.0,
+        }
+
+    if not smoke_test and trainable_params < int(min_moe_trainable_params):
+        raise RuntimeError(
+            f"CRITICAL MoE LoRA Error: Gemma-4-26B-A4B has only {trainable_params:,} trainable "
+            f"parameters (< {min_moe_trainable_params:,})! All 128 3D routed experts "
+            "(`experts.gate_up_proj`, `experts.down_proj`) MUST be attached (~498.5M params at r=16)."
+        )
+
+    if require_frozen_router:
+        trainable_routers = [
+            n for n, p in model.named_parameters() if p.requires_grad and "router" in n.lower()
+        ]
+        if trainable_routers:
+            raise RuntimeError(
+                f"CRITICAL MoE Router Error: MoE router parameters must remain frozen, "
+                f"found trainable router params: {trainable_routers[:5]}"
+            )
+
+    expert_wrappers: List[Tuple[str, nn.Module]] = []
+    lora_b_sq_sum = 0.0
+    lora_a_sq_sum = 0.0
+    repacked_tensors: List[str] = []
+
+    for mod_name, mod in model.named_modules():
+        param_name = getattr(mod, "parameter_name", None)
+        if param_name not in ("gate_up_proj", "down_proj"):
+            continue
+        lora_a_dict = getattr(mod, "lora_A", None)
+        lora_b_dict = getattr(mod, "lora_B", None)
+        if lora_a_dict is None or lora_b_dict is None or "default" not in lora_b_dict:
+            continue
+        expert_wrappers.append((mod_name, mod))
+        w_a = lora_a_dict["default"].weight
+        w_b = lora_b_dict["default"].weight
+        if not w_a.requires_grad or not w_b.requires_grad:
+            raise RuntimeError(
+                f"CRITICAL MoE LoRA Error: Expert ParamWrapper '{mod_name}' ({param_name}) "
+                "has frozen `default` LoRA weights (`requires_grad=False`)!"
+            )
+        w_a_f = w_a.detach().float()
+        w_b_f = w_b.detach().float()
+        if not bool(torch.isfinite(w_a_f).all().item()) or not bool(torch.isfinite(w_b_f).all().item()):
+            raise RuntimeError(
+                f"CRITICAL MoE LoRA Error: NaN/Inf detected in expert LoRA weights at '{mod_name}'!"
+            )
+        lora_a_sq_sum += float(w_a_f.pow(2).sum().item())
+        lora_b_sq_sum += float(w_b_f.pow(2).sum().item())
+        if getattr(w_b, "_unsloth_lora_b_repacked", None) is not None:
+            repacked_tensors.append(mod_name)
+
+    if not expert_wrappers:
+        raise RuntimeError(
+            "CRITICAL MoE LoRA Error: Zero 3D `ParamWrapper` expert modules (`gate_up_proj`, `down_proj`) "
+            "found on MoE model! Routed experts are NOT receiving LoRA adapters."
+        )
+
+    lora_b_norm = math.sqrt(lora_b_sq_sum)
+    lora_a_norm = math.sqrt(lora_a_sq_sum)
+    if repacked_tensors:
+        raise RuntimeError(
+            f"CRITICAL MoE LoRA Layout Error: Unsloth legacy-repacked {len(repacked_tensors)} `lora_B` "
+            f"tensors ({repacked_tensors[:3]}), indicating missing `lora_B_layout='rank_major'` metadata!"
+        )
+    if expect_trained_adapter and lora_b_norm <= 1e-6:
+        raise RuntimeError(
+            f"CRITICAL MoE Adapter Load Error: Loaded Stage 1 SFT MoE adapter has zero expert `lora_B` "
+            f"L2 norm ({lora_b_norm:.3e})! Stage 1 3D expert weights failed to load into Stage 2 DPO."
+        )
+
+    resolved_layout = "rank_major"
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_layout
+
+        resolved_layout = str(moe_lora_b_layout())
+        if resolved_layout != "rank_major":
+            raise RuntimeError(
+                f"CRITICAL MoE LoRA Layout Error: Active `moe_lora_b_layout()` is '{resolved_layout}', "
+                "expected 'rank_major'!"
+            )
+    except ImportError:
+        pass
+
+    if adapter_dir is not None:
+        cfg_file = pathlib.Path(adapter_dir) / "adapter_config.json"
+        if cfg_file.is_file():
+            cfg_json = json.loads(cfg_file.read_text(encoding="utf-8"))
+            target_params = cfg_json.get("target_parameters") or []
+            if not target_params:
+                raise RuntimeError(
+                    f"CRITICAL MoE Adapter Config Error: `{cfg_file}` is missing `target_parameters`!"
+                )
+            declared_layout = cfg_json.get("lora_B_layout")
+            auto_map = cfg_json.get("auto_mapping") or {}
+            detail = auto_map.get("unsloth_fused_expert_lora")
+            if declared_layout is not None and declared_layout != "rank_major":
+                raise RuntimeError(
+                    f"CRITICAL MoE Adapter Config Error: `{cfg_file}` declares "
+                    f"`lora_B_layout={declared_layout!r}` (expected 'rank_major')!"
+                )
+            if isinstance(detail, dict) and isinstance(detail.get("parameters"), dict):
+                bad_params = {
+                    k: v.get("lora_B_layout")
+                    for k, v in detail["parameters"].items()
+                    if isinstance(v, dict) and v.get("lora_B_layout") != "rank_major"
+                }
+                if bad_params:
+                    raise RuntimeError(
+                        f"CRITICAL MoE Adapter Config Error: `{cfg_file}` has non-rank_major "
+                        f"expert parameters: {bad_params}"
+                    )
+
+    summary = {
+        "is_moe": True,
+        "trainable_params": trainable_params,
+        "num_expert_wrappers": len(expert_wrappers),
+        "lora_b_layout": resolved_layout,
+        "expert_lora_a_l2_norm": round(lora_a_norm, 6),
+        "expert_lora_b_l2_norm": round(lora_b_norm, 6),
+    }
+    logger.info(
+        "[MoE LoRA Integrity Verified] trainable_params=%s | expert_wrappers=%d | layout=%s | lora_A_norm=%.4f | lora_B_norm=%.4f",
+        f"{trainable_params:,}",
+        len(expert_wrappers),
+        resolved_layout,
+        lora_a_norm,
+        lora_b_norm,
+    )
+    return summary
+
+
+def verify_saved_moe_adapter_config(
+    output_dir: Union[str, pathlib.Path],
+    is_moe: bool = False,
+) -> None:
+    """Ensure saved MoE `adapter_config.json` explicitly records `lora_B_layout='rank_major'` and `target_parameters`."""
+    if not is_moe:
+        return
+    cfg_path = pathlib.Path(output_dir) / "adapter_config.json"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Saved MoE adapter_config.json missing at {cfg_path}")
+    cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    target_params = cfg_data.get("target_parameters") or []
+    if not target_params:
+        raise RuntimeError(
+            f"Saved MoE adapter_config.json at {cfg_path} is missing 3D `target_parameters`!"
+        )
+    existing_layout = cfg_data.get("lora_B_layout")
+    if existing_layout is not None and existing_layout != "rank_major":
+        raise RuntimeError(
+            f"Saved MoE adapter_config.json at {cfg_path} wrote unexpected lora_B_layout={existing_layout!r}!"
+        )
+    if existing_layout is None:
+        cfg_data["lora_B_layout"] = "rank_major"
+        atomic_write_json(cfg_path, cfg_data)

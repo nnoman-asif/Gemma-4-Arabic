@@ -25,7 +25,7 @@ vram_optimization:
   free_ref_model_vram: true
   ref_model: null
   precompute_ref_log_probs: true
-  precompute_ref_batch_size: 8
+  precompute_ref_batch_size: 2
 
 lora:
   use_rslora: false

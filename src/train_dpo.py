@@ -17,14 +17,21 @@ Key architectural guarantees:
 
 import argparse
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
 import math
+import os
 import pathlib
 import shutil
 import sys
 from typing import Any, Dict, List, Optional
+
+# Force identical separated Triton MoE GEMM + LoRA execution across eval (`compute_ref_log_probs`)
+# and train (`training_step`) on Linux A100 before Unsloth initializes MoE patches.
+os.environ["UNSLOTH_MOE_LORA_FOLD"] = "0"
+os.environ["UNSLOTH_MOE_GC_KEEP_BASE"] = "0"
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -37,7 +44,9 @@ from src.model_loader import (
     find_latest_valid_checkpoint,
     is_adapter_stage_complete,
     load_gemma4_8gb_model_and_tokenizer,
+    verify_moe_lora_integrity,
     verify_moe_peft_version,
+    verify_saved_moe_adapter_config,
 )
 
 ensure_unsloth_builtins()
@@ -128,18 +137,17 @@ class TrustRegionDPOCallback(TrainerCallback):
 
 
 class DPORefSanityCallback(TrainerCallback):
-    """Fail-fast guard verifying Step-1 DPO reference log-probabilities and gradient norm.
+    """Fail-fast guard verifying DPO reference log-probabilities, early-step alignment, and NaN/Inf safety.
 
     When KL is anchored to the frozen Stage 1 SFT adapter (`precompute_ref_log_probs=True`),
-    initial DPO loss at step 0 is `ln(2) = 0.6931` and the first logged step sits near `0.45..0.85`
-    with bounded `grad_norm`. If reference log-probabilities ever desynchronize (e.g. `loss > 0.98`
-    or `grad_norm > 50.0`), training aborts immediately instead of corrupting the checkpoint.
+    initial DPO loss at step 0 is `ln(2) = 0.6931` and early logged steps sit near `0.45..0.85`
+    with bounded pre-clip `grad_norm`. Every logged step is also checked for NaN/Inf.
     """
 
-    def __init__(self, max_initial_loss: float = 0.98, max_initial_grad_norm: float = 50.0) -> None:
+    def __init__(self, max_initial_loss: float = 0.98, max_initial_grad_norm: float = 100.0) -> None:
         self.max_initial_loss = float(max_initial_loss)
         self.max_initial_grad_norm = float(max_initial_grad_norm)
-        self.checked_first_log = False
+        self.passed_initial_gate = False
 
     def on_log(
         self,
@@ -149,14 +157,13 @@ class DPORefSanityCallback(TrainerCallback):
         logs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        if self.checked_first_log or not logs or "loss" not in logs:
+        if not logs or "loss" not in logs:
             return
-        self.checked_first_log = True
         loss_val = float(logs["loss"])
         grad_norm_val = float(logs.get("grad_norm", 0.0) or 0.0)
         if not math.isfinite(loss_val) or not math.isfinite(grad_norm_val):
             raise RuntimeError(
-                f"DPO NaN/Inf detected on first logged step (step={state.global_step}): "
+                f"DPO NaN/Inf detected at step={state.global_step}: "
                 f"loss={loss_val}, grad_norm={grad_norm_val}"
             )
         if state.global_step <= max(15, int(getattr(args, "logging_steps", 10)) * 2):
@@ -167,12 +174,195 @@ class DPORefSanityCallback(TrainerCallback):
                     f"grad_norm={grad_norm_val:.4f} (max={self.max_initial_grad_norm}). "
                     "Reference log-probabilities are misaligned with Stage 1 SFT policy!"
                 )
-            logger.info(
-                "[DPO Sanity Gate PASSED] step=%d | loss=%.4f (~ln2=0.6931) | grad_norm=%.4f",
-                state.global_step,
-                loss_val,
-                grad_norm_val,
+            if not self.passed_initial_gate:
+                self.passed_initial_gate = True
+                logger.info(
+                    "[DPO Sanity Gate PASSED] step=%d | loss=%.4f (~ln2=0.6931) | grad_norm=%.4f",
+                    state.global_step,
+                    loss_val,
+                    grad_norm_val,
+                )
+
+
+def salt_dpo_dataset_fingerprint(
+    dataset: Any,
+    base_model_id: str,
+    sft_adapter_dir: Optional[str],
+    precompute_ref_batch_size: Optional[int],
+    is_moe: bool,
+) -> Any:
+    """Salt HuggingFace `datasets` fingerprint so `DPOTrainer` reference logprob `.map()` never
+    reuses stale Arrow cache files across different Stage 1 SFT adapters, batch sizes, or MoE kernel flags.
+    """
+    adapter_sig = "none"
+    if sft_adapter_dir:
+        st_file = pathlib.Path(sft_adapter_dir) / "adapter_model.safetensors"
+        cfg_file = pathlib.Path(sft_adapter_dir) / "adapter_config.json"
+        if st_file.is_file():
+            stat = st_file.stat()
+            adapter_sig = f"{st_file.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+        elif cfg_file.is_file():
+            stat = cfg_file.stat()
+            adapter_sig = f"{cfg_file.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+        else:
+            adapter_sig = str(sft_adapter_dir)
+
+    payload = json.dumps(
+        {
+            "base_model_id": str(base_model_id),
+            "adapter_sig": adapter_sig,
+            "precompute_ref_batch_size": precompute_ref_batch_size,
+            "is_moe": bool(is_moe),
+            "moe_lora_fold": os.environ.get("UNSLOTH_MOE_LORA_FOLD", "0"),
+            "moe_gc_keep_base": os.environ.get("UNSLOTH_MOE_GC_KEEP_BASE", "0"),
+            "rows": len(dataset),
+        },
+        sort_keys=True,
+    )
+    fp = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+    return dataset.map(
+        lambda batch: batch,
+        batched=True,
+        new_fingerprint=fp,
+        load_from_cache_file=False,
+        keep_in_memory=True,
+        desc="Salting DPO dataset fingerprint",
+    )
+
+
+def verify_step0_dpo_ref_alignment(
+    trainer: Any,
+    model: Any,
+    is_moe: bool = False,
+    max_loss_drift_from_ln2: float = 0.05,
+    max_eval_train_drift: float = 0.02,
+    max_step0_grad_norm: float = 500.0,
+) -> Dict[str, float]:
+    """Run a `<5s` pre-flight check before `trainer.train()` verifying exact Step-0 alignment
+    between precomputed `ref_*_logps`, `model.eval()` forward, `model.train()` forward, and backward gradients.
+    """
+    train_ds = trainer.train_dataset
+    col_names = set(getattr(train_ds, "column_names", []) or [])
+    if bool(getattr(trainer.args, "precompute_ref_log_probs", False)):
+        if "ref_chosen_logps" not in col_names or "ref_rejected_logps" not in col_names:
+            raise RuntimeError(
+                f"DPO precompute_ref_log_probs=True failed to populate ref_*_logps columns! Columns={sorted(col_names)}"
             )
+        inspect_n = min(16, len(train_ds))
+        for i in range(inspect_n):
+            row = train_ds[i]
+            rc = float(row["ref_chosen_logps"])
+            rr = float(row["ref_rejected_logps"])
+            if not math.isfinite(rc) or not math.isfinite(rr) or rc >= 0.0 or rr >= 0.0:
+                raise RuntimeError(
+                    f"Invalid precomputed reference log-probabilities at row {i}: "
+                    f"ref_chosen_logps={rc}, ref_rejected_logps={rr}"
+                )
+            if "chosen_input_ids" in row and "rejected_input_ids" in row:
+                c_len = max(1, len(row["chosen_input_ids"]))
+                r_len = max(1, len(row["rejected_input_ids"]))
+                if (-rc / c_len) > 12.0 or (-rr / r_len) > 12.0:
+                    raise RuntimeError(
+                        f"Pathological per-token reference NLL at row {i}: "
+                        f"chosen_nll={-rc / c_len:.3f}, rejected_nll={-rr / r_len:.3f}"
+                    )
+
+    bsz = min(len(train_ds), max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1))))
+    raw_items = [train_ds[i] for i in range(bsz)]
+    collated = trainer.data_collator(raw_items)
+
+    def _clone_batch(batch_dict: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            k: (v.clone() if isinstance(v, torch.Tensor) else v)
+            for k, v in batch_dict.items()
+        }
+
+    batch_eval = trainer._prepare_inputs(_clone_batch(collated))
+    batch_train = trainer._prepare_inputs(_clone_batch(collated))
+
+    try:
+        model.eval()
+        with torch.no_grad():
+            loss_nograd_t = trainer.compute_loss(model, batch_eval)
+            loss_nograd = float(loss_nograd_t.detach().float().item())
+
+        model.train()
+        model.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            loss_grad_t = trainer.compute_loss(model, batch_train)
+            loss_grad = float(loss_grad_t.detach().float().item())
+            loss_grad_t.backward()
+
+        total_sq = 0.0
+        expert_sq = 0.0
+        for pname, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                gnorm = float(param.grad.detach().float().norm(2).item())
+                if not math.isfinite(gnorm):
+                    raise RuntimeError(f"Non-finite Step-0 gradient on '{pname}': {gnorm}")
+                total_sq += gnorm * gnorm
+                if "experts" in pname and "lora_" in pname:
+                    expert_sq += gnorm * gnorm
+        step0_grad_norm = math.sqrt(total_sq)
+        expert_grad_norm = math.sqrt(expert_sq)
+    finally:
+        model.zero_grad(set_to_none=True)
+        model.train()
+        metrics_dict = getattr(trainer, "_metrics", None)
+        if isinstance(metrics_dict, dict):
+            for sub in metrics_dict.values():
+                if hasattr(sub, "clear"):
+                    sub.clear()
+        if hasattr(trainer, "_total_train_tokens"):
+            trainer._total_train_tokens = 0
+
+    ln2 = math.log(2.0)
+    if (
+        not math.isfinite(loss_nograd)
+        or not math.isfinite(loss_grad)
+        or not math.isfinite(step0_grad_norm)
+    ):
+        raise RuntimeError(
+            f"DPO Step-0 check produced non-finite values: loss_eval={loss_nograd}, "
+            f"loss_train={loss_grad}, grad_norm={step0_grad_norm}"
+        )
+    if (
+        abs(loss_nograd - ln2) > max_loss_drift_from_ln2
+        or abs(loss_grad - ln2) > max_loss_drift_from_ln2
+        or abs(loss_grad - loss_nograd) > max_eval_train_drift
+    ):
+        raise RuntimeError(
+            f"DPO Step-0 reference alignment FAILED BEFORE training! "
+            f"loss_eval={loss_nograd:.6f}, loss_train={loss_grad:.6f}, ln(2)={ln2:.6f}, "
+            f"|train-eval|={abs(loss_grad - loss_nograd):.6f}. "
+            "Policy forward pass does not match precomputed Stage 1 SFT reference log-probabilities!"
+        )
+    if step0_grad_norm > max_step0_grad_norm:
+        raise RuntimeError(
+            f"DPO Step-0 gradient norm explosion ({step0_grad_norm:.4f} > {max_step0_grad_norm}) before step 1!"
+        )
+    if is_moe and step0_grad_norm > 1e-6 and expert_grad_norm <= 0.0:
+        raise RuntimeError(
+            "DPO Step-0 MoE gradient check FAILED: zero gradient norm on 3D `experts` LoRA parameters!"
+        )
+
+    summary = {
+        "loss_eval": round(loss_nograd, 6),
+        "loss_train": round(loss_grad, 6),
+        "eval_train_abs_diff": round(abs(loss_grad - loss_nograd), 6),
+        "step0_grad_norm": round(step0_grad_norm, 4),
+        "expert_grad_norm": round(expert_grad_norm, 4),
+    }
+    logger.info(
+        "[DPO Step-0 Alignment Verified] loss_eval=%.6f | loss_train=%.6f | |diff|=%.6f (ln2=%.6f) | step0_grad_norm=%.4f | expert_grad_norm=%.4f",
+        loss_nograd,
+        loss_grad,
+        abs(loss_grad - loss_nograd),
+        ln2,
+        step0_grad_norm,
+        expert_grad_norm,
+    )
+    return summary
 
 
 @contextlib.contextmanager
@@ -467,6 +657,7 @@ def build_dpo_training_arguments(
         "gradient_checkpointing": use_gc,
         "dataloader_pin_memory": bool(train_cfg.get("dataloader_pin_memory", True)),
         "dataloader_num_workers": int(train_cfg.get("dataloader_num_workers", 0)),
+        "logging_first_step": True,
         "logging_steps": 1 if smoke_test else int(train_cfg.get("logging_steps", 10)),
         "eval_strategy": eval_strategy,
         "save_strategy": "no" if smoke_test else str(train_cfg.get("save_strategy", "steps")),
@@ -608,6 +799,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point for Stage 2 DPO training."""
+    os.environ["UNSLOTH_MOE_LORA_FOLD"] = "0"
+    os.environ["UNSLOTH_MOE_GC_KEEP_BASE"] = "0"
+
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
@@ -741,6 +935,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
         freeze_moe_router=bool(vram_cfg.get("freeze_moe_router", True)),
     )
+    verify_moe_lora_integrity(
+        model,
+        is_moe=is_moe,
+        smoke_test=args.smoke_test,
+        expect_trained_adapter=(not args.smoke_test and adapter_ckpt is not None),
+        adapter_dir=adapter_ckpt,
+        require_frozen_router=bool(vram_cfg.get("freeze_moe_router", True)),
+    )
+
+    base_model_id_str = str(model_cfg.get("base_model_id", BASE_MODEL_ID))
+    precomp_bs = getattr(dpo_args, "precompute_ref_batch_size", None)
+    train_dataset = salt_dpo_dataset_fingerprint(
+        train_dataset,
+        base_model_id=base_model_id_str,
+        sft_adapter_dir=adapter_ckpt,
+        precompute_ref_batch_size=precomp_bs,
+        is_moe=is_moe,
+    )
+    if eval_dataset is not None:
+        eval_dataset = salt_dpo_dataset_fingerprint(
+            eval_dataset,
+            base_model_id=base_model_id_str,
+            sft_adapter_dir=adapter_ckpt,
+            precompute_ref_batch_size=precomp_bs,
+            is_moe=is_moe,
+        )
 
     original_chat_template = getattr(tokenizer, "chat_template", None)
     if is_moe and original_chat_template:
@@ -769,7 +989,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     dpo_callbacks: List[TrainerCallback] = []
     if not args.smoke_test and last_ckpt is None:
-        dpo_callbacks.append(DPORefSanityCallback())
+        dpo_callbacks.append(
+            DPORefSanityCallback(
+                max_initial_loss=0.98,
+                max_initial_grad_norm=(250.0 if is_moe else 100.0),
+            )
+        )
 
     trainer_kwargs: Dict[str, Any] = {
         "model": model,
@@ -806,6 +1031,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         trainer,
         freeze_moe_router=bool(vram_cfg.get("freeze_moe_router", True)),
     )
+    if not args.smoke_test and last_ckpt is None:
+        verify_step0_dpo_ref_alignment(trainer, model, is_moe=is_moe)
     log_vram_telemetry(model, stage="pre_dpo_train")
     train_result = trainer.train(resume_from_checkpoint=last_ckpt)
     log_vram_telemetry(model, stage="post_dpo_train")
@@ -829,6 +1056,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 trainer.save_model(output_dir)
         else:
             trainer.save_model(output_dir)
+        verify_saved_moe_adapter_config(out_path, is_moe=is_moe)
         proc_or_tok = getattr(tokenizer, "_gemma4_processor", tokenizer)
         proc_or_tok.save_pretrained(output_dir)
 

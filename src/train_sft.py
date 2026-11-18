@@ -32,7 +32,9 @@ from src.model_loader import (
     find_latest_valid_checkpoint,
     is_adapter_stage_complete,
     load_gemma4_8gb_model_and_tokenizer,
+    verify_moe_lora_integrity,
     verify_moe_peft_version,
+    verify_saved_moe_adapter_config,
 )
 
 ensure_unsloth_builtins()
@@ -502,16 +504,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         freeze_moe_router=bool(vram_cfg.get("freeze_moe_router", True)),
     )
 
-    # Hard MoE expert parameter count verification on 26B-A4B
-    vram_stats = log_vram_telemetry(model, stage="pre_sft_train")
-    if is_moe and not args.smoke_test and torch.cuda.is_available():
-        trainable_params = int(vram_stats.get("trainable_params", 0))
-        if trainable_params < 250_000_000:
-            raise RuntimeError(
-                f"CRITICAL MoE LoRA Error: Gemma-4-26B-A4B has only {trainable_params:,} trainable "
-                "parameters (< 250M)! All 128 3D routed experts (`experts.gate_up_proj`, "
-                "`experts.down_proj`) MUST be attached (~498.5M params at r=16). Check Unsloth>=2026.4.2 & peft>=0.21.3."
-            )
+    # Hard MoE expert parameter count & 3D ParamWrapper layout verification on 26B-A4B
+    log_vram_telemetry(model, stage="pre_sft_train")
+    if is_moe and (not args.smoke_test or torch.cuda.is_available()):
+        verify_moe_lora_integrity(
+            model,
+            is_moe=is_moe,
+            smoke_test=args.smoke_test,
+            expect_trained_adapter=False,
+            require_frozen_router=bool(vram_cfg.get("freeze_moe_router", True)),
+        )
 
     # Pre-tokenize with exact response-only labels (-100 on all prompt tokens BEFORE packing)
     pretok_cache_root = (
@@ -602,6 +604,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         out_path = pathlib.Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         trainer.save_model(output_dir)
+        verify_saved_moe_adapter_config(out_path, is_moe=is_moe)
         proc_or_tok = getattr(tokenizer, "_gemma4_processor", tokenizer)
         proc_or_tok.save_pretrained(output_dir)
         metrics_payload = {

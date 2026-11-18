@@ -52,6 +52,8 @@ export DATASETS_VERBOSITY=warning
 export PYTHONWARNINGS="ignore::SyntaxWarning,ignore::FutureWarning"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export UNSLOTH_BLOCK_COMPILE="0"
+export UNSLOTH_MOE_LORA_FOLD="0"
+export UNSLOTH_MOE_GC_KEEP_BASE="0"
 export HF_ALLOW_CODE_EVAL="1"
 export VLLM_WORKER_MULTIPROC_METHOD="spawn"
 export PYTHONHASHSEED="0"
@@ -281,6 +283,7 @@ else
       echo "[GPU 1] [Skip] Verified completed Stage 2 DPO adapter at outputs/dpo_26b_a4b_a100."
     else
       echo "[GPU 1] Starting/resuming Stage 2 DPO for Gemma-4-26B-A4B-Arabic-It..."
+      rm -rf unsloth_compiled_cache_gpu1 /tmp/inductor_train_gpu1 /tmp/triton_train_gpu1
       "${PYTHON_BIN}" src/train_dpo.py \
         --config configs/dpo_26b_a4b_a100.yaml \
         --dataset-dir data/dpo_mixed \

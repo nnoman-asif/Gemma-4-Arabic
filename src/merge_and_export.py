@@ -180,7 +180,7 @@ def scale_and_trim_peft_lora_weights(
 
     modified_count = 0
     for name, param in model.named_parameters():
-        if "lora_B" in name and ".ref." not in name:
+        if "lora_B" in name and ".ref." not in name and not name.endswith(".ref"):
             updated = param.data
             if float(density) < 1.0:
                 updated = ties_trim_tensor(updated, density=float(density))
@@ -408,14 +408,30 @@ def export_merged_checkpoint(
                 pass
 
         saved_16bit = False
+        has_moe_expert_lora = any(
+            getattr(m, "parameter_name", None) in ("gate_up_proj", "down_proj")
+            for m in model.modules()
+        )
         if hasattr(model, "save_pretrained_merged"):
             moe_merge_state = None
+            _uz_saving = None
             try:
-                import unsloth_zoo.saving_utils as _uz_saving
+                import unsloth_zoo.saving_utils as _uz_saving  # type: ignore
 
+                if hasattr(_uz_saving, "_reset_moe_merge_state"):
+                    _uz_saving._reset_moe_merge_state()
                 moe_merge_state = getattr(_uz_saving, "_MOE_MERGE_STATE", None)
-                if isinstance(moe_merge_state, dict) and hasattr(moe_merge_state.get("fallbacks"), "clear"):
-                    moe_merge_state["fallbacks"].clear()
+                if isinstance(moe_merge_state, dict):
+                    if "fallback" in moe_merge_state:
+                        moe_merge_state["fallback"] = 0
+                    if "attempted" in moe_merge_state:
+                        moe_merge_state["attempted"] = 0
+                    if "applied" in moe_merge_state:
+                        moe_merge_state["applied"] = 0
+                    if "first_error" in moe_merge_state:
+                        moe_merge_state["first_error"] = None
+                    if hasattr(moe_merge_state.get("fallbacks"), "clear"):
+                        moe_merge_state["fallbacks"].clear()
             except Exception:
                 moe_merge_state = None
 
@@ -425,11 +441,26 @@ def export_merged_checkpoint(
                 proc_or_tok,
                 save_method="merged_16bit",
             )
-            if isinstance(moe_merge_state, dict) and moe_merge_state.get("fallbacks"):
-                raise RuntimeError(
-                    "CRITICAL: Unsloth recorded unmerged MoE 3D expert fallbacks during save_pretrained_merged: "
-                    f"{moe_merge_state['fallbacks']}"
-                )
+            if _uz_saving is not None:
+                moe_merge_state = getattr(_uz_saving, "_MOE_MERGE_STATE", moe_merge_state)
+            if isinstance(moe_merge_state, dict):
+                setattr(model, "_last_moe_merge_state", dict(moe_merge_state))
+                fallback_count = int(moe_merge_state.get("fallback", 0) or 0)
+                legacy_fallbacks = moe_merge_state.get("fallbacks")
+                if fallback_count > 0 or bool(legacy_fallbacks):
+                    raise RuntimeError(
+                        "CRITICAL: Unsloth recorded unmerged MoE 3D expert fallbacks during "
+                        f"save_pretrained_merged: state={moe_merge_state}"
+                    )
+                if (
+                    has_moe_expert_lora
+                    and "applied" in moe_merge_state
+                    and int(moe_merge_state.get("applied", 0) or 0) <= 0
+                ):
+                    raise RuntimeError(
+                        "CRITICAL: MoE model has 3D expert LoRA adapters (`gate_up_proj`/`down_proj`), "
+                        f"but Unsloth applied 0 expert merges during save_pretrained_merged: state={moe_merge_state}"
+                    )
             saved_16bit = True
 
         if not saved_16bit:
@@ -720,6 +751,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "lambda_scale": args.lambda_scale,
         "density": args.density,
         "modified_lora_b_tensors": modified,
+        "moe_merge_state": getattr(model, "_last_moe_merge_state", None),
         "exported_artifacts": exported,
         "verification": verification,
     }
