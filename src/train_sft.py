@@ -546,7 +546,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         trainer_kwargs["eval_dataset"] = eval_dataset
 
     trainer_sig = inspect.signature(SFTTrainer.__init__)
-    if "processing_class" in trainer_sig.parameters:
+    has_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in trainer_sig.parameters.values()
+    )
+    if "processing_class" in trainer_sig.parameters or has_var_kw:
         trainer_kwargs["processing_class"] = tokenizer
     elif "tokenizer" in trainer_sig.parameters:
         trainer_kwargs["tokenizer"] = tokenizer

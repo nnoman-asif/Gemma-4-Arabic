@@ -2378,7 +2378,9 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         )
         from src.train_dpo import (
             DPORefSanityCallback,
+            _maybe_inject_gemma4_mm_token_type_ids,
             build_dpo_training_arguments,
+            preserve_stage1_adapter_for_ref_precompute,
             salt_dpo_dataset_fingerprint,
             verify_step0_dpo_ref_alignment,
         )
@@ -2401,24 +2403,36 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
 
         dpo_args = build_dpo_training_arguments(dpo_26b_cfg, output_dir="outputs/_tmp_dpo_args")
         self.assertTrue(bool(getattr(dpo_args, "logging_first_step", False)))
+        self.assertEqual(os.environ.get("UNSLOTH_BLOCK_COMPILE"), "0")
         self.assertEqual(os.environ.get("UNSLOTH_MOE_LORA_FOLD"), "0")
         self.assertEqual(os.environ.get("UNSLOTH_MOE_GC_KEEP_BASE"), "0")
+        self.assertEqual(os.environ.get("UNSLOTH_MOE_ROUTED_KERNEL"), "0")
+        self.assertEqual(os.environ.get("UNSLOTH_HD512_ATTENTION"), "0")
 
         pipeline_sh = (PROJECT_ROOT / "scripts" / "run_dual_a100_pipeline.sh").read_text(encoding="utf-8")
+        self.assertIn('export UNSLOTH_BLOCK_COMPILE="0"', pipeline_sh)
         self.assertIn('export UNSLOTH_MOE_LORA_FOLD="0"', pipeline_sh)
         self.assertIn('export UNSLOTH_MOE_GC_KEEP_BASE="0"', pipeline_sh)
+        self.assertIn('export UNSLOTH_MOE_ROUTED_KERNEL="0"', pipeline_sh)
+        self.assertIn('export UNSLOTH_HD512_ATTENTION="0"', pipeline_sh)
         self.assertIn("unsloth_compiled_cache_gpu1", pipeline_sh)
 
-        # 2. Verify DPORefSanityCallback allows Gemma 4 pre-clip grad_norm (`transformers#45676`) while catching loss drift, dead grads, & NaN/Inf
-        cb = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=100_000.0)
+        # 2. Verify DPORefSanityCallback allows Gemma 4 pre-clip grad_norm (`transformers#45676`) while catching
+        #    Step-1 reference misalignment, mid-run runaway divergence (`loss > 3.5`), dead grads, & NaN/Inf
+        cb_bad_step1 = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=100_000.0)
         t_args = TrainingArguments(output_dir="outputs/_tmp_cb2", logging_steps=10)
-        # Exact Vast.ai Step-1 telemetry (`loss=0.6931, grad_norm=575.1310`) + Gemma 4 CoT spike (`grad_norm=8500`) must PASS!
+        with self.assertRaises(RuntimeError):
+            cb_bad_step1.on_log(t_args, TrainerState(global_step=1), TrainerControl(), logs={"loss": 1.15, "grad_norm": 42.0})
+
+        cb = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=100_000.0)
+        # Exact Vast.ai Step-1 telemetry (`loss=0.6931, grad_norm=575.1310`) + Gemma 4 CoT spike (`grad_norm=8500`) + hard batch (`1.12`) must PASS!
         cb.on_log(t_args, TrainerState(global_step=1), TrainerControl(), logs={"loss": 0.6931, "grad_norm": 575.1310})
         self.assertTrue(cb.passed_initial_gate)
         cb.on_log(t_args, TrainerState(global_step=10), TrainerControl(), logs={"loss": 0.6420, "grad_norm": 8500.0})
+        cb.on_log(t_args, TrainerState(global_step=20), TrainerControl(), logs={"loss": 1.1200, "grad_norm": 4200.0})
         with self.assertRaises(RuntimeError):
-            # Must STILL catch reference logprob misalignment at step 10 even after step 1 passed!
-            cb.on_log(t_args, TrainerState(global_step=10), TrainerControl(), logs={"loss": 1.45, "grad_norm": 42.0})
+            # Must catch Failure-#1 style runaway KL divergence (`loss=4.2813 > 3.50`) at any step!
+            cb.on_log(t_args, TrainerState(global_step=10), TrainerControl(), logs={"loss": 4.2813, "grad_norm": 42.0})
         with self.assertRaises(RuntimeError):
             # Must catch dead zero gradients at step >= 1
             cb.on_log(t_args, TrainerState(global_step=1), TrainerControl(), logs={"loss": 0.6931, "grad_norm": 0.0})
@@ -2429,11 +2443,12 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             # Must catch NaN/Inf at late steps (e.g. step 200)
             cb.on_log(t_args, TrainerState(global_step=200), TrainerControl(), logs={"loss": float("nan"), "grad_norm": 1.0})
 
-        # 3. Verify salt_dpo_dataset_fingerprint changes fingerprint across adapters and batch sizes
+        # 3. Verify salt_dpo_dataset_fingerprint changes fingerprint across adapters/batch sizes & persists cache_dir
         base_ds = Dataset.from_list([{"prompt": "p", "chosen": "c", "rejected": "r"}])
         with tempfile.TemporaryDirectory() as tmpdir:
             ad1 = pathlib.Path(tmpdir) / "sft1"
             ad2 = pathlib.Path(tmpdir) / "sft2"
+            cdir = pathlib.Path(tmpdir) / "ref_cache"
             ad1.mkdir()
             ad2.mkdir()
             (ad1 / "adapter_model.safetensors").write_bytes(b"adapter_v1")
@@ -2441,8 +2456,12 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             ds_fp1 = salt_dpo_dataset_fingerprint(base_ds, PRIMARY_MODEL_ID_26B, str(ad1), 1, True)
             ds_fp2 = salt_dpo_dataset_fingerprint(base_ds, PRIMARY_MODEL_ID_26B, str(ad2), 1, True)
             ds_fp3 = salt_dpo_dataset_fingerprint(base_ds, PRIMARY_MODEL_ID_26B, str(ad1), 4, True)
+            ds_disk = salt_dpo_dataset_fingerprint(
+                base_ds, PRIMARY_MODEL_ID_26B, str(ad1), 1, True, cache_dir=cdir
+            )
             self.assertNotEqual(ds_fp1._fingerprint, ds_fp2._fingerprint)
             self.assertNotEqual(ds_fp1._fingerprint, ds_fp3._fingerprint)
+            self.assertTrue(bool(ds_disk.cache_files))
 
         # 4. Verify verify_moe_lora_integrity & verify_saved_moe_adapter_config
         class _Mock3DLoRAWeight(nn.Module):
@@ -2513,15 +2532,38 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 verify_saved_moe_adapter_config(ad_dir, is_moe=True)
 
-        # 5. Verify verify_step0_dpo_ref_alignment passes at ln(2) and fails on misaligned reference logprobs
+        # 5. Verify verify_step0_dpo_ref_alignment restores `for_training()`, enters `compute_loss_context_manager()`,
+        #    passes at ln(2), and fails on misaligned reference logprobs or eval/train drift
+        import contextlib as _ctxlib
+
+        trained_moe.gradient_checkpointing = False
+        trained_moe._flag_for_generation = True
+        trained_moe.eval()
+        for_training_calls: List[Any] = []
+
+        def _mock_for_training(use_gradient_checkpointing: Any = True) -> nn.Module:
+            for_training_calls.append(use_gradient_checkpointing)
+            trained_moe.gradient_checkpointing = bool(use_gradient_checkpointing)
+            if hasattr(trained_moe, "_flag_for_generation"):
+                delattr(trained_moe, "_flag_for_generation")
+            return trained_moe.train()
+
+        trained_moe.for_training = _mock_for_training  # type: ignore[attr-defined]
+
         class _DummyTrainer:
             def __init__(self, target_loss_eval: float, target_loss_train: float) -> None:
                 self.target_loss_eval = target_loss_eval
                 self.target_loss_train = target_loss_train
+                self.in_autocast_ctx = False
+                self.autocast_enter_count = 0
                 self.args = type(
                     "_Args",
                     (),
-                    {"precompute_ref_log_probs": True, "per_device_train_batch_size": 1},
+                    {
+                        "precompute_ref_log_probs": True,
+                        "per_device_train_batch_size": 1,
+                        "gradient_checkpointing": True,
+                    },
                 )()
                 self.train_dataset = Dataset.from_list(
                     [
@@ -2536,6 +2578,15 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                 self._metrics = {"train": {"x": [1.0]}, "eval": {}}
                 self._total_train_tokens = 99
 
+            @_ctxlib.contextmanager
+            def compute_loss_context_manager(self):
+                self.autocast_enter_count += 1
+                self.in_autocast_ctx = True
+                try:
+                    yield
+                finally:
+                    self.in_autocast_ctx = False
+
             def data_collator(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
                 return {"x": torch.ones(len(items), 8)}
 
@@ -2543,20 +2594,33 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                 return batch
 
             def compute_loss(self, model: nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
-                target = self.target_loss_train if model.training else self.target_loss_eval
+                if not self.in_autocast_ctx or not model.training or hasattr(model, "_flag_for_generation"):
+                    raise AssertionError("compute_loss called outside autocast or while in for_inference mode!")
+                if torch.is_grad_enabled() and not getattr(model, "gradient_checkpointing", False):
+                    raise AssertionError("enable_grad forward ran with gradient_checkpointing=False!")
+                if (not torch.is_grad_enabled()) and getattr(model, "gradient_checkpointing", False):
+                    raise AssertionError("no_grad reference forward ran without disabling gradient_checkpointing!")
+                target = self.target_loss_train if torch.is_grad_enabled() else self.target_loss_eval
                 reg = (model.experts_gate_up.lora_B["default"].weight.sum() * 0.0) + (
                     model.experts_gate_up.lora_B["default"].weight.pow(2).mean()
                 )
                 return reg - reg.detach() + torch.tensor(target, dtype=torch.float32)
 
+        dummy_ok = _DummyTrainer(math.log(2.0), math.log(2.0))
         step0_ok = verify_step0_dpo_ref_alignment(
-            _DummyTrainer(math.log(2.0), math.log(2.0)),
+            dummy_ok,
             trained_moe,
             is_moe=True,
         )
         self.assertAlmostEqual(step0_ok["loss_eval"], math.log(2.0), places=5)
         self.assertEqual(step0_ok["eval_train_abs_diff"], 0.0)
         self.assertGreater(step0_ok["expert_grad_norm"], 0.0)
+        self.assertEqual(dummy_ok.autocast_enter_count, 2)
+        self.assertGreaterEqual(len(for_training_calls), 2)
+        self.assertTrue(trained_moe.training)
+        self.assertTrue(trained_moe.gradient_checkpointing)
+        self.assertFalse(hasattr(trained_moe, "_flag_for_generation"))
+        self.assertFalse(trained_moe.router.weight.requires_grad)
 
         with self.assertRaises(RuntimeError):
             verify_step0_dpo_ref_alignment(
@@ -2564,6 +2628,40 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
                 trained_moe,
                 is_moe=True,
             )
+
+        with self.assertRaises(RuntimeError):
+            verify_step0_dpo_ref_alignment(
+                _DummyTrainer(0.884034, 1.159814),
+                trained_moe,
+                is_moe=True,
+            )
+
+        # 6. Verify Gemma 4 `mm_token_type_ids` parity wrapper on `compute_ref_log_probs`
+        sys.modules[__name__].create_causal_mask_mapping = True  # type: ignore[attr-defined]
+        try:
+            class _MockGemma4Inner(nn.Module):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.config = type("_Cfg", (), {"model_type": "gemma4"})()
+
+            g4_inner = _MockGemma4Inner()
+            seen_ref_inputs: List[Dict[str, Any]] = []
+
+            class _MockDPOCls:
+                def compute_ref_log_probs(self, mdl: Any, inp: Dict[str, Any]) -> str:
+                    seen_ref_inputs.append(inp)
+                    return "ok"
+
+            with preserve_stage1_adapter_for_ref_precompute(g4_inner, {}, dpo_trainer_cls=_MockDPOCls):
+                out_tag = _MockDPOCls().compute_ref_log_probs(
+                    g4_inner, {"input_ids": torch.tensor([[2, 10, 11, 1]])}
+                )
+            self.assertEqual(out_tag, "ok")
+            self.assertIn("mm_token_type_ids", seen_ref_inputs[0])
+            self.assertTrue(torch.equal(seen_ref_inputs[0]["mm_token_type_ids"], torch.zeros((1, 4), dtype=torch.long)))
+        finally:
+            if hasattr(sys.modules[__name__], "create_causal_mask_mapping"):
+                delattr(sys.modules[__name__], "create_causal_mask_mapping")
 
 
 if __name__ == "__main__":

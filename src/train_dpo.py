@@ -28,10 +28,14 @@ import shutil
 import sys
 from typing import Any, Dict, List, Optional
 
-# Force identical separated Triton MoE GEMM + LoRA execution across eval (`compute_ref_log_probs`)
-# and train (`training_step`) on Linux A100 before Unsloth initializes MoE patches.
+# Enforce bitwise-identical decoder-block, attention, and MoE kernel execution across
+# `_precompute_ref_logps`, `verify_step0_dpo_ref_alignment`, and `trainer.train()` on A100
+# before Unsloth initializes module and kernel patches.
+os.environ["UNSLOTH_BLOCK_COMPILE"] = "0"
 os.environ["UNSLOTH_MOE_LORA_FOLD"] = "0"
 os.environ["UNSLOTH_MOE_GC_KEEP_BASE"] = "0"
+os.environ["UNSLOTH_MOE_ROUTED_KERNEL"] = "0"
+os.environ["UNSLOTH_HD512_ATTENTION"] = "0"
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -153,10 +157,12 @@ class DPORefSanityCallback(TrainerCallback):
     def __init__(
         self,
         max_initial_loss: float = 0.98,
+        max_diverged_loss: float = 3.50,
         max_initial_grad_norm: float = 100_000.0,
         check_initial_loss: bool = True,
     ) -> None:
         self.max_initial_loss = float(max_initial_loss)
+        self.max_diverged_loss = float(max_diverged_loss)
         self.max_initial_grad_norm = float(max_initial_grad_norm)
         self.check_initial_loss = bool(check_initial_loss)
         self.passed_initial_gate = False
@@ -179,20 +185,30 @@ class DPORefSanityCallback(TrainerCallback):
                 f"DPO NaN/Inf detected at step={state.global_step}: "
                 f"loss={loss_val}, grad_norm={grad_norm_val}"
             )
+        if loss_val > self.max_diverged_loss:
+            raise RuntimeError(
+                f"DPO runaway loss divergence detected at step {state.global_step}: "
+                f"loss={loss_val:.4f} (> max_diverged_loss={self.max_diverged_loss}), "
+                f"pre_clip_grad_norm={grad_norm_val:.4f}."
+            )
+        if has_grad_norm and grad_norm_val > self.max_initial_grad_norm:
+            raise RuntimeError(
+                f"DPO gradient sanity check FAILED at step {state.global_step}: "
+                f"pre_clip_grad_norm={grad_norm_val:.4f} (> {self.max_initial_grad_norm}), "
+                f"loss={loss_val:.4f}."
+            )
         if self.check_initial_loss and state.global_step <= max(15, int(getattr(args, "logging_steps", 10)) * 2):
-            if loss_val > self.max_initial_loss:
+            if not self.passed_initial_gate and loss_val > self.max_initial_loss:
                 raise RuntimeError(
                     f"DPO reference logprob sanity gate FAILED at step {state.global_step}: "
                     f"loss={loss_val:.4f} (expected ~0.6931, max={self.max_initial_loss}), "
                     f"pre_clip_grad_norm={grad_norm_val:.4f}. "
                     "Reference log-probabilities are misaligned with Stage 1 SFT policy!"
                 )
-            if (has_grad_norm and state.global_step >= 1 and grad_norm_val <= 0.0) or (
-                grad_norm_val > self.max_initial_grad_norm
-            ):
+            if has_grad_norm and state.global_step >= 1 and grad_norm_val <= 0.0:
                 raise RuntimeError(
                     f"DPO gradient sanity check FAILED at step {state.global_step}: "
-                    f"pre_clip_grad_norm={grad_norm_val:.4f} (expected (0, {self.max_initial_grad_norm}]), "
+                    f"pre_clip_grad_norm={grad_norm_val:.4f} (expected > 0.0), "
                     f"loss={loss_val:.4f}."
                 )
             if not self.passed_initial_gate:
@@ -212,9 +228,11 @@ def salt_dpo_dataset_fingerprint(
     sft_adapter_dir: Optional[str],
     precompute_ref_batch_size: Optional[int],
     is_moe: bool,
+    cache_dir: Optional[pathlib.Path] = None,
 ) -> Any:
     """Salt HuggingFace `datasets` fingerprint so `DPOTrainer` reference logprob `.map()` never
-    reuses stale Arrow cache files across different Stage 1 SFT adapters, batch sizes, or MoE kernel flags.
+    reuses stale Arrow cache files across different Stage 1 SFT adapters, batch sizes, or MoE kernel flags,
+    while persisting verified reference log-probabilities under `cache_dir` when provided.
     """
     adapter_sig = "none"
     if sft_adapter_dir:
@@ -231,17 +249,34 @@ def salt_dpo_dataset_fingerprint(
 
     payload = json.dumps(
         {
+            "schema": "v5_aligned_tok_and_deterministic_dpo_ref",
             "base_model_id": str(base_model_id),
             "adapter_sig": adapter_sig,
             "precompute_ref_batch_size": precompute_ref_batch_size,
             "is_moe": bool(is_moe),
+            "block_compile": os.environ.get("UNSLOTH_BLOCK_COMPILE", "0"),
             "moe_lora_fold": os.environ.get("UNSLOTH_MOE_LORA_FOLD", "0"),
             "moe_gc_keep_base": os.environ.get("UNSLOTH_MOE_GC_KEEP_BASE", "0"),
+            "moe_routed_kernel": os.environ.get("UNSLOTH_MOE_ROUTED_KERNEL", "0"),
+            "hd512_attention": os.environ.get("UNSLOTH_HD512_ATTENTION", "0"),
             "rows": len(dataset),
         },
         sort_keys=True,
     )
     fp = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+    if cache_dir is not None:
+        target_dir = pathlib.Path(cache_dir) / f"{'moe' if is_moe else 'dense'}_{fp[:16]}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        cache_arrow = target_dir / "salted_dpo_pairs.arrow"
+        return dataset.map(
+            lambda batch: batch,
+            batched=True,
+            new_fingerprint=fp,
+            cache_file_name=str(cache_arrow),
+            load_from_cache_file=True,
+            keep_in_memory=False,
+            desc="Salting DPO dataset fingerprint",
+        )
     return dataset.map(
         lambda batch: batch,
         batched=True,
@@ -252,16 +287,110 @@ def salt_dpo_dataset_fingerprint(
     )
 
 
+def _maybe_inject_gemma4_mm_token_type_ids(model: Any, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Match Unsloth `_unsloth_pre_compute_loss` (`unsloth/models/_utils.py:6072-6083`) so
+    `DPOTrainer.compute_ref_log_probs` constructs the exact same Gemma 4 causal/sliding masks as `compute_loss`.
+    """
+    if not isinstance(inputs, dict) or "mm_token_type_ids" in inputs or "input_ids" not in inputs:
+        return inputs
+    input_ids = inputs.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        return inputs
+    inner = model
+    for attr in ("base_model", "model", "model"):
+        inner = getattr(inner, attr, inner)
+    if getattr(getattr(inner, "config", None), "model_type", "") == "gemma4":
+        mod = sys.modules.get(type(inner).__module__)
+        if mod is not None and hasattr(mod, "create_causal_mask_mapping"):
+            patched = dict(inputs)
+            patched["mm_token_type_ids"] = torch.zeros_like(input_ids)
+            return patched
+    return inputs
+
+
+def _enter_unsloth_training_mode(
+    model: Any,
+    trainer: Any = None,
+    freeze_moe_router: bool = True,
+) -> None:
+    """Restore full Unsloth training state (`for_training`) after `UnslothDPOTrainer.__init__`'s
+    trailing `model.for_inference()` call (`UnslothDPOTrainer.py:3235`), ensuring `gradient_checkpointing`,
+    `use_cache=False`, compiler stance, and router/tower freeze flags match `trainer.train()` verbatim.
+    """
+    args = getattr(trainer, "args", None)
+    use_gc = getattr(
+        model,
+        "_unsloth_gradient_checkpointing",
+        getattr(args, "gradient_checkpointing", True) if args is not None else True,
+    )
+    if hasattr(model, "for_training") and callable(model.for_training):
+        try:
+            model.for_training(use_gradient_checkpointing=use_gc)
+        except TypeError:
+            model.for_training()
+    else:
+        model.train()
+    freeze_embeddings_and_towers(model, freeze_moe_router=freeze_moe_router)
+
+
+@contextlib.contextmanager
+def _dpo_compute_loss_autocast_context(trainer: Any):
+    """Enter the exact mixed-precision autocast context that `Trainer.training_step` /
+    `DPOTrainer.compute_ref_log_probs` use during real forward passes.
+    """
+    ctx_fn = getattr(trainer, "compute_loss_context_manager", None)
+    if callable(ctx_fn):
+        with ctx_fn():
+            yield
+        return
+    accel = getattr(trainer, "accelerator", None)
+    if accel is not None and hasattr(accel, "autocast") and callable(accel.autocast):
+        with accel.autocast():
+            yield
+        return
+    args = getattr(trainer, "args", None)
+    if bool(getattr(args, "bf16", False)) and torch.cuda.is_available():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            yield
+        return
+    yield
+
+
+@contextlib.contextmanager
+def _temporarily_disable_gradient_checkpointing(model: Any, trainer: Any = None):
+    """Mirror `DPOTrainer.compute_ref_log_probs`'s `disable_gradient_checkpointing(...)` context."""
+    args = getattr(trainer, "args", None)
+    gc_kwargs = getattr(args, "gradient_checkpointing_kwargs", None) if args is not None else None
+    try:
+        from trl.models.utils import disable_gradient_checkpointing  # type: ignore
+
+        with disable_gradient_checkpointing(model, gc_kwargs):
+            yield
+        return
+    except Exception:
+        pass
+    flagged = [m for m in model.modules() if getattr(m, "gradient_checkpointing", False) is True]
+    for m in flagged:
+        m.gradient_checkpointing = False
+    try:
+        yield
+    finally:
+        for m in flagged:
+            m.gradient_checkpointing = True
+
+
 def verify_step0_dpo_ref_alignment(
     trainer: Any,
     model: Any,
     is_moe: bool = False,
+    freeze_moe_router: bool = True,
     max_loss_drift_from_ln2: float = 0.05,
     max_eval_train_drift: float = 0.02,
     max_step0_grad_norm: float = 100_000.0,
 ) -> Dict[str, float]:
     """Run a `<5s` pre-flight check before `trainer.train()` verifying exact Step-0 alignment
-    between precomputed `ref_*_logps`, `model.eval()` forward, `model.train()` forward, and backward gradients.
+    between precomputed `ref_*_logps`, the `no_grad` reference-mode forward, the exact `for_training`
+    + `autocast` `training_step` forward, and backward gradients through 2D + 3D MoE LoRA weights.
     """
     train_ds = trainer.train_dataset
     col_names = set(getattr(train_ds, "column_names", []) or [])
@@ -303,14 +432,21 @@ def verify_step0_dpo_ref_alignment(
     batch_train = trainer._prepare_inputs(_clone_batch(collated))
 
     try:
-        model.eval()
-        with torch.no_grad():
+        # 1. Undo `UnslothDPOTrainer.__init__`'s trailing `model.for_inference()` and verify the
+        #    no-grad + disabled-GC + autocast forward (identical to `DPOTrainer.compute_ref_log_probs`).
+        _enter_unsloth_training_mode(model, trainer=trainer, freeze_moe_router=freeze_moe_router)
+        with (
+            torch.no_grad(),
+            _temporarily_disable_gradient_checkpointing(model, trainer=trainer),
+            _dpo_compute_loss_autocast_context(trainer),
+        ):
             loss_nograd_t = trainer.compute_loss(model, batch_eval)
             loss_nograd = float(loss_nograd_t.detach().float().item())
 
-        model.train()
+        # 2. Verify the exact `trainer.train()` Step-0 forward + backward (`for_training` + GC + autocast).
+        _enter_unsloth_training_mode(model, trainer=trainer, freeze_moe_router=freeze_moe_router)
         model.zero_grad(set_to_none=True)
-        with torch.enable_grad():
+        with torch.enable_grad(), _dpo_compute_loss_autocast_context(trainer):
             loss_grad_t = trainer.compute_loss(model, batch_train)
             loss_grad = float(loss_grad_t.detach().float().item())
             loss_grad_t.backward()
@@ -329,7 +465,7 @@ def verify_step0_dpo_ref_alignment(
         expert_grad_norm = math.sqrt(expert_sq)
     finally:
         model.zero_grad(set_to_none=True)
-        model.train()
+        _enter_unsloth_training_mode(model, trainer=trainer, freeze_moe_router=freeze_moe_router)
         metrics_dict = getattr(trainer, "_metrics", None)
         if isinstance(metrics_dict, dict):
             for sub in metrics_dict.values():
@@ -388,16 +524,26 @@ def verify_step0_dpo_ref_alignment(
 
 
 @contextlib.contextmanager
-def preserve_stage1_adapter_for_ref_precompute(model: Any, trainer_box: Dict[str, Any]):
+def preserve_stage1_adapter_for_ref_precompute(
+    model: Any,
+    trainer_box: Dict[str, Any],
+    dpo_trainer_cls: Any = None,
+):
     """Keep the untouched Stage 1 SFT `"default"` adapter active during `precompute_ref_log_probs=True`
     without duplicating `"ref"` LoRA adapters (which corrupt nested 3D `ParamWrapper` layers when
-    `target_parameters=['experts.gate_up_proj', 'experts.down_proj']` on `Gemma-4-26B-A4B`) and without
+    `target_parameters=['experts.gate_up_proj', 'experts.down_proj']` on `Gemma-4-26B-A4B`), without
     allowing `use_adapter(model, None)` / `model.disable_adapter()` to revert $\\pi_{\\text{ref}}$ to the
-    untuned base model.
+    untuned base model, and while ensuring `compute_ref_log_probs` passes identical Gemma 4
+    `mm_token_type_ids` masks as `DPOTrainer.compute_loss`.
     """
     orig_disable = getattr(model, "disable_adapter", None)
     orig_add_adapter = getattr(model, "add_adapter", None)
     orig_get_parameter = getattr(model, "get_parameter", None)
+    orig_compute_ref = (
+        getattr(dpo_trainer_cls, "compute_ref_log_probs", None)
+        if dpo_trainer_cls is not None
+        else None
+    )
 
     @contextlib.contextmanager
     def _guarded_disable_adapter():
@@ -433,12 +579,18 @@ def preserve_stage1_adapter_for_ref_precompute(model: Any, trainer_box: Dict[str
                 return orig_get_parameter(target.replace(".ref.", ".default."))
             raise
 
+    def _aligned_compute_ref_log_probs(self_trainer: Any, ref_or_policy_model: Any, inputs: Dict[str, Any]):
+        aligned_inputs = _maybe_inject_gemma4_mm_token_type_ids(ref_or_policy_model, inputs)
+        return orig_compute_ref(self_trainer, ref_or_policy_model, aligned_inputs)
+
     if orig_disable is not None:
         model.disable_adapter = _guarded_disable_adapter
     if orig_add_adapter is not None:
         model.add_adapter = _guarded_add_adapter
     if orig_get_parameter is not None:
         model.get_parameter = _guarded_get_parameter
+    if orig_compute_ref is not None and dpo_trainer_cls is not None:
+        dpo_trainer_cls.compute_ref_log_probs = _aligned_compute_ref_log_probs
     try:
         yield
     finally:
@@ -448,6 +600,8 @@ def preserve_stage1_adapter_for_ref_precompute(model: Any, trainer_box: Dict[str
             model.add_adapter = orig_add_adapter
         if orig_get_parameter is not None:
             model.get_parameter = orig_get_parameter
+        if orig_compute_ref is not None and dpo_trainer_cls is not None:
+            dpo_trainer_cls.compute_ref_log_probs = orig_compute_ref
 
 
 def align_26b_chat_template_for_dpo(chat_template: Optional[str]) -> Optional[str]:
@@ -821,8 +975,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point for Stage 2 DPO training."""
+    os.environ["UNSLOTH_BLOCK_COMPILE"] = "0"
     os.environ["UNSLOTH_MOE_LORA_FOLD"] = "0"
     os.environ["UNSLOTH_MOE_GC_KEEP_BASE"] = "0"
+    os.environ["UNSLOTH_MOE_ROUTED_KERNEL"] = "0"
+    os.environ["UNSLOTH_HD512_ATTENTION"] = "0"
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -968,12 +1125,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     base_model_id_str = str(model_cfg.get("base_model_id", BASE_MODEL_ID))
     precomp_bs = getattr(dpo_args, "precompute_ref_batch_size", None)
+    ref_cache_root = (
+        None
+        if args.smoke_test
+        else (out_dir_path.resolve().parent / ".dpo_ref_cache")
+    )
     train_dataset = salt_dpo_dataset_fingerprint(
         train_dataset,
         base_model_id=base_model_id_str,
         sft_adapter_dir=adapter_ckpt,
         precompute_ref_batch_size=precomp_bs,
         is_moe=is_moe,
+        cache_dir=ref_cache_root,
     )
     if eval_dataset is not None:
         eval_dataset = salt_dpo_dataset_fingerprint(
@@ -982,14 +1145,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             sft_adapter_dir=adapter_ckpt,
             precompute_ref_batch_size=precomp_bs,
             is_moe=is_moe,
+            cache_dir=(ref_cache_root / "eval") if ref_cache_root is not None else None,
         )
 
+    saved_gemma4_proc = getattr(tokenizer, "_gemma4_processor", None)
     original_chat_template = getattr(tokenizer, "chat_template", None)
     if is_moe and original_chat_template:
         tokenizer.chat_template = align_26b_chat_template_for_dpo(original_chat_template)
-        proc = getattr(tokenizer, "_gemma4_processor", None)
-        if proc is not None and hasattr(proc, "chat_template"):
-            proc.chat_template = tokenizer.chat_template
+        if saved_gemma4_proc is not None and hasattr(saved_gemma4_proc, "chat_template"):
+            saved_gemma4_proc.chat_template = tokenizer.chat_template
 
     # Hard pre-train verification that `prompt_ids` is an exact prefix of `prompt + chosen/rejected`
     # across BOTH non-thinking (`enable_thinking=False`) and thinking (`enable_thinking=True`) pairs.
@@ -1019,6 +1183,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         )
 
+    # Detach non-hashable VLM processor attachment during `DPOTrainer._prepare_dataset` so
+    # HuggingFace `datasets` `Hasher` produces an identical fingerprint across restarts/resumes.
+    if hasattr(tokenizer, "_gemma4_processor"):
+        try:
+            delattr(tokenizer, "_gemma4_processor")
+        except AttributeError:
+            pass
+
     trainer_kwargs: Dict[str, Any] = {
         "model": model,
         "ref_model": None,
@@ -1031,31 +1203,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         trainer_kwargs["eval_dataset"] = eval_dataset
 
     trainer_sig = inspect.signature(DPOTrainer.__init__)
-    if "processing_class" in trainer_sig.parameters:
+    has_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in trainer_sig.parameters.values()
+    )
+    if "processing_class" in trainer_sig.parameters or has_var_kw:
         trainer_kwargs["processing_class"] = tokenizer
     elif "tokenizer" in trainer_sig.parameters:
         trainer_kwargs["tokenizer"] = tokenizer
 
+    freeze_router_flag = bool(vram_cfg.get("freeze_moe_router", True))
     trainer_box: Dict[str, Any] = {}
     precompute_guard = (
-        preserve_stage1_adapter_for_ref_precompute(model, trainer_box)
+        preserve_stage1_adapter_for_ref_precompute(model, trainer_box, dpo_trainer_cls=DPOTrainer)
         if bool(getattr(dpo_args, "precompute_ref_log_probs", False))
         else contextlib.nullcontext()
     )
-    with precompute_guard:
-        trainer = DPOTrainer(**trainer_kwargs)
-        trainer_box["trainer"] = trainer
-        if bool(getattr(dpo_args, "precompute_ref_log_probs", False)) and getattr(
-            trainer, "_precomputed_train_ref_log_probs", True
-        ) is False:
-            # Force TRL 1.15.x lazy precomputation to execute now while `model` holds untouched Stage 1 SFT weights
-            trainer.get_train_dataloader()
+    try:
+        with precompute_guard:
+            trainer = DPOTrainer(**trainer_kwargs)
+            trainer_box["trainer"] = trainer
+            if bool(getattr(dpo_args, "precompute_ref_log_probs", False)) and getattr(
+                trainer, "_precomputed_train_ref_log_probs", True
+            ) is False:
+                # Force TRL 1.15.x lazy precomputation to execute now while `model` holds untouched Stage 1 SFT weights
+                trainer.get_train_dataloader()
+    finally:
+        if saved_gemma4_proc is not None:
+            setattr(tokenizer, "_gemma4_processor", saved_gemma4_proc)
+
     install_dpo_default_adapter_resume_hook(
         trainer,
-        freeze_moe_router=bool(vram_cfg.get("freeze_moe_router", True)),
+        freeze_moe_router=freeze_router_flag,
     )
     if not args.smoke_test and last_ckpt is None:
-        verify_step0_dpo_ref_alignment(trainer, model, is_moe=is_moe)
+        verify_step0_dpo_ref_alignment(
+            trainer,
+            model,
+            is_moe=is_moe,
+            freeze_moe_router=freeze_router_flag,
+        )
     log_vram_telemetry(model, stage="pre_dpo_train")
     train_result = trainer.train(resume_from_checkpoint=last_ckpt)
     log_vram_telemetry(model, stage="post_dpo_train")
