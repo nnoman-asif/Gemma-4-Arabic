@@ -380,16 +380,11 @@ def resolve_torch_dtype(dtype_spec: Union[str, torch.dtype]) -> torch.dtype:
 
 def build_8gb_device_map(cuda_device_index: int = 0) -> Dict[str, Union[str, int]]:
     """Construct the device_map that routes PLE and multimodal towers directly to CPU RAM."""
-    if not torch.cuda.is_available():
-        return {"": "cpu"}
-    return {
-        "model.language_model.embed_tokens_per_layer": "cpu",
-        "model.audio_tower": "cpu",
-        "model.vision_tower": "cpu",
-        "model.embed_audio": "cpu",
-        "model.embed_vision": "cpu",
-        "": cuda_device_index,
-    }
+    return build_device_map(
+        cuda_device_index=cuda_device_index,
+        offload_ple_to_cpu=True,
+        offload_multimodal_towers_to_cpu=True,
+    )
 
 
 def build_device_map(
@@ -397,20 +392,32 @@ def build_device_map(
     offload_ple_to_cpu: bool = True,
     offload_multimodal_towers_to_cpu: bool = True,
 ) -> Dict[str, Union[str, int]]:
-    """Build hardware-aware device_map for either 8 GB Edge (CPU offload) or A100 80 GB (pure HBM2e)."""
+    """Build hardware-aware device_map for either 8 GB Edge (CPU offload) or A100 80 GB (pure HBM2e).
+
+    When CPU offload is active, maps all 12 `Gemma4ForConditionalGeneration` submodules explicitly
+    without a root `""` entry so `accelerate` does not attach a root `AlignDevicesHook` that drags
+    the 5.25 GiB `embed_tokens_per_layer` table onto GPU VRAM.
+    """
     if not torch.cuda.is_available():
         return {"": "cpu"}
     if not offload_ple_to_cpu and not offload_multimodal_towers_to_cpu:
         return {"": cuda_device_index}
-    dmap: Dict[str, Union[str, int]] = {"": cuda_device_index}
-    if offload_ple_to_cpu:
-        dmap["model.language_model.embed_tokens_per_layer"] = "cpu"
-    if offload_multimodal_towers_to_cpu:
-        dmap["model.audio_tower"] = "cpu"
-        dmap["model.vision_tower"] = "cpu"
-        dmap["model.embed_audio"] = "cpu"
-        dmap["model.embed_vision"] = "cpu"
-    return dmap
+    ple_target: Union[str, int] = "cpu" if offload_ple_to_cpu else cuda_device_index
+    mm_target: Union[str, int] = "cpu" if offload_multimodal_towers_to_cpu else cuda_device_index
+    return {
+        "model.language_model.embed_tokens": cuda_device_index,
+        "model.language_model.layers": cuda_device_index,
+        "model.language_model.norm": cuda_device_index,
+        "model.language_model.rotary_emb": cuda_device_index,
+        "model.language_model.per_layer_model_projection": cuda_device_index,
+        "model.language_model.per_layer_projection_norm": cuda_device_index,
+        "lm_head": cuda_device_index,
+        "model.language_model.embed_tokens_per_layer": ple_target,
+        "model.audio_tower": mm_target,
+        "model.vision_tower": mm_target,
+        "model.embed_audio": mm_target,
+        "model.embed_vision": mm_target,
+    }
 
 
 def build_bnb_4bit_config(
@@ -418,6 +425,7 @@ def build_bnb_4bit_config(
     quant_type: str = "nf4",
     use_double_quant: bool = True,
     exclude_modules: Sequence[str] = LORA_EXCLUDE_MODULES,
+    enable_fp32_cpu_offload: bool = False,
 ) -> Any:
     """Build a BitsAndBytesConfig for 4-bit NF4 quantization."""
     from transformers import BitsAndBytesConfig
@@ -428,6 +436,7 @@ def build_bnb_4bit_config(
         bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=use_double_quant,
         llm_int8_skip_modules=list(exclude_modules),
+        llm_int8_enable_fp32_cpu_offload=bool(enable_fp32_cpu_offload),
     )
 
 
@@ -981,6 +990,7 @@ def load_gemma4_8gb_model_and_tokenizer(
             load_kwargs["quantization_config"] = build_bnb_4bit_config(
                 compute_dtype=resolved_dtype,
                 exclude_modules=resolved_excludes,
+                enable_fp32_cpu_offload=enable_cpu_offload,
             )
 
         arch_list = getattr(hf_config, "architectures", None) or []

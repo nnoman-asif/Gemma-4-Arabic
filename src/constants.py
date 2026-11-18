@@ -42,8 +42,8 @@ MOE_ROUTER_MODULE_PATTERNS: Tuple[str, ...] = ("router", ".gate.")
 MOE_ROUTER_KEYWORDS: Tuple[str, ...] = MOE_ROUTER_MODULE_PATTERNS
 
 # Published Hugging Face Dataset Repositories (for fast pull on GPU nodes)
-PUBLISHED_SFT_DATASET_REPO: str = "noman-asif/Arabic-Reasoning-Instruct-120k"
-PUBLISHED_DPO_DATASET_REPO: str = "noman-asif/Arabic-Preference-DPO-20k"
+PUBLISHED_SFT_DATASET_REPO: str = "noman-asif/Arabic-Reasoning-Instruct-30k"
+PUBLISHED_DPO_DATASET_REPO: str = "noman-asif/Arabic-Preference-DPO-6k"
 
 # ---------------------------------------------------------------------------
 # Native Gemma 4 Chat & Reasoning Special Tokens (Verified Against Tokenizer)

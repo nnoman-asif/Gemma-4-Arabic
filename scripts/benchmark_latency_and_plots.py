@@ -826,14 +826,14 @@ def generate_all_family_plots(
 
     ax4_left.plot(steps_sft_e4b, loss_e4b, linewidth=2.3, color="#0284c7", label="Gemma-4-E4B-Arabic-It (SFT Loss)")
     ax4_left.plot(steps_sft_moe, loss_moe, linewidth=2.3, color="#16a34a", label="Gemma-4-26B-A4B-Arabic-It (SFT Loss)")
-    ax4_left.set_xlabel("Stage 1 QLoRA SFT Steps (120k Mix, Effective BS=32)", fontsize=11, fontweight="bold")
+    ax4_left.set_xlabel("Stage 1 QLoRA SFT Steps (30k Mix, Effective BS=64)", fontsize=11, fontweight="bold")
     ax4_left.set_ylabel("Cross-Entropy Completion Loss", fontsize=11, fontweight="bold")
     ax4_left.set_title("Stage 1 QLoRA Continual Instruction Tuning Convergence", fontsize=12.5, fontweight="bold")
     ax4_left.legend(loc="upper right", fontsize=9.5)
 
     ax4_right.plot(steps_dpo_e4b, margin_e4b, linewidth=2.3, color="#0284c7", label="E4B-Arabic-It Reward Margin (Chosen - Rejected)")
     ax4_right.plot(steps_dpo_moe, margin_moe, linewidth=2.3, color="#16a34a", label="26B-A4B-Arabic-It Reward Margin (Chosen - Rejected)")
-    ax4_right.set_xlabel("Stage 2 Conversational DPO Steps (20k Pairs, Effective BS=16, beta=0.1, lr=5e-6)", fontsize=10.5, fontweight="bold")
+    ax4_right.set_xlabel("Stage 2 Conversational DPO Steps (6k Pairs, Effective BS=32, beta=0.2)", fontsize=10.5, fontweight="bold")
     ax4_right.set_ylabel("Implicit Log-Ratio Reward Margin", fontsize=11, fontweight="bold")
     ax4_right.set_title("Stage 2 Conversational DPO Alignment Reward Margin", fontsize=12.5, fontweight="bold")
     ax4_right.legend(loc="lower right", fontsize=9.5)

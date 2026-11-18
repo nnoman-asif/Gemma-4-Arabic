@@ -82,7 +82,7 @@ training:
 datasets:
   total_target_pairs: 6000
   output_dataset_dir: "data/dpo_mixed"
-  hf_hub_dataset_repo: "noman-asif/Arabic-Preference-DPO-20k"
+  hf_hub_dataset_repo: "noman-asif/Arabic-Preference-DPO-6k"
 
   preference_sources:
     arabic_dialect_dpo_saudi:

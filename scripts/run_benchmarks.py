@@ -254,26 +254,121 @@ def _resolve_hf_eval_cache_dir() -> Optional[str]:
 
 def normalize_lighteval_mcq_continuation_space(
     context: str,
-    continuation: str,
+    continuation: Any,
     start_space: bool = True,
-) -> str:
+) -> Any:
     """Ensure log-likelihood MCQ continuations carry a leading space when `context` does not end in whitespace.
 
-    Fixes upstream `lighteval` `VLLMModel` parity with `TransformersModel._check_continuations_start_space`:
-    `VLLMModelConfig(multichoice_continuations_start_space=True)` is ignored by `VLLMModel._loglikelihood_tokens`,
-    which otherwise glues `("الإجابة:", "أ")` into `"الإجابة:أ"` (`[':', 'أ']` medial piece) instead of
-    `"الإجابة: أ"` (`[':', '▁أ']` standalone word-piece) on SentencePiece tokenizers like Gemma 4.
+    Handles `str`, `list[str]`, and `tuple[str, ...]` (since upstream `lighteval` passes `doc.choices: list[str]`
+    into `tok_encode_pair(context, doc.choices, ...)`), returning a new container without mutating `doc.choices`
+    in place so `LogProbCharNorm()` continues to divide by canonical choice character lengths.
     """
     if (
-        start_space
-        and isinstance(context, str)
-        and isinstance(continuation, str)
-        and continuation
-        and not continuation[0].isspace()
-        and (not context or not context[-1].isspace())
+        not start_space
+        or not isinstance(context, str)
+        or (context and (context[-1].isspace() or context.endswith("<channel|>")))
     ):
-        return f" {continuation}"
+        return continuation
+
+    def _pad_one(item: Any) -> Any:
+        if isinstance(item, str) and item and not item[0].isspace():
+            return f" {item}"
+        return item
+
+    if isinstance(continuation, str):
+        return _pad_one(continuation)
+    if isinstance(continuation, list):
+        return [_pad_one(c) for c in continuation]
+    if isinstance(continuation, tuple):
+        return tuple(_pad_one(c) for c in continuation)
     return continuation
+
+
+def format_lighteval_arabic_chat_prompt(
+    doc: Any,
+    tokenizer: Any,
+    system_prompt: Optional[str] = None,
+) -> str:
+    """Format an OALL v2 `lighteval` `Doc` using Gemma 4's non-thinking chat template + `"الإجابة:"` assistant prefill.
+
+    Instruction-tuned Gemma 4 checkpoints (`E4B-it` and `26B-A4B-it`) are trained and adapted inside
+    `<bos><|turn>user\\n...<turn|>\\n<|turn>model\\n` (`E4B-it`) and
+    `<bos><|turn>user\\n...<turn|>\\n<|turn>model\\n<|channel>thought\\n<channel|>` (`26B-A4B-it`).
+    Rendering `apply_chat_template(..., add_generation_prompt=True, enable_thinking=False)` and prefilling
+    `"الإجابة:"` on MCQ items ending in `"الإجابة:"` aligns log-likelihood scoring directly with the chat
+    distribution while preventing conversational preambles before the answer key.
+    """
+    def _extract_q(query_text: str, instr_text: Optional[str]) -> str:
+        if instr_text and query_text.startswith(instr_text):
+            return query_text[len(instr_text):].strip()
+        return query_text
+
+    doc_instr: Optional[str] = getattr(doc, "instruction", None) or None
+    fewshot_samples = getattr(doc, "fewshot_samples", None) or []
+
+    messages: List[Dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": str(system_prompt)})
+
+    instruction_used = False
+    for ix, fs in enumerate(fewshot_samples):
+        fs_instr: Optional[str] = getattr(fs, "instruction", None) or None
+        fq = _extract_q(str(getattr(fs, "query", "")), fs_instr)
+        if ix == 0 and doc_instr:
+            instruction_used = True
+            fq = doc_instr + fq
+        fq_clean = fq.rstrip()
+        if hasattr(fs, "get_golds"):
+            golds = fs.get_golds()
+            gold_str = str(golds[0]).strip() if golds else ""
+        else:
+            fs_choices = getattr(fs, "choices", []) or []
+            fs_gold_idx = int(getattr(fs, "gold_index", 0) or 0)
+            gold_str = str(fs_choices[fs_gold_idx]).strip() if 0 <= fs_gold_idx < len(fs_choices) else ""
+        asst_content = f"الإجابة: {gold_str}" if fq_clean.endswith("الإجابة:") else gold_str
+        messages.append({"role": "user", "content": fq_clean})
+        messages.append({"role": "assistant", "content": asst_content})
+
+    mq = _extract_q(str(getattr(doc, "query", "")), doc_instr)
+    if doc_instr and not instruction_used:
+        mq = doc_instr + mq
+    mq_clean = mq.rstrip()
+    messages.append({"role": "user", "content": mq_clean})
+
+    if tokenizer is not None and getattr(tokenizer, "chat_template", None):
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        if mq_clean.endswith("الإجابة:"):
+            rendered = f"{rendered}الإجابة:"
+        return str(rendered)
+
+    parts: List[str] = []
+    if system_prompt:
+        parts.append(str(system_prompt))
+    for i in range(0, len(messages) - 1, 2):
+        u_msg = messages[i]["content"]
+        a_msg = messages[i + 1]["content"]
+        if u_msg.endswith("الإجابة:") and a_msg.startswith("الإجابة:"):
+            parts.append(f"{u_msg} {a_msg[len('الإجابة:'):].strip()}")
+        else:
+            parts.append(f"{u_msg} {a_msg}".strip())
+    parts.append(mq_clean)
+    plain = "\n\n".join(parts)
+    bos_tok = getattr(tokenizer, "bos_token", None) if tokenizer is not None else None
+    if bos_tok and not plain.startswith(str(bos_tok)):
+        plain = f"{bos_tok}{plain}"
+    return plain
 
 
 def _enable_vllm_language_model_only_default() -> bool:
@@ -2292,6 +2387,7 @@ from scripts.run_benchmarks import (
     _destroy_vllm_and_free_vram,
     _enable_vllm_language_model_only_default,
     _prepare_gemma4_config_for_load,
+    format_lighteval_arabic_chat_prompt,
     normalize_lighteval_mcq_continuation_space,
 )
 try:
@@ -2301,6 +2397,21 @@ except Exception:
 
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+
+
+class _Gemma4ArabicPromptManager:
+    def __init__(self, tokenizer, system_prompt=None):
+        self.use_chat_template = True
+        self.tokenizer = tokenizer
+        self.system_prompt = system_prompt
+
+    def prepare_prompt(self, doc):
+        return format_lighteval_arabic_chat_prompt(
+            doc,
+            self.tokenizer,
+            system_prompt=self.system_prompt,
+        )
+
 
 evaluation_tracker = EvaluationTracker(
     output_dir={repr(str(tmp_dir))},
@@ -2319,11 +2430,19 @@ try:
             from lighteval.models.vllm.vllm_model import VLLMModel, VLLMModelConfig
 
             class Gemma4ArabicVLLMModel(VLLMModel):
+                def __init__(self, config):
+                    super().__init__(config)
+                    self._add_special_tokens = False
+                    self.prompt_manager = _Gemma4ArabicPromptManager(
+                        self.tokenizer,
+                        getattr(config, "system_prompt", None),
+                    )
+
                 def tok_encode_pair(self, context, continuation, pairwise=False):
                     continuation = normalize_lighteval_mcq_continuation_space(
                         context,
                         continuation,
-                        start_space=bool(getattr(self, "multichoice_continuations_start_space", True)),
+                        start_space=True,
                     )
                     return super().tok_encode_pair(context, continuation, pairwise=pairwise)
 
@@ -2340,11 +2459,12 @@ try:
                 gpu_memory_utilization=0.90,
                 max_model_length={int(le_max_len)},
                 max_num_batched_tokens={max(8192, int(le_max_len))},
-                override_chat_template=False,
                 trust_remote_code=True,
             )
-            if "multichoice_continuations_start_space" in inspect.signature(VLLMModelConfig).parameters:
-                _vllm_kw["multichoice_continuations_start_space"] = True
+            if "add_special_tokens" in inspect.signature(VLLMModelConfig).parameters:
+                _vllm_kw["add_special_tokens"] = False
+            if "override_chat_template" in inspect.signature(VLLMModelConfig).parameters:
+                _vllm_kw["override_chat_template"] = True
             if "enable_prefix_caching" in inspect.signature(VLLMModelConfig).parameters:
                 _vllm_kw["enable_prefix_caching"] = False
             model_config = VLLMModelConfig(**_vllm_kw)
@@ -2364,10 +2484,48 @@ try:
             results_payload = pipeline.get_results()
         except Exception as vllm_exc:
             sys.stderr.write(f"[LightEval] vLLM backend failed ({{vllm_exc}}); falling back to Accelerate...\\n")
-            _destroy_vllm_and_free_vram()
+            _destroy_vllm_and_free_vram(lm_obj=locals().get("vllm_ar_model"))
 
     if results_payload is None:
-        from lighteval.models.transformers.transformers_model import TransformersModelConfig
+        import lighteval.models.transformers.transformers_model as _le_tf_mod
+        from lighteval.models.transformers.transformers_model import (
+            TransformersModel,
+            TransformersModelConfig,
+        )
+        from transformers import AutoModelForImageTextToText
+
+        class Gemma4ArabicTransformersModel(TransformersModel):
+            def __init__(self, config):
+                super().__init__(config)
+                self._add_special_tokens = False
+                self.prompt_manager = _Gemma4ArabicPromptManager(
+                    self.tokenizer,
+                    getattr(config, "system_prompt", None),
+                )
+
+            def _create_auto_model(self):
+                arch_list = getattr(self.transformers_config, "architectures", None) or []
+                is_mm = (
+                    getattr(self.transformers_config, "model_type", "") == "gemma4"
+                    or any("ConditionalGeneration" in a for a in arch_list)
+                )
+                if not is_mm:
+                    return super()._create_auto_model()
+                orig_cls = _le_tf_mod.AutoModelForCausalLM
+                _le_tf_mod.AutoModelForCausalLM = AutoModelForImageTextToText
+                try:
+                    return super()._create_auto_model()
+                finally:
+                    _le_tf_mod.AutoModelForCausalLM = orig_cls
+
+            def tok_encode_pair(self, context, continuation, pairwise=False):
+                continuation = normalize_lighteval_mcq_continuation_space(
+                    context,
+                    continuation,
+                    start_space=True,
+                )
+                return super().tok_encode_pair(context, continuation, pairwise=False)
+
         pipeline_params = PipelineParameters(
             launcher_type=ParallelismManager.ACCELERATE,
             custom_tasks_directory="lighteval.tasks.multilingual.tasks.arabic",
@@ -2375,19 +2533,24 @@ try:
             max_samples={repr(per_subtask_samples)},
             bootstrap_iters=0,
         )
-        model_config = TransformersModelConfig(
+        _tf_kw = dict(
             model_name={repr(load_target_path)},
             dtype="bfloat16",
             batch_size={int(le_batch_size)},
             max_length={int(le_max_len)},
-            override_chat_template=False,
             trust_remote_code=True,
         )
+        if "add_special_tokens" in inspect.signature(TransformersModelConfig).parameters:
+            _tf_kw["add_special_tokens"] = False
+        if "override_chat_template" in inspect.signature(TransformersModelConfig).parameters:
+            _tf_kw["override_chat_template"] = True
+        model_config = TransformersModelConfig(**_tf_kw)
+        tf_ar_model = Gemma4ArabicTransformersModel(model_config)
         pipeline = Pipeline(
             tasks={repr(tasks_csv)},
             pipeline_parameters=pipeline_params,
             evaluation_tracker=evaluation_tracker,
-            model_config=model_config,
+            model=tf_ar_model,
         )
         doc_counts = {{
             str(k): len(v)
@@ -2408,7 +2571,7 @@ try:
         encoding="utf-8",
     )
 finally:
-    _destroy_vllm_and_free_vram()
+    _destroy_vllm_and_free_vram(lm_obj=locals().get("vllm_ar_model") or locals().get("vllm_model"))
 """
         proc = subprocess.run(
             [sys.executable, "-c", runner_code],
@@ -2988,7 +3151,7 @@ try:
         encoding="utf-8",
     )
 finally:
-    _destroy_vllm_and_free_vram()
+    _destroy_vllm_and_free_vram(lm_obj=locals().get("vllm_ar_model") or locals().get("vllm_model"))
 """
             proc = subprocess.run(
                 [sys.executable, "-c", runner_code],

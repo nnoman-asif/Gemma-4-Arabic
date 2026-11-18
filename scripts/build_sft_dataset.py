@@ -1,23 +1,22 @@
-"""CLI script to build, decontaminate, validate, or pull the Stage 1 SFT dataset (120,000 rows).
+"""CLI script to build, decontaminate, validate, or pull the V3 Stage 1 SFT dataset (30,000 rows).
 
 Supports:
-- All 9 curated public (`gated=False`) Arabic & Saudi SFT sources (90,000 rows / 75.0%):
+- High-purity public (`gated=False`) Arabic & Saudi SFT sources (22,500 rows / 75.0%, 55.0% overall CoT):
   1. `AdaMLLab/smolkalam-arabic-conversational-sft` (`Mixture_of_Thoughts_science_no_think`)
-  2. `AdaMLLab/smolkalam-arabic-conversational-sft` (`OpenThoughts3_50K` — verified `<think>...</think>`)
+  2. `AdaMLLab/smolkalam-arabic-conversational-sft` (`OpenThoughts3_50K`, `s1k_1.1_think`, `*_think` — `<|channel>thought` CoT)
   3. `AdaMLLab/smolkalam-arabic-conversational-sft` (`OpenHermes_2.5_no_think`)
-  4. `oddadmix/arabic-math-reasoning-synth`
-  5. `FreedomIntelligence/alpaca-gpt4-arabic`
-  6. `Gheras/Medical_Reasoning_Arabic_Dataset`
-  7. `CohereLabs/aya_dataset` (human-annotated Arabic)
-  8. `VohoAI/voho-saudi-dialogues`
-  9. `SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus` (`moj` & `boe`, active statutes)
-- All 6 Replay Buffer anchors (30,000 rows / 25.0%):
+  4. `FreedomIntelligence/alpaca-gpt4-arabic`
+  5. `Gheras/Medical_Reasoning_Arabic_Dataset`
+  6. `CohereLabs/aya_dataset` (human-annotated Arabic)
+  7. `VohoAI/voho-saudi-dialogues`
+  8. `SaudiArabicLaws/saudi-arabic-laws-and-regulations-corpus` (`moj` & `boe`, active statutes)
+- All 6 Replay Buffer anchors (7,500 rows / 25.0%):
   `nvidia/OpenCodeReasoning`, `open-r1/codeforces-cots`, `m-a-p/CodeFeedback-Filtered-Instruction`,
   `nvidia/OpenMathInstruct-2` (full CoT + `\\boxed{}`), `nvidia/OpenScienceReasoning-2`, and
   `HuggingFaceH4/ultrachat_200k`.
 - 13-gram benchmark decontamination against all Arabic & English evaluation test sets.
 - `--pull-from-hub` fast path to download the pre-built verified corpus from
-  `noman-asif/Arabic-Reasoning-Instruct-120k` in seconds on rented GPU instances.
+  `noman-asif/Arabic-Reasoning-Instruct-30k` in seconds on rented GPU instances.
 """
 
 import argparse

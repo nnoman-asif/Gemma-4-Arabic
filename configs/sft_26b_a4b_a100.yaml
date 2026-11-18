@@ -85,4 +85,4 @@ datasets:
   arabic_mix_ratio: 0.75
   replay_mix_ratio: 0.25
   output_dataset_dir: "data/sft_mixed"
-  hf_hub_dataset_repo: "noman-asif/Arabic-Reasoning-Instruct-120k"
+  hf_hub_dataset_repo: "noman-asif/Arabic-Reasoning-Instruct-30k"

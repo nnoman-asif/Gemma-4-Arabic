@@ -10,8 +10,8 @@ End-to-end continual instruction tuning (`QLoRA` across dense + 128 3D MoE exper
 | :--- | :--- | :---: | :--- |
 | **Edge / Workstation Model** | [`noman-asif/Gemma-4-E4B-Arabic-It`](https://huggingface.co/noman-asif/Gemma-4-E4B-Arabic-It) | **4.5B Total / 4.0B Active** (Dense) | Standalone 16-bit (`bfloat16`) `safetensors` checkpoint (`r=16, alpha=16`) for laptops & single-GPU workstations |
 | **Enterprise MoE Flagship** | [`noman-asif/Gemma-4-26B-A4B-Arabic-It`](https://huggingface.co/noman-asif/Gemma-4-26B-A4B-Arabic-It) | **25.2B Total / 3.8B Active** (128 Experts, Top-8 + 1 Shared) | Standalone 16-bit (`bfloat16`) `safetensors` MoE flagship (`r=16, alpha=16` across attention + shared MLP + all 128 3D experts) |
-| **Stage 1 SFT Dataset** | [`noman-asif/Arabic-Reasoning-Instruct-120k`](https://huggingface.co/datasets/noman-asif/Arabic-Reasoning-Instruct-120k) | **30,000 rows** (V3 High-Purity: 75% Arabic / 25% Replay, 55% CoT) | 13-gram de-contaminated Arabic, Saudi dialect, legal (`moj` + `boe`), and native Gemma 4 `<\|channel>thought` reasoning curriculum |
-| **Stage 2 DPO Dataset** | [`noman-asif/Arabic-Preference-DPO-20k`](https://huggingface.co/datasets/noman-asif/Arabic-Preference-DPO-20k) | **6,000 pairs** (V3 Length-Balanced: 70% Arabic / 30% English+Math, 43.3% CoT) | Thinking-aware conversational preference alignment dataset (`0.55..1.75` length balance, 0% SFT prompt overlap) |
+| **Stage 1 SFT Dataset** | [`noman-asif/Arabic-Reasoning-Instruct-30k`](https://huggingface.co/datasets/noman-asif/Arabic-Reasoning-Instruct-30k) | **30,000 rows** (V3 High-Purity: 75% Arabic / 25% Replay, 55% CoT) | 13-gram de-contaminated Arabic, Saudi dialect, legal (`moj` + `boe`), and native Gemma 4 `<\|channel>thought` reasoning curriculum |
+| **Stage 2 DPO Dataset** | [`noman-asif/Arabic-Preference-DPO-6k`](https://huggingface.co/datasets/noman-asif/Arabic-Preference-DPO-6k) | **6,000 pairs** (V3 Length-Balanced: 70% Arabic / 30% English+Math, 43.3% CoT) | Thinking-aware conversational preference alignment dataset (`0.55..1.75` length balance, 0% SFT prompt overlap) |
 
 ---
 

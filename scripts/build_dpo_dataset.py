@@ -8,7 +8,7 @@ Supports:
 3. Cross-stage prompt deduplication against `data/sft_mixed` (0% SFT-to-DPO prompt overlap), strict sentence
    terminal punctuation, and tight length balance (`0.55..1.75`) to prevent DPO verbosity drift.
 4. `--pull-from-hub` fast path to download the pre-built verified preference corpus from
-   `noman-asif/Arabic-Preference-DPO-20k` in seconds on rented GPU instances.
+   `noman-asif/Arabic-Preference-DPO-6k` in seconds on rented GPU instances.
 """
 
 import argparse

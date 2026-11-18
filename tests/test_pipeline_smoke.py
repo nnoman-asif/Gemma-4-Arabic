@@ -97,6 +97,8 @@ from src.constants import (
     LORA_RANK_26B,
     LORA_TARGET_MODULES,
     PRIMARY_MODEL_ID_26B,
+    PUBLISHED_DPO_DATASET_REPO,
+    PUBLISHED_SFT_DATASET_REPO,
     TURN_END_TOKEN,
     TURN_START_TOKEN,
 )
@@ -171,9 +173,17 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(len(LORA_TARGET_MODULES), 7)
         self.assertEqual(DEFAULT_TIES_LAMBDA, 1.0)
         self.assertEqual(DEFAULT_TIES_DENSITY, 1.0)
+        self.assertEqual(PUBLISHED_SFT_DATASET_REPO, "noman-asif/Arabic-Reasoning-Instruct-30k")
+        self.assertEqual(PUBLISHED_DPO_DATASET_REPO, "noman-asif/Arabic-Preference-DPO-6k")
 
         sft_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "sft_config.yaml").read_text(encoding="utf-8")
+        )
+        sft_e4b_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "sft_e4b_a100.yaml").read_text(encoding="utf-8")
+        )
+        sft_26b_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "sft_26b_a4b_a100.yaml").read_text(encoding="utf-8")
         )
         dpo_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "dpo_config.yaml").read_text(encoding="utf-8")
@@ -187,6 +197,11 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         eval_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "eval_config.yaml").read_text(encoding="utf-8")
         )
+
+        for cfg in (sft_cfg, sft_e4b_cfg, sft_26b_cfg):
+            self.assertEqual(cfg["datasets"]["hf_hub_dataset_repo"], PUBLISHED_SFT_DATASET_REPO)
+        for cfg in (dpo_cfg, dpo_e4b_cfg, dpo_26b_cfg):
+            self.assertEqual(cfg["datasets"]["hf_hub_dataset_repo"], PUBLISHED_DPO_DATASET_REPO)
 
         self.assertFalse(sft_cfg["lora"]["use_rslora"])
         self.assertEqual(sft_cfg["lora"]["r"], 32)
@@ -1995,11 +2010,14 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
     def test_14_v3_end_to_end_fixes(self) -> None:
         """Verify all V3 root-cause fixes across 26B masking, DPO ref precompute, LightEval spacing, GPU env, and preflight gate."""
         import os
+        from typing import Optional
         from transformers import TrainerControl, TrainerState, TrainingArguments
         from scripts.run_benchmarks import (
             evaluate_preflight_gate_metrics,
+            format_lighteval_arabic_chat_prompt,
             normalize_lighteval_mcq_continuation_space,
         )
+        from src.model_loader import build_device_map
         from src.dpo_formatter import (
             _has_complete_terminal_ending,
             normalize_arabic_reasoning_thinking_dpo_row,
@@ -2035,7 +2053,7 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertIn(EMPTY_THINKING_BLOCK, unsupervised_text)
         self.assertNotIn(EMPTY_THINKING_BLOCK, supervised_text)
 
-        # 2. Verify LightEval VLLMModel SentencePiece leading-space normalization
+        # 2. Verify LightEval VLLMModel/TransformersModel SentencePiece leading-space & chat-prefill formatting
         self.assertEqual(
             normalize_lighteval_mcq_continuation_space("الإجابة:", "أ"),
             " أ",
@@ -2052,6 +2070,160 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             normalize_lighteval_mcq_continuation_space("الإجابة:\n", "أ"),
             "أ",
         )
+        self.assertEqual(
+            normalize_lighteval_mcq_continuation_space("<|turn>model\n<|channel>thought\n<channel|>", ["أ", "ب"]),
+            ["أ", "ب"],
+        )
+        orig_choices = ["أ", "ب", "ج", "د"]
+        spaced_choices = normalize_lighteval_mcq_continuation_space("الإجابة:", orig_choices)
+        self.assertEqual(spaced_choices, [" أ", " ب", " ج", " د"])
+        self.assertEqual(orig_choices, ["أ", "ب", "ج", "د"])
+        self.assertEqual(
+            normalize_lighteval_mcq_continuation_space("الإجابة:", spaced_choices),
+            [" أ", " ب", " ج", " د"],
+        )
+        self.assertEqual(
+            normalize_lighteval_mcq_continuation_space("الإجابة:", ("صح", "خطأ")),
+            (" صح", " خطأ"),
+        )
+
+        class _MockChatTok:
+            def __init__(self, is_26b: bool = False) -> None:
+                self.is_26b = is_26b
+                self.chat_template = "gemma4"
+
+            def apply_chat_template(
+                self,
+                messages: List[Dict[str, str]],
+                tokenize: bool = False,
+                add_generation_prompt: bool = True,
+                enable_thinking: bool = False,
+            ) -> str:
+                out = "<bos>"
+                for m in messages:
+                    role = "model" if m["role"] == "assistant" else m["role"]
+                    out += f"<|turn>{role}\n{m['content']}<turn|>\n"
+                if add_generation_prompt:
+                    out += "<|turn>model\n"
+                    if self.is_26b and not enable_thinking:
+                        out += "<|channel>thought\n<channel|>"
+                return out
+
+        class _MockDoc:
+            def __init__(
+                self,
+                query: str,
+                choices: List[str],
+                gold_index: int = 0,
+                instruction: Optional[str] = None,
+                fewshot_samples: Optional[List[Any]] = None,
+            ) -> None:
+                self.query = query
+                self.choices = choices
+                self.gold_index = gold_index
+                self.instruction = instruction
+                self.fewshot_samples = fewshot_samples or []
+
+            def get_golds(self) -> List[str]:
+                return [self.choices[self.gold_index]]
+
+        instr_mmlu = "السؤال التالي هو سؤال متعدد الإختيارات. اختر الإجابة الصحيحة:\n\n"
+        doc_mmlu = _MockDoc(
+            query=f"{instr_mmlu}ما عاصمة المملكة العربية السعودية؟\nأ. الرياض\nب. جدة\nالإجابة:",
+            choices=["أ", "ب"],
+            gold_index=0,
+            instruction=instr_mmlu,
+        )
+        e4b_prompt = format_lighteval_arabic_chat_prompt(doc_mmlu, _MockChatTok(is_26b=False))
+        self.assertTrue(e4b_prompt.startswith("<bos><|turn>user\n"))
+        self.assertTrue(e4b_prompt.endswith("<turn|>\n<|turn>model\nالإجابة:"))
+        self.assertEqual(e4b_prompt.count(instr_mmlu.strip()), 1)
+
+        moe_prompt = format_lighteval_arabic_chat_prompt(doc_mmlu, _MockChatTok(is_26b=True))
+        self.assertTrue(moe_prompt.endswith("<turn|>\n<|turn>model\n<|channel>thought\n<channel|>الإجابة:"))
+
+        doc_boolq = _MockDoc(
+            query="بناء على المقطع التالي، أجب عن السؤال ب نعم أو لا\n    الإجابة:\n    ",
+            choices=["نعم", "لا"],
+            gold_index=0,
+            instruction="بناء على المقطع التالي، أجب عن السؤال ب نعم أو لا",
+        )
+        boolq_prompt = format_lighteval_arabic_chat_prompt(doc_boolq, _MockChatTok(is_26b=False))
+        self.assertTrue(boolq_prompt.endswith("<turn|>\n<|turn>model\nالإجابة:"))
+
+        fs_acva = _MockDoc(query="السؤال: تقع الرياض في نجد.\nالإجابة:", choices=["صح", "خطأ"], gold_index=0)
+        doc_acva = _MockDoc(
+            query="السؤال: تقع مكة على ساحل الخليج العربي.\nالإجابة:",
+            choices=["صح", "خطأ"],
+            gold_index=1,
+            fewshot_samples=[fs_acva],
+        )
+        acva_prompt = format_lighteval_arabic_chat_prompt(doc_acva, _MockChatTok(is_26b=False))
+        self.assertIn("<|turn>model\nالإجابة: صح<turn|>", acva_prompt)
+        self.assertTrue(acva_prompt.endswith("<turn|>\n<|turn>model\nالإجابة:"))
+
+        if torch.cuda.is_available():
+            dmap_offload = build_device_map(cuda_device_index=0, offload_ple_to_cpu=True, offload_multimodal_towers_to_cpu=True)
+            self.assertNotIn("", dmap_offload)
+            self.assertEqual(dmap_offload["model.language_model.embed_tokens_per_layer"], "cpu")
+            self.assertEqual(dmap_offload["model.audio_tower"], "cpu")
+            self.assertEqual(dmap_offload["model.language_model.layers"], 0)
+            self.assertEqual(len(dmap_offload), 12)
+            dmap_a100 = build_device_map(cuda_device_index=1, offload_ple_to_cpu=False, offload_multimodal_towers_to_cpu=False)
+            self.assertEqual(dmap_a100, {"": 1})
+
+        # Compile-verify dynamically generated subprocess runner scripts in run_benchmarks.py
+        import unittest.mock as _umock
+        from scripts.run_benchmarks import run_lighteval_lcb_subprocess, run_lighteval_tasks_subprocess
+
+        captured_scripts: List[str] = []
+
+        def _fake_subproc_run(cmd: List[str], **kwargs: Any) -> Any:
+            captured_scripts.append(cmd[2])
+            compile(cmd[2], "lighteval_subprocess_runner", "exec")
+            import re as _re
+
+            m = _re.search(r"pathlib\.Path\((['\"].+?\.json['\"])\)\.write_text", cmd[2])
+            if m:
+                out_p = pathlib.Path(eval(m.group(1)))
+                out_p.write_text(
+                    json.dumps(
+                        {
+                            "results": {
+                                "community|arabic_mmlu:All|0": {"acc_norm": 0.61},
+                                "community|lcb:codegeneration_v6|0": {"codegen_pass@1:1": 0.54},
+                            },
+                            "doc_counts": {"community|arabic_mmlu:All|0": 50, "community|lcb:codegeneration_v6|0": 10},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            class _ProcRes:
+                returncode = 0
+
+            return _ProcRes()
+
+        with _umock.patch("scripts.run_benchmarks.subprocess.run", side_effect=_fake_subproc_run):
+            ar_mock_res = run_lighteval_tasks_subprocess(
+                model_path="unsloth/gemma-4-E4B-it",
+                suite_names=["ArabicMMLU"],
+                device="cuda:0",
+                limit=50,
+                use_vllm=True,
+                tag="compile_check_ar",
+            )
+            lcb_mock_res = run_lighteval_lcb_subprocess(
+                model_path="unsloth/gemma-4-E4B-it",
+                suite_specs={"LiveCodeBench-v6": {"lighteval_task": "lcb:codegeneration_v6|0", "num_samples": 1}},
+                device="cuda:0",
+                limit=10,
+                use_vllm=True,
+                tag="compile_check_lcb",
+            )
+        self.assertEqual(len(captured_scripts), 2)
+        self.assertAlmostEqual(ar_mock_res["ArabicMMLU"]["eval_score_pct"], 61.0, places=2)
+        self.assertAlmostEqual(lcb_mock_res["LiveCodeBench-v6"]["eval_score_pct"], 54.0, places=2)
 
         # 3. Verify strict DPO terminal-ending filter & thinking-mode CoT DPO normalizers
         self.assertFalse(_has_complete_terminal_ending("تبدأ الإجراءات بالذهاب إلى مكتب"))
