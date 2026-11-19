@@ -5072,6 +5072,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--force-preflight",
+        action="store_true",
+        default=False,
+        help="Force re-running all preflight probes even if a model already passed in preflight_gate_report.json.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate all 6 OALL v2 Arabic benchmarks, 4 retention anchors, and Markdown report generation.",
@@ -5285,13 +5291,14 @@ def _probe_single_checkpoint_preflight(
 def run_preflight_gate(
     args: argparse.Namespace,
     cfg: Dict[str, Any],
+    report_path_override: Optional[pathlib.Path] = None,
 ) -> Dict[str, Any]:
     """Execute the fast Dual-GPU Pre-Flight Gate across target model(s) before full 40-suite evaluation."""
     from concurrent.futures import ThreadPoolExecutor
 
     models_cfg = cfg.get("models", {})
     target_keys = ["e4b", "26b_a4b"] if args.model_key == "both" else [args.model_key]
-    report_path = PROJECT_ROOT / "outputs" / "eval_reports" / "preflight_gate_report.json"
+    report_path = report_path_override or (PROJECT_ROOT / "outputs" / "eval_reports" / "preflight_gate_report.json")
 
     if args.dry_run:
         payload = {
@@ -5300,6 +5307,17 @@ def run_preflight_gate(
             "probes": ["ArabicMMLU", "AlGhafa", "MMLU-Pro"],
         }
         return payload
+
+    existing_models: Dict[str, Any] = {}
+    existing_report_mtime: float = 0.0
+    if report_path.is_file() and not getattr(args, "force_preflight", False):
+        try:
+            existing_report_mtime = report_path.stat().st_mtime
+            loaded_prev = json.loads(report_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_prev, dict) and isinstance(loaded_prev.get("models"), dict):
+                existing_models = loaded_prev["models"]
+        except Exception as exc:
+            logger.warning("[Preflight] Could not parse existing %s (%s); running fresh probes.", report_path, exc)
 
     import torch
 
@@ -5320,8 +5338,36 @@ def run_preflight_gate(
             or entry.get("merged_checkpoint_dir")
             or f"outputs/merged_gemma4_{mk}_arabic/merged_16bit"
         )
-        if not (pathlib.Path(tuned_path) / "config.json").exists():
+        cfg_file = pathlib.Path(tuned_path) / "config.json"
+        if not cfg_file.exists():
             raise FileNotFoundError(f"[Preflight:{mk}] Merged checkpoint missing at {tuned_path}")
+
+        ckpt_mtime = cfg_file.stat().st_mtime
+        prev_gate = existing_models.get(mk)
+        if isinstance(prev_gate, dict) and prev_gate.get("gate_passed") is True:
+            saved_mtime = prev_gate.get("tuned_checkpoint_mtime")
+            checkpoint_unchanged = (
+                abs(float(saved_mtime) - ckpt_mtime) < 1e-3
+                if saved_mtime is not None
+                else (ckpt_mtime <= existing_report_mtime)
+            )
+            if checkpoint_unchanged:
+                reused_gate = dict(prev_gate)
+                reused_gate["tuned_checkpoint_mtime"] = ckpt_mtime
+                model_reports[mk] = reused_gate
+                logger.info(
+                    "[Preflight:%s] Reusing verified PASSED preflight result (unchanged checkpoint) | "
+                    "Arabic Avg: %.2f%% -> %.2f%% (%+.2f) | MMLU-Pro: %.2f%% -> %.2f%% (%+.2f) | lambda=%.2f",
+                    mk,
+                    float(reused_gate.get("avg_base_arabic", 0.0)),
+                    float(reused_gate.get("avg_tuned_arabic", 0.0)),
+                    float(reused_gate.get("arabic_gain_pts", 0.0)),
+                    float(reused_gate.get("base_mmlu_pro", 0.0)),
+                    float(reused_gate.get("tuned_mmlu_pro", 0.0)),
+                    float(reused_gate.get("mmlu_pro_delta_pts", 0.0)),
+                    float(reused_gate.get("merge_lambda_used", 1.0)),
+                )
+                continue
 
         logger.info("[Preflight:%s] Running paired Base vs. Tuned gate on ArabicMMLU + AlGhafa + MMLU-Pro...", mk)
         if dual_gpu:
@@ -5337,6 +5383,7 @@ def run_preflight_gate(
 
         gate = evaluate_preflight_gate_metrics(base_ar, tuned_ar, base_ret, tuned_ret)
         gate["merge_lambda_used"] = 1.0
+        gate["tuned_checkpoint_mtime"] = cfg_file.stat().st_mtime
 
         # Automatic conservative lambda=0.70 fallback re-merge if retention dipped slightly
         if not gate["gate_passed"] and gate["needs_conservative_lambda_retry"] and mk in default_dpo_map:
@@ -5371,6 +5418,7 @@ def run_preflight_gate(
                     )
                     gate = evaluate_preflight_gate_metrics(base_ar, tuned_ar, base_ret, tuned_ret)
                     gate["merge_lambda_used"] = 0.70
+                    gate["tuned_checkpoint_mtime"] = cfg_file.stat().st_mtime
 
         model_reports[mk] = gate
         logger.info(

@@ -212,6 +212,7 @@ def _read_safetensors_header_keys(st_path: pathlib.Path) -> List[str]:
 
 def _patch_exported_gemma4_config_tie_embeddings(out_16bit: pathlib.Path) -> bool:
     """Ensure `tie_word_embeddings: true`, `use_cache: true`, and no `quantization_config` in exported `config.json`."""
+    out_16bit = pathlib.Path(out_16bit)
     cfg_path = out_16bit / "config.json"
     if not cfg_path.exists():
         return False

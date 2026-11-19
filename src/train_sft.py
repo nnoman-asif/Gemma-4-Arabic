@@ -16,10 +16,19 @@ import argparse
 import inspect
 import json
 import logging
+import os
 import pathlib
 import shutil
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# Enforce deterministic SDPA / MoE / decoder-block kernels across Stage 1 SFT and Stage 2 DPO
+# (matching `src/train_dpo.py` before Unsloth initializes module patches).
+os.environ["UNSLOTH_BLOCK_COMPILE"] = "0"
+os.environ["UNSLOTH_MOE_LORA_FOLD"] = "0"
+os.environ["UNSLOTH_MOE_GC_KEEP_BASE"] = "0"
+os.environ["UNSLOTH_MOE_ROUTED_KERNEL"] = "0"
+os.environ["UNSLOTH_HD512_ATTENTION"] = "0"
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -48,7 +57,12 @@ import torch
 import yaml
 
 from scripts.build_sft_dataset import build_synthetic_dry_run_pools
-from src.chat_template import build_tokenized_sft_Turn_masks, parse_reasoning_and_content
+from src.chat_template import (
+    build_tokenized_sft_Turn_masks,
+    normalize_messages_schema,
+    parse_reasoning_and_content,
+    strip_embedded_thinking_from_content,
+)
 from src.constants import (
     BASE_MODEL_ID,
     DEFAULT_MAX_SEQ_LENGTH,
@@ -76,12 +90,66 @@ def _is_moe_model_cfg(model_cfg: Dict[str, Any]) -> bool:
     return arch == "moe" or "26b" in base_id or "a4b" in base_id
 
 
+def _has_arabic_script(text: str, min_chars: int = 8) -> bool:
+    ar_chars = 0
+    for ch in text:
+        if "\u0600" <= ch <= "\u06ff":
+            ar_chars += 1
+            if ar_chars >= min_chars:
+                return True
+    return False
+
+
+def _collect_concise_prior_turn_pools(
+    dataset: Any,
+    max_pair_chars: int = 900,
+    max_pool_size: int = 2048,
+) -> Tuple[List[Tuple[Dict[str, str], Dict[str, str]]], List[Tuple[Dict[str, str], Dict[str, str]]]]:
+    """Build deterministic Arabic and English `(user, stripped_assistant)` prior-turn context pools.
+
+    In Google's official Gemma 4 `E4B` `chat_template.jinja`, multi-turn / few-shot conversations
+    with `enable_thinking=True` place `<|turn>system\\n<|think|>\\n<turn|>\\n` at token 0 and strip
+    `<|channel>thought...<channel|>` from all prior assistant turns (`loop.index0 < last_user_idx`),
+    emitting `<|channel>thought\\n` ONLY on the final active assistant turn.
+    Prepending 2–3 masked (`assistant_masks = 0`) stripped prior turns onto a 25% stride of single-turn
+    thinking SFT examples explicitly teaches `E4B` to preserve `<|channel>thought\\n` activation across
+    multi-turn conversations and few-shot reasoning prompts without supervising any context tokens.
+    """
+    ar_pool: List[Tuple[Dict[str, str], Dict[str, str]]] = []
+    en_pool: List[Tuple[Dict[str, str], Dict[str, str]]] = []
+    n_rows = len(dataset)
+    for idx in range(n_rows):
+        if len(ar_pool) >= max_pool_size and len(en_pool) >= max_pool_size:
+            break
+        row = dataset[idx]
+        norm_msgs = normalize_messages_schema(row.get("messages") or [])
+        non_sys = [m for m in norm_msgs if m["role"] in ("user", "assistant")]
+        if len(non_sys) < 2 or non_sys[0]["role"] != "user" or non_sys[1]["role"] != "assistant":
+            continue
+        u_txt = non_sys[0]["content"].strip()
+        a_txt = strip_embedded_thinking_from_content(non_sys[1]["content"]).strip()
+        if len(u_txt) < 6 or len(a_txt) < 8 or (len(u_txt) + len(a_txt)) > max_pair_chars:
+            continue
+        pair = (
+            {"role": "user", "content": u_txt, "reasoning_content": ""},
+            {"role": "assistant", "content": a_txt, "reasoning_content": ""},
+        )
+        if _has_arabic_script(u_txt + " " + a_txt):
+            if len(ar_pool) < max_pool_size:
+                ar_pool.append(pair)
+        else:
+            if len(en_pool) < max_pool_size:
+                en_pool.append(pair)
+    return ar_pool, en_pool
+
+
 def pretokenize_sft_dataset(
     dataset: Any,
     tokenizer: Any,
     max_seq_length: int,
     is_26b_moe: bool = False,
     cache_dir: Optional[pathlib.Path] = None,
+    augment_multiturn_thinking: bool = True,
 ) -> Any:
     """Convert raw `messages` SFT rows into `input_ids`, `attention_mask`, and response-only `assistant_masks`.
 
@@ -93,10 +161,13 @@ def pretokenize_sft_dataset(
     """
     from datasets import Dataset, load_from_disk
 
+    do_multiturn_aug = bool(augment_multiturn_thinking and not is_26b_moe)
     cache_meta = {
+        "schema": "v2_multiturn_thinking_gate",
         "num_input_rows": len(dataset),
         "max_seq_length": int(max_seq_length),
         "is_26b_moe": bool(is_26b_moe),
+        "multiturn_thinking_aug": do_multiturn_aug,
     }
     if cache_dir is not None:
         ready_file = cache_dir / "cache_ready.json"
@@ -117,8 +188,15 @@ def pretokenize_sft_dataset(
                 logger.warning("Pre-tokenized SFT cache invalid (%s); rebuilding.", cache_exc)
                 shutil.rmtree(cache_dir, ignore_errors=True)
 
+    ar_prior_pool: List[Tuple[Dict[str, str], Dict[str, str]]] = []
+    en_prior_pool: List[Tuple[Dict[str, str], Dict[str, str]]] = []
+    if do_multiturn_aug and len(dataset) >= 8:
+        ar_prior_pool, en_prior_pool = _collect_concise_prior_turn_pools(dataset)
+
     tokenized_rows: List[Dict[str, Any]] = []
     skipped = 0
+    single_thinking_seen = 0
+    multiturn_aug_count = 0
 
     for idx in range(len(dataset)):
         row = dataset[idx]
@@ -126,13 +204,56 @@ def pretokenize_sft_dataset(
         enable_thinking = bool(row.get("enable_thinking", False))
 
         if isinstance(msgs, list) and msgs:
-            tok_out = build_tokenized_sft_Turn_masks(
-                messages=msgs,
-                tokenizer=tokenizer,
-                enable_thinking=enable_thinking,
-                max_seq_length=max_seq_length,
-                is_26b_moe=is_26b_moe,
-            )
+            tok_out: Optional[Dict[str, List[int]]] = None
+            if do_multiturn_aug and enable_thinking and (len(ar_prior_pool) >= 3 or len(en_prior_pool) >= 3):
+                norm_msgs = normalize_messages_schema(msgs)
+                asst_count = sum(1 for m in norm_msgs if m["role"] == "assistant")
+                if asst_count == 1 and norm_msgs and norm_msgs[-1]["role"] == "assistant":
+                    single_thinking_seen += 1
+                    if (single_thinking_seen - 1) % 4 == 0:
+                        sys_msgs = [norm_msgs[0]] if norm_msgs[0]["role"] in ("system", "developer") else []
+                        core_msgs = norm_msgs[1:] if sys_msgs else norm_msgs
+                        target_u = core_msgs[0]["content"] if core_msgs else ""
+                        prefer_ar = _has_arabic_script(target_u)
+                        cand_pool = (
+                            ar_prior_pool
+                            if (prefer_ar and len(ar_prior_pool) >= 3)
+                            else (en_prior_pool if len(en_prior_pool) >= 3 else ar_prior_pool)
+                        )
+                        if len(cand_pool) >= 3:
+                            num_prior = 2 if ((single_thinking_seen - 1) % 8 == 0) else 3
+                            start_cursor = ((single_thinking_seen - 1) * 3) % len(cand_pool)
+                            chosen_priors: List[Dict[str, str]] = []
+                            picked_pairs = 0
+                            for offset in range(len(cand_pool)):
+                                p_u, p_a = cand_pool[(start_cursor + offset) % len(cand_pool)]
+                                if p_u["content"] == target_u:
+                                    continue
+                                chosen_priors.append(p_u)
+                                chosen_priors.append(p_a)
+                                picked_pairs += 1
+                                if picked_pairs >= num_prior:
+                                    break
+                            if picked_pairs >= 2:
+                                aug_msgs = sys_msgs + chosen_priors + core_msgs
+                                tok_out = build_tokenized_sft_Turn_masks(
+                                    messages=aug_msgs,
+                                    tokenizer=tokenizer,
+                                    enable_thinking=True,
+                                    max_seq_length=max_seq_length,
+                                    is_26b_moe=is_26b_moe,
+                                )
+                                if tok_out is not None:
+                                    multiturn_aug_count += 1
+
+            if tok_out is None:
+                tok_out = build_tokenized_sft_Turn_masks(
+                    messages=msgs,
+                    tokenizer=tokenizer,
+                    enable_thinking=enable_thinking,
+                    max_seq_length=max_seq_length,
+                    is_26b_moe=is_26b_moe,
+                )
             if tok_out is not None:
                 ids = tok_out["input_ids"]
                 masks = tok_out["assistant_masks"]
@@ -171,11 +292,12 @@ def pretokenize_sft_dataset(
     sup_tokens = sum(sum(r["assistant_masks"]) for r in tokenized_rows)
     tot_tokens = sum(len(r["input_ids"]) for r in tokenized_rows)
     logger.info(
-        "Pre-tokenized %d SFT examples (skipped=%d, is_26b_moe=%s, max_seq_len=%d): "
+        "Pre-tokenized %d SFT examples (skipped=%d, is_26b_moe=%s, multiturn_thinking_aug=%d, max_seq_len=%d): "
         "%d / %d tokens supervised (%.1f%% assistant completion tokens).",
         len(tokenized_rows),
         skipped,
         is_26b_moe,
+        multiturn_aug_count,
         max_seq_length,
         sup_tokens,
         tot_tokens,

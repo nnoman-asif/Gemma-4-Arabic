@@ -704,14 +704,17 @@ def inject_rslora_adapters(
             "random_state": random_state,
         }
         sig = inspect.signature(loader_cls.get_peft_model)
-        supports_auto_flags = "finetune_mlp_modules" in sig.parameters
-        if "finetune_vision_layers" in sig.parameters:
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        supports_auto_flags = "finetune_mlp_modules" in sig.parameters or has_var_kw
+        if "finetune_vision_layers" in sig.parameters or has_var_kw:
             unsloth_peft_kwargs["finetune_vision_layers"] = False
-        if "finetune_language_layers" in sig.parameters:
+        if "finetune_language_layers" in sig.parameters or has_var_kw:
             unsloth_peft_kwargs["finetune_language_layers"] = True
-        if "finetune_attention_modules" in sig.parameters:
+        if "finetune_attention_modules" in sig.parameters or has_var_kw:
             unsloth_peft_kwargs["finetune_attention_modules"] = True
-        if "finetune_mlp_modules" in sig.parameters:
+        if "finetune_mlp_modules" in sig.parameters or has_var_kw:
             unsloth_peft_kwargs["finetune_mlp_modules"] = True
 
         if sanitized_targets is not None and not is_moe:

@@ -696,8 +696,8 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         sft_e4b = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "sft_e4b_a100.yaml").read_text(encoding="utf-8")
         )
-        self.assertEqual(sft_e4b["lora"]["r"], 16)
-        self.assertEqual(sft_e4b["lora"]["lora_alpha"], 16)
+        self.assertEqual(sft_e4b["lora"]["r"], 32)
+        self.assertEqual(sft_e4b["lora"]["lora_alpha"], 32)
         self.assertEqual(sft_e4b["datasets"]["total_target_samples"], 30000)
         self.assertFalse(sft_e4b["lora"]["use_rslora"])
 
@@ -2392,14 +2392,28 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         dpo_e4b_cfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "dpo_e4b_a100.yaml").read_text(encoding="utf-8")
         )
+        sft_e4b_cfg = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "sft_e4b_a100.yaml").read_text(encoding="utf-8")
+        )
         self.assertEqual(dpo_26b_cfg["vram_optimization"]["precompute_ref_batch_size"], 1)
         self.assertEqual(dpo_26b_cfg["training"]["per_device_train_batch_size"], 1)
         self.assertEqual(dpo_26b_cfg["training"]["per_device_eval_batch_size"], 1)
         self.assertEqual(dpo_26b_cfg["training"]["gradient_accumulation_steps"], 16)
         self.assertAlmostEqual(float(dpo_26b_cfg["training"]["learning_rate"]), 5.0e-7, places=12)
         self.assertAlmostEqual(float(dpo_26b_cfg["training"]["warmup_ratio"]), 0.15, places=6)
-        self.assertEqual(dpo_e4b_cfg["vram_optimization"]["precompute_ref_batch_size"], 2)
-        self.assertEqual(dpo_e4b_cfg["training"]["per_device_train_batch_size"], 2)
+
+        self.assertEqual(sft_e4b_cfg["lora"]["r"], 32)
+        self.assertEqual(sft_e4b_cfg["lora"]["lora_alpha"], 32)
+        self.assertAlmostEqual(float(sft_e4b_cfg["training"]["learning_rate"]), 1.5e-5, places=12)
+        self.assertAlmostEqual(float(sft_e4b_cfg["training"]["warmup_ratio"]), 0.10, places=6)
+        self.assertEqual(dpo_e4b_cfg["lora"]["r"], 32)
+        self.assertEqual(dpo_e4b_cfg["lora"]["lora_alpha"], 32)
+        self.assertEqual(dpo_e4b_cfg["vram_optimization"]["precompute_ref_batch_size"], 1)
+        self.assertEqual(dpo_e4b_cfg["training"]["per_device_train_batch_size"], 1)
+        self.assertEqual(dpo_e4b_cfg["training"]["per_device_eval_batch_size"], 1)
+        self.assertEqual(dpo_e4b_cfg["training"]["gradient_accumulation_steps"], 16)
+        self.assertAlmostEqual(float(dpo_e4b_cfg["training"]["learning_rate"]), 5.0e-7, places=12)
+        self.assertAlmostEqual(float(dpo_e4b_cfg["training"]["warmup_ratio"]), 0.15, places=6)
 
         dpo_args = build_dpo_training_arguments(dpo_26b_cfg, output_dir="outputs/_tmp_dpo_args")
         self.assertTrue(bool(getattr(dpo_args, "logging_first_step", False)))
@@ -2662,6 +2676,218 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         finally:
             if hasattr(sys.modules[__name__], "create_causal_mask_mapping"):
                 delattr(sys.modules[__name__], "create_causal_mask_mapping")
+
+    def test_30_e4b_multiturn_thinking_gate_vision_exclusion_and_preflight_cache(self) -> None:
+        """Verify E4B multi-turn thinking mask contract, FastModel VAR_KEYWORD vision exclusion, and preflight reuse."""
+        import argparse
+        from unittest.mock import patch
+        from datasets import Dataset
+        from scripts.run_benchmarks import run_preflight_gate
+        from src.chat_template import build_tokenized_sft_Turn_masks
+        import src.model_loader as model_loader_mod
+        from src.train_sft import pretokenize_sft_dataset
+
+        # 1. Multi-turn `enable_thinking=True` on E4B must mask stripped historical assistant turns (`assistant_masks=0`)
+        #    and supervise strictly `<|channel>thought\n{reasoning}\n<channel|>{answer}<turn|>\n` on the active turn.
+        class _CharTok:
+            unk_token_id = 3
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+                return [ord(c) + 10 for c in text]
+
+            def decode(self, ids: List[int]) -> str:
+                return "".join(chr(i - 10) for i in ids)
+
+        char_tok = _CharTok()
+        mt_thinking_msgs = [
+            {"role": "user", "content": "Prior question 1?", "reasoning_content": ""},
+            {"role": "assistant", "content": "Prior stripped answer 1.", "reasoning_content": "Old thought 1"},
+            {"role": "user", "content": "Prior question 2?", "reasoning_content": ""},
+            {"role": "assistant", "content": "Prior stripped answer 2.", "reasoning_content": ""},
+            {"role": "user", "content": "Final hard reasoning problem?", "reasoning_content": ""},
+            {"role": "assistant", "content": "The answer is (C).", "reasoning_content": "Step 1: evaluate options carefully."},
+        ]
+        mt_out = build_tokenized_sft_Turn_masks(
+            mt_thinking_msgs,
+            tokenizer=char_tok,
+            enable_thinking=True,
+            max_seq_length=4096,
+            is_26b_moe=False,
+        )
+        self.assertIsNotNone(mt_out)
+        assert mt_out is not None
+        full_decoded = char_tok.decode(mt_out["input_ids"])
+        sup_decoded = char_tok.decode(
+            [tid for tid, m in zip(mt_out["input_ids"], mt_out["assistant_masks"]) if m == 1]
+        )
+        self.assertIn("<|turn>system\n<|think|>\n<turn|>\n", full_decoded)
+        self.assertNotIn("Old thought 1", full_decoded)
+        self.assertTrue(sup_decoded.startswith("<|channel>thought\nStep 1: evaluate options carefully.\n<channel|>"))
+        self.assertEqual(
+            sup_decoded,
+            "<|channel>thought\nStep 1: evaluate options carefully.\n<channel|>The answer is (C).<turn|>\n",
+        )
+
+        # Verify multi-turn non-thinking (`enable_thinking=False`) still supervises all assistant turns
+        mt_nonthink = build_tokenized_sft_Turn_masks(
+            mt_thinking_msgs[:4],
+            tokenizer=char_tok,
+            enable_thinking=False,
+            max_seq_length=4096,
+            is_26b_moe=False,
+        )
+        self.assertIsNotNone(mt_nonthink)
+        assert mt_nonthink is not None
+        sup_nonthink = char_tok.decode(
+            [tid for tid, m in zip(mt_nonthink["input_ids"], mt_nonthink["assistant_masks"]) if m == 1]
+        )
+        self.assertIn("Prior stripped answer 1.<turn|>\n", sup_nonthink)
+        self.assertIn("Prior stripped answer 2.<turn|>\n", sup_nonthink)
+
+        # 2. Verify `pretokenize_sft_dataset` augments ~25% of single-turn E4B thinking rows with masked prior context
+        #    without altering total supervised assistant completion token count!
+        synth_rows = []
+        for idx in range(12):
+            if idx % 2 == 0:
+                synth_rows.append(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"احسب قيمة المسألة رقم {idx} بالتفصيل.", "reasoning_content": ""},
+                            {
+                                "role": "assistant",
+                                "content": f"الإجابة النهائية هي {idx * 5}.",
+                                "reasoning_content": f"نضرب العدد {idx} في خمسة خطوة بخطوة.",
+                            },
+                        ],
+                        "enable_thinking": True,
+                    }
+                )
+            else:
+                synth_rows.append(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"ما تعريف المصطلح العربي رقم {idx}؟", "reasoning_content": ""},
+                            {"role": "assistant", "content": f"هو مصطلح علمي دقيق رقم {idx}.", "reasoning_content": ""},
+                        ],
+                        "enable_thinking": False,
+                    }
+                )
+        raw_ds = Dataset.from_list(synth_rows)
+        ds_no_aug = pretokenize_sft_dataset(
+            raw_ds, char_tok, max_seq_length=4096, is_26b_moe=False, augment_multiturn_thinking=False
+        )
+        ds_with_aug = pretokenize_sft_dataset(
+            raw_ds, char_tok, max_seq_length=4096, is_26b_moe=False, augment_multiturn_thinking=True
+        )
+        self.assertEqual(len(ds_no_aug), len(ds_with_aug))
+        sup_no_aug = sum(sum(r["assistant_masks"]) for r in ds_no_aug)
+        sup_with_aug = sum(sum(r["assistant_masks"]) for r in ds_with_aug)
+        tot_no_aug = sum(len(r["input_ids"]) for r in ds_no_aug)
+        tot_with_aug = sum(len(r["input_ids"]) for r in ds_with_aug)
+        self.assertEqual(sup_no_aug, sup_with_aug)
+        self.assertGreater(tot_with_aug, tot_no_aug)
+
+        # 3. Verify `inject_rslora_adapters` passes `finetune_vision_layers=False` through `(model, *args, **kwargs)`
+        captured_peft_kwargs: Dict[str, Any] = {}
+
+        class _FakeFastModelLoader:
+            @staticmethod
+            def get_peft_model(model: Any, *args: Any, **kwargs: Any) -> Any:
+                captured_peft_kwargs.update(kwargs)
+                return model
+
+        dummy_m = nn.Linear(8, 8)
+        with patch.object(model_loader_mod, "_get_unsloth_loader_cls", return_value=_FakeFastModelLoader):
+            model_loader_mod.inject_rslora_adapters(
+                dummy_m,
+                r=32,
+                lora_alpha=32,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                is_moe=False,
+            )
+        self.assertIs(captured_peft_kwargs.get("finetune_vision_layers"), False)
+        self.assertIs(captured_peft_kwargs.get("finetune_language_layers"), True)
+        self.assertIs(captured_peft_kwargs.get("finetune_attention_modules"), True)
+        self.assertIs(captured_peft_kwargs.get("finetune_mlp_modules"), True)
+
+        # 4. Verify `run_preflight_gate` reuses already-PASSED `26b_a4b` when checkpoint mtime is unchanged
+        #    while re-running rebuilt `e4b`!
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_p = pathlib.Path(tmpdir)
+            e4b_dir = tmp_p / "merged_e4b"
+            moe_dir = tmp_p / "merged_26b"
+            e4b_dir.mkdir(parents=True)
+            moe_dir.mkdir(parents=True)
+            e4b_cfg_f = e4b_dir / "config.json"
+            moe_cfg_f = moe_dir / "config.json"
+            e4b_cfg_f.write_text("{}", encoding="utf-8")
+            moe_cfg_f.write_text("{}", encoding="utf-8")
+
+            rep_file = tmp_p / "preflight_gate_report.json"
+            prev_summary = {
+                "status": "failed",
+                "gate_passed": False,
+                "models": {
+                    "e4b": {
+                        "gate_passed": False,
+                        "needs_conservative_lambda_retry": False,
+                        "avg_base_arabic": 73.41,
+                        "avg_tuned_arabic": 73.15,
+                        "arabic_gain_pts": -0.26,
+                        "base_mmlu_pro": 73.21,
+                        "tuned_mmlu_pro": 55.36,
+                        "mmlu_pro_delta_pts": -17.85,
+                        "merge_lambda_used": 1.0,
+                        "failure_reasons": ["e4b old failure"],
+                    },
+                    "26b_a4b": {
+                        "gate_passed": True,
+                        "needs_conservative_lambda_retry": False,
+                        "avg_base_arabic": 76.81,
+                        "avg_tuned_arabic": 78.41,
+                        "arabic_gain_pts": 1.59,
+                        "base_mmlu_pro": 84.82,
+                        "tuned_mmlu_pro": 85.71,
+                        "mmlu_pro_delta_pts": 0.89,
+                        "merge_lambda_used": 1.0,
+                        "failure_reasons": [],
+                    },
+                },
+            }
+            rep_file.write_text(json.dumps(prev_summary), encoding="utf-8")
+            # Simulate `e4b` being newly re-merged AFTER `preflight_gate_report.json`, while `26b_a4b` is older
+            old_ts = rep_file.stat().st_mtime - 60.0
+            new_ts = rep_file.stat().st_mtime + 60.0
+            os.utime(moe_cfg_f, (old_ts, old_ts))
+            os.utime(e4b_cfg_f, (new_ts, new_ts))
+
+            probed_tags: List[str] = []
+
+            def _fake_probe(ckpt: str, dev: str, cfg_d: Dict[str, Any], use_v: bool, tag: str):
+                probed_tags.append(tag)
+                if "base" in tag:
+                    return {"ArabicMMLU": 74.0, "AlGhafa": 72.8}, 73.21
+                return {"ArabicMMLU": 76.5, "AlGhafa": 75.1}, 73.50
+
+            pf_args = argparse.Namespace(
+                model_key="both",
+                model_path=None,
+                dry_run=False,
+                use_vllm=True,
+                force_preflight=False,
+            )
+            pf_cfg = {
+                "models": {
+                    "e4b": {"base_model_id": "unsloth/gemma-4-E4B-it", "merged_checkpoint_dir": str(e4b_dir)},
+                    "26b_a4b": {"base_model_id": "unsloth/gemma-4-26B-A4B-it", "merged_checkpoint_dir": str(moe_dir)},
+                }
+            }
+            with patch("scripts.run_benchmarks._probe_single_checkpoint_preflight", side_effect=_fake_probe):
+                res_pf = run_preflight_gate(pf_args, pf_cfg, report_path_override=rep_file)
+            self.assertTrue(res_pf["gate_passed"])
+            self.assertTrue(all(t.startswith("e4b:") for t in probed_tags))
+            self.assertEqual(len(probed_tags), 2)
+            self.assertAlmostEqual(res_pf["models"]["26b_a4b"]["arabic_gain_pts"], 1.59, places=2)
 
 
 if __name__ == "__main__":

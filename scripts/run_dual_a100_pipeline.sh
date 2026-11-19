@@ -243,7 +243,8 @@ else
     if [[ -f "outputs/sft_e4b_a100/adapter_config.json" && -s "outputs/sft_e4b_a100/adapter_model.safetensors" && -f "outputs/sft_e4b_a100/training_metrics.json" ]]; then
       echo "[GPU 0] [Skip] Verified completed Stage 1 SFT adapter at outputs/sft_e4b_a100."
     else
-      echo "[GPU 0] Starting/resuming Stage 1 QLoRA SFT for Gemma-4-E4B-Arabic-It (r=16, alpha=16)..."
+      echo "[GPU 0] Starting/resuming Stage 1 QLoRA SFT for Gemma-4-E4B-Arabic-It (r=32, alpha=32)..."
+      rm -rf unsloth_compiled_cache_gpu0 /tmp/inductor_train_gpu0 /tmp/triton_train_gpu0
       "${PYTHON_BIN}" src/train_sft.py \
         --config configs/sft_e4b_a100.yaml \
         --dataset-dir data/sft_mixed \
@@ -254,6 +255,7 @@ else
       echo "[GPU 0] [Skip] Verified completed Stage 2 DPO adapter at outputs/dpo_e4b_a100."
     else
       echo "[GPU 0] Starting/resuming Stage 2 DPO for Gemma-4-E4B-Arabic-It..."
+      rm -rf unsloth_compiled_cache_gpu0 /tmp/inductor_train_gpu0 /tmp/triton_train_gpu0
       "${PYTHON_BIN}" src/train_dpo.py \
         --config configs/dpo_e4b_a100.yaml \
         --dataset-dir data/dpo_mixed \

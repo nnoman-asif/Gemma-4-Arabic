@@ -336,15 +336,22 @@ def build_tokenized_sft_Turn_masks(
             input_ids.extend(header_ids)
             assistant_masks.extend([0] * len(header_ids))
 
-            # Assistant completion body + `<turn|>\n` is supervised (assistant_masks = 1)
+            # Assistant completion body + `<turn|>\n`:
+            # When `effective_thinking` is True (`<|think|>` is active in `<|turn>system\n`),
+            # historical assistant turns (`idx < last_user_idx`) have their thoughts stripped
+            # per Google's `chat_template.jinja` (`thinking_gate`) purely as prompt context.
+            # They must remain masked (`assistant_masks = 0`) so E4B is never supervised to emit
+            # un-thought text directly after `<|turn>model\n` when `<|think|>` is present.
             if emit_full_thought:
                 comp_seg = f"{THOUGHT_CHANNEL_OPEN}{reasoning}{THOUGHT_CHANNEL_CLOSE}{clean_answer}{TURN_END_TOKEN}\n"
+                sup_flag = 1
             else:
                 comp_seg = f"{clean_answer}{TURN_END_TOKEN}\n"
+                sup_flag = 0 if effective_thinking else 1
 
             c_ids = _encode_segment(comp_seg)
             input_ids.extend(c_ids)
-            assistant_masks.extend([1] * len(c_ids))
+            assistant_masks.extend([sup_flag] * len(c_ids))
 
     if len(input_ids) > max_seq_length:
         if effective_thinking:
