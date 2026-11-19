@@ -28,14 +28,28 @@ import shutil
 import sys
 from typing import Any, Dict, List, Optional
 
-# Enforce bitwise-identical decoder-block, attention, and MoE kernel execution across
-# `_precompute_ref_logps`, `verify_step0_dpo_ref_alignment`, and `trainer.train()` on A100
-# before Unsloth initializes module and kernel patches.
-os.environ["UNSLOTH_BLOCK_COMPILE"] = "0"
-os.environ["UNSLOTH_MOE_LORA_FOLD"] = "0"
-os.environ["UNSLOTH_MOE_GC_KEEP_BASE"] = "0"
-os.environ["UNSLOTH_MOE_ROUTED_KERNEL"] = "0"
-os.environ["UNSLOTH_HD512_ATTENTION"] = "0"
+def _enforce_deterministic_dpo_kernels() -> None:
+    """Enforce bitwise-identical decoder-block, RMSNorm/MLP/RoPE, sliding-attention, LM-head,
+    and MoE kernel execution across `_precompute_ref_logps` (`no_grad`, `GC=False`),
+    `verify_step0_dpo_ref_alignment`, and `trainer.train()` (`enable_grad`, non-reentrant GC on E4B)
+    before Unsloth initializes module and kernel patches.
+    """
+    os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+    os.environ["UNSLOTH_FUSED_LINEAR"] = "0"
+    os.environ["UNSLOTH_GEMMA4_FLASH_SLIDING"] = "0"
+    os.environ["UNSLOTH_BLOCK_COMPILE"] = "0"
+    os.environ["UNSLOTH_MOE_LORA_FOLD"] = "0"
+    os.environ["UNSLOTH_MOE_GC_KEEP_BASE"] = "0"
+    os.environ["UNSLOTH_MOE_ROUTED_KERNEL"] = "0"
+    os.environ["UNSLOTH_HD512_ATTENTION"] = "0"
+    flash_sliding_mod = sys.modules.get("unsloth_zoo.temporary_patches.gemma4_flash_sliding")
+    if flash_sliding_mod is not None:
+        enabled_fn = getattr(flash_sliding_mod, "_enabled", None)
+        if hasattr(enabled_fn, "cache_clear"):
+            enabled_fn.cache_clear()
+
+
+_enforce_deterministic_dpo_kernels()
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -249,11 +263,14 @@ def salt_dpo_dataset_fingerprint(
 
     payload = json.dumps(
         {
-            "schema": "v5_aligned_tok_and_deterministic_dpo_ref",
+            "schema": "v6_bitexact_dpo_ref_alignment",
             "base_model_id": str(base_model_id),
             "adapter_sig": adapter_sig,
             "precompute_ref_batch_size": precompute_ref_batch_size,
             "is_moe": bool(is_moe),
+            "compile_disable": os.environ.get("UNSLOTH_COMPILE_DISABLE", "0"),
+            "fused_linear": os.environ.get("UNSLOTH_FUSED_LINEAR", "1"),
+            "gemma4_flash_sliding": os.environ.get("UNSLOTH_GEMMA4_FLASH_SLIDING", "1"),
             "block_compile": os.environ.get("UNSLOTH_BLOCK_COMPILE", "0"),
             "moe_lora_fold": os.environ.get("UNSLOTH_MOE_LORA_FOLD", "0"),
             "moe_gc_keep_base": os.environ.get("UNSLOTH_MOE_GC_KEEP_BASE", "0"),
@@ -975,11 +992,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point for Stage 2 DPO training."""
-    os.environ["UNSLOTH_BLOCK_COMPILE"] = "0"
-    os.environ["UNSLOTH_MOE_LORA_FOLD"] = "0"
-    os.environ["UNSLOTH_MOE_GC_KEEP_BASE"] = "0"
-    os.environ["UNSLOTH_MOE_ROUTED_KERNEL"] = "0"
-    os.environ["UNSLOTH_HD512_ATTENTION"] = "0"
+    _enforce_deterministic_dpo_kernels()
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -1178,7 +1191,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         dpo_callbacks.append(
             DPORefSanityCallback(
                 max_initial_loss=0.98,
-                max_initial_grad_norm=(100_000.0 if is_moe else 25_000.0),
+                max_initial_grad_norm=100_000.0,
                 check_initial_loss=(last_ckpt is None),
             )
         )

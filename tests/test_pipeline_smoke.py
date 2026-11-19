@@ -2889,6 +2889,74 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             self.assertEqual(len(probed_tags), 2)
             self.assertAlmostEqual(res_pf["models"]["26b_a4b"]["arabic_gain_pts"], 1.59, places=2)
 
+    def test_31_e4b_dpo_bitexact_kernel_flags_and_fingerprint(self) -> None:
+        """Verify E4B DPO bit-exact kernel determinism flags, flash-sliding cache reset, and salted ref fingerprint."""
+        import types
+        from datasets import Dataset
+        from transformers import TrainerControl, TrainerState, TrainingArguments
+        from src.train_dpo import (
+            DPORefSanityCallback,
+            _enforce_deterministic_dpo_kernels,
+            salt_dpo_dataset_fingerprint,
+        )
+
+        # 1. Verify _enforce_deterministic_dpo_kernels sets all 8 env flags and clears cached flash-sliding state
+        cleared = {"count": 0}
+        fake_mod = types.ModuleType("unsloth_zoo.temporary_patches.gemma4_flash_sliding")
+
+        class _FakeCachedEnabled:
+            @staticmethod
+            def cache_clear() -> None:
+                cleared["count"] += 1
+
+        fake_mod._enabled = _FakeCachedEnabled()  # type: ignore[attr-defined]
+        sys.modules["unsloth_zoo.temporary_patches.gemma4_flash_sliding"] = fake_mod
+        try:
+            os.environ["UNSLOTH_COMPILE_DISABLE"] = "0"
+            os.environ["UNSLOTH_FUSED_LINEAR"] = "1"
+            os.environ["UNSLOTH_GEMMA4_FLASH_SLIDING"] = "1"
+            _enforce_deterministic_dpo_kernels()
+            self.assertEqual(os.environ.get("UNSLOTH_COMPILE_DISABLE"), "1")
+            self.assertEqual(os.environ.get("UNSLOTH_FUSED_LINEAR"), "0")
+            self.assertEqual(os.environ.get("UNSLOTH_GEMMA4_FLASH_SLIDING"), "0")
+            self.assertEqual(os.environ.get("UNSLOTH_BLOCK_COMPILE"), "0")
+            self.assertEqual(cleared["count"], 1)
+        finally:
+            sys.modules.pop("unsloth_zoo.temporary_patches.gemma4_flash_sliding", None)
+
+        # 2. Verify salt_dpo_dataset_fingerprint isolates fingerprints when kernel determinism flags change
+        tiny_ds = Dataset.from_list([{"prompt": [{"role": "user", "content": "hi"}], "chosen": [], "rejected": []}])
+        ds_det = salt_dpo_dataset_fingerprint(
+            tiny_ds,
+            base_model_id="unsloth/gemma-4-E4B-it",
+            sft_adapter_dir=None,
+            precompute_ref_batch_size=1,
+            is_moe=False,
+        )
+        os.environ["UNSLOTH_COMPILE_DISABLE"] = "0"
+        try:
+            ds_compiled = salt_dpo_dataset_fingerprint(
+                tiny_ds,
+                base_model_id="unsloth/gemma-4-E4B-it",
+                sft_adapter_dir=None,
+                precompute_ref_batch_size=1,
+                is_moe=False,
+            )
+        finally:
+            _enforce_deterministic_dpo_kernels()
+        self.assertNotEqual(ds_det._fingerprint, ds_compiled._fingerprint)
+
+        # 3. Verify DPORefSanityCallback allows healthy 42-layer E4B r=32 pre-clip grad_norm (~65k) while rejecting >100k
+        cb = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=100_000.0, check_initial_loss=True)
+        t_args = TrainingArguments(output_dir="outputs/tmp_test_cb", logging_steps=10, report_to="none")
+        t_state = TrainerState(global_step=10)
+        cb.on_log(t_args, t_state, TrainerControl(), logs={"loss": 0.6931, "grad_norm": 65_730.0})
+        self.assertTrue(cb.passed_initial_gate)
+
+        cb_bad = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=100_000.0, check_initial_loss=True)
+        with self.assertRaises(RuntimeError):
+            cb_bad.on_log(t_args, t_state, TrainerControl(), logs={"loss": 0.6931, "grad_norm": 125_000.0})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

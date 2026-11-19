@@ -227,7 +227,7 @@ else
 
   echo "======================================================================"
   echo "[Phase 2A/4] Simultaneous Dual-GPU Training (SFT -> DPO, save_steps=100)"
-  echo "  - GPU 0: Gemma-4-E4B-Arabic-It      (r=16, alpha=16)          -> logs/train_gpu0_e4b.log"
+  echo "  - GPU 0: Gemma-4-E4B-Arabic-It      (r=32, alpha=32)          -> logs/train_gpu0_e4b.log"
   echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  (r=16, alpha=16, 128 exp) -> logs/train_gpu1_26b_a4b.log"
   echo "======================================================================"
 
@@ -256,7 +256,8 @@ else
     else
       echo "[GPU 0] Starting/resuming Stage 2 DPO for Gemma-4-E4B-Arabic-It..."
       rm -rf unsloth_compiled_cache_gpu0 /tmp/inductor_train_gpu0 /tmp/triton_train_gpu0
-      "${PYTHON_BIN}" src/train_dpo.py \
+      UNSLOTH_COMPILE_DISABLE="1" UNSLOTH_FUSED_LINEAR="0" UNSLOTH_GEMMA4_FLASH_SLIDING="0" \
+        "${PYTHON_BIN}" src/train_dpo.py \
         --config configs/dpo_e4b_a100.yaml \
         --dataset-dir data/dpo_mixed \
         --sft-adapter-dir outputs/sft_e4b_a100 \
@@ -288,7 +289,8 @@ else
     else
       echo "[GPU 1] Starting/resuming Stage 2 DPO for Gemma-4-26B-A4B-Arabic-It..."
       rm -rf unsloth_compiled_cache_gpu1 /tmp/inductor_train_gpu1 /tmp/triton_train_gpu1
-      "${PYTHON_BIN}" src/train_dpo.py \
+      UNSLOTH_COMPILE_DISABLE="1" UNSLOTH_FUSED_LINEAR="0" UNSLOTH_GEMMA4_FLASH_SLIDING="0" \
+        "${PYTHON_BIN}" src/train_dpo.py \
         --config configs/dpo_26b_a4b_a100.yaml \
         --dataset-dir data/dpo_mixed \
         --sft-adapter-dir outputs/sft_26b_a4b_a100 \
