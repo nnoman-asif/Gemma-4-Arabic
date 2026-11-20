@@ -250,6 +250,9 @@ def _patch_exported_gemma4_config_tie_embeddings(out_16bit: pathlib.Path) -> boo
         if not has_separate_lm_head and cfg_data.get("tie_word_embeddings") is not True:
             cfg_data["tie_word_embeddings"] = True
             changed = True
+        if cfg_data.get("model_type") == "gemma4" and cfg_data.get("eos_token_id") != [1, 106, 50]:
+            cfg_data["eos_token_id"] = [1, 106, 50]
+            changed = True
         if isinstance(cfg_data.get("text_config"), dict):
             if "quantization_config" in cfg_data["text_config"]:
                 cfg_data["text_config"].pop("quantization_config", None)
@@ -259,6 +262,9 @@ def _patch_exported_gemma4_config_tie_embeddings(out_16bit: pathlib.Path) -> boo
                 changed = True
             if not has_separate_lm_head and cfg_data["text_config"].get("tie_word_embeddings") is not True:
                 cfg_data["text_config"]["tie_word_embeddings"] = True
+                changed = True
+            if cfg_data.get("model_type") == "gemma4" and cfg_data["text_config"].get("eos_token_id") != [1, 106, 50]:
+                cfg_data["text_config"]["eos_token_id"] = [1, 106, 50]
                 changed = True
         if changed:
             cfg_path.write_text(
@@ -293,9 +299,10 @@ def _restore_canonical_processor_and_templates(
     try:
         from huggingface_hub import hf_hub_download
 
+        always_overwrite = {"chat_template.jinja", "generation_config.json"}
         for fname in ("chat_template.jinja", "generation_config.json", "preprocessor_config.json", "processor_config.json"):
             dst = out_16bit / fname
-            if not dst.exists():
+            if fname in always_overwrite or not dst.exists():
                 try:
                     cached = hf_hub_download(repo_id=canonical_repo, filename=fname)
                     shutil.copy2(cached, dst)
@@ -304,12 +311,29 @@ def _restore_canonical_processor_and_templates(
     except Exception:
         pass
 
+    gen_cfg_path = out_16bit / "generation_config.json"
+    try:
+        gen_data: Dict[str, Any] = (
+            json.loads(gen_cfg_path.read_text(encoding="utf-8"))
+            if gen_cfg_path.exists()
+            else {"bos_token_id": 2, "pad_token_id": 0, "do_sample": True, "temperature": 1.0, "top_k": 64, "top_p": 0.95}
+        )
+        eos_val = gen_data.get("eos_token_id")
+        if not (isinstance(eos_val, list) and 106 in eos_val):
+            gen_data["eos_token_id"] = [1, 106, 50]
+            gen_cfg_path.write_text(
+                json.dumps(gen_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+    except Exception as gen_exc:
+        logger.warning("Could not verify/patch generation_config.json eos_token_id: %s", gen_exc)
+
     tc_path = out_16bit / "tokenizer_config.json"
     if tc_path.exists():
         try:
             raw_tc = tc_path.read_text(encoding="utf-8")
             tc_data = json.loads(raw_tc)
-            if "<turn|>" in raw_tc and tc_data.get("eos_token") != "<turn|>":
+            if tc_data.get("eos_token") != "<turn|>":
                 tc_data["eos_token"] = "<turn|>"
                 tc_path.write_text(
                     json.dumps(tc_data, indent=2, ensure_ascii=False),
@@ -365,6 +389,17 @@ def verify_merged_checkpoint(
         tpl_txt = tpl_path.read_text(encoding="utf-8")
         if "<|turn>" not in tpl_txt or "<turn|>" not in tpl_txt:
             raise RuntimeError(f"chat_template.jinja at {out_16bit} is missing native <|turn>/<turn|> tokens!")
+
+    gen_cfg_path = out_16bit / "generation_config.json"
+    if gen_cfg_path.exists():
+        gen_data = json.loads(gen_cfg_path.read_text(encoding="utf-8"))
+        eos_ids = gen_data.get("eos_token_id")
+        if not (isinstance(eos_ids, list) and 106 in eos_ids):
+            raise RuntimeError(
+                f"generation_config.json at {out_16bit} is missing Gemma 4 `<turn|>` (106) in eos_token_id={eos_ids!r}!"
+            )
+    elif enforce_full_size:
+        raise RuntimeError(f"Merged checkpoint verification failed: missing {gen_cfg_path}")
 
     return {
         "verified": True,
@@ -640,9 +675,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_16bit_dir = out_root / "merged_16bit"
     if effective_format == "merged_16bit" and (out_16bit_dir / "config.json").exists() and not args.force:
         try:
+            orig_cfg_stat = (out_16bit_dir / "config.json").stat()
             _patch_exported_gemma4_config_tie_embeddings(out_16bit_dir)
-            if not (out_16bit_dir / "chat_template.jinja").exists():
+            gen_p = out_16bit_dir / "generation_config.json"
+            gen_has_106 = False
+            if gen_p.exists():
+                try:
+                    g_eos = json.loads(gen_p.read_text(encoding="utf-8")).get("eos_token_id")
+                    gen_has_106 = isinstance(g_eos, list) and 106 in g_eos
+                except Exception:
+                    gen_has_106 = False
+            if not (out_16bit_dir / "chat_template.jinja").exists() or not gen_has_106:
                 _restore_canonical_processor_and_templates(out_16bit_dir, args.base_model)
+            try:
+                os.utime(out_16bit_dir / "config.json", (orig_cfg_stat.st_atime, orig_cfg_stat.st_mtime))
+            except OSError:
+                pass
             verification = verify_merged_checkpoint(out_16bit_dir, is_moe=is_moe, enforce_full_size=True)
             manifest_path = out_root / "merge_manifest.json"
             if not manifest_path.exists():
@@ -706,12 +754,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"need >= {req_gb:.1f} GiB to export standalone BF16 safetensors!"
         )
 
-    # Load via Unsloth in 4-bit so `save_pretrained_merged(..., save_method="merged_16bit")`
-    # streams upstream BF16 base shards directly to disk with low RAM/VRAM and full 3D MoE support.
+    # On >=24 GiB GPUs (e.g. A100 80 GB), load Dense E4B directly in native 16-bit BF16
+    # (`load_in_4bit=False`) so SFT/DPO 16-bit LoRA adapters merge onto exact BF16 base weights;
+    # on <=16 GiB GPUs or 26B-A4B MoE, stream 16-bit base shards via `load_in_4bit=True`.
+    gpu_total_gb = (
+        torch.cuda.get_device_properties(0).total_memory / float(1024**3)
+        if torch.cuda.is_available()
+        else 0.0
+    )
+    use_4bit_for_merge = bool(is_moe or args.offload_to_cpu or gpu_total_gb < 24.0)
     model, tokenizer, offload_state = load_gemma4_8gb_model_and_tokenizer(
         model_name=args.base_model,
         max_seq_length=DEFAULT_MAX_SEQ_LENGTH,
-        load_in_4bit=True,
+        load_in_4bit=use_4bit_for_merge,
         attach_lora=False,
         adapter_checkpoint=str(adapter_path),
         is_trainable=False,

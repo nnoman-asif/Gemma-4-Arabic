@@ -617,6 +617,38 @@ def ensure_tied_lm_head(model: nn.Module) -> bool:
     return False
 
 
+def _normalize_offloaded_hf_device_map_for_training(
+    model: nn.Module,
+    device_idx: int = 0,
+) -> None:
+    """Normalize `hf_device_map` to `{"": device_idx}` after frozen PLE/tower CPU offload hooks are installed.
+
+    `accelerate >= 1.6`'s `Accelerator.prepare_model` rejects 4-bit/8-bit training whenever `"cpu"` or
+    `"disk"` appears in `model.hf_device_map`, even when 100% of quantized decoder layers and trainable
+    LoRA adapters reside on `cuda:{device_idx}` and only frozen non-quantized embeddings/towers are
+    offloaded. Setting `hf_device_map = {"": device_idx}` satisfies `Accelerator.prepare_model` while
+    preserving `Trainer._move_model_to_device`'s early return so offloaded frozen weights stay on CPU.
+    """
+    target_map: Dict[str, Any] = {"": int(device_idx)}
+    for obj in (
+        model,
+        getattr(model, "base_model", None),
+        getattr(getattr(model, "base_model", None), "model", None),
+        getattr(model, "model", None),
+    ):
+        if obj is None:
+            continue
+        cur_map = getattr(obj, "hf_device_map", None)
+        if isinstance(cur_map, dict):
+            vals = set(cur_map.values())
+            if "cpu" in vals or "disk" in vals:
+                setattr(obj, "hf_device_map", dict(target_map))
+        elif obj is model and cur_map is None:
+            base_map = getattr(getattr(getattr(model, "base_model", None), "model", None), "hf_device_map", None)
+            if isinstance(base_map, dict):
+                setattr(obj, "hf_device_map", dict(target_map))
+
+
 def _configure_trainable_model_flags(model: nn.Module, is_trainable: bool = True) -> None:
     """Ensure `use_cache=False` across top-level and nested `text_config` objects during training."""
     if not is_trainable:
@@ -891,20 +923,55 @@ def load_gemma4_8gb_model_and_tokenizer(
             "load_in_4bit": load_in_4bit,
             "device_map": device_map,
         }
-        if "load_in_16bit" in inspect.signature(loader_cls.from_pretrained).parameters and not load_in_4bit:
+        sig_fp = inspect.signature(loader_cls.from_pretrained)
+        fp_has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_fp.parameters.values()
+        )
+        if not load_in_4bit and ("load_in_16bit" in sig_fp.parameters or fp_has_var_kw):
             unsloth_kwargs["load_in_16bit"] = True
-        # IMPORTANT: Never pass `config=hf_config` (from the 16-bit repo) into Unsloth's
-        # `from_pretrained` when `load_in_4bit=True`, because Unsloth remaps `unsloth/gemma-4-E4B-it`
-        # to `unsloth/gemma-4-E4B-it-unsloth-bnb-4bit` (pre-quantized Dynamic 4-bit) and passing an
-        # unquantized `config` wipes out `quantization_config`, discarding `quant_state` tensors!
-        if hf_config is not None and adapter_checkpoint is None and not load_in_4bit:
-            unsloth_kwargs["config"] = hf_config
+
+        orig_bnb_validate: Any = None
+        bnb_quantizer_cls: Any = None
+        orig_alloc_warmup: Any = None
+        modeling_utils_mod: Any = None
+        if enable_cpu_offload:
+            try:
+                import transformers.modeling_utils as _hf_mu  # type: ignore
+
+                modeling_utils_mod = _hf_mu
+                orig_alloc_warmup = getattr(_hf_mu, "caching_allocator_warmup", None)
+                if orig_alloc_warmup is not None:
+                    _hf_mu.caching_allocator_warmup = lambda *a, **kw: None  # type: ignore[assignment]
+            except Exception:
+                modeling_utils_mod = None
+        if enable_cpu_offload and load_in_4bit:
+            try:
+                from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer  # type: ignore
+
+                bnb_quantizer_cls = Bnb4BitHfQuantizer
+                orig_bnb_validate = Bnb4BitHfQuantizer.validate_environment
+
+                def _cpu_offload_aware_validate(self_q: Any, *v_args: Any, **v_kwargs: Any) -> Any:
+                    dmap = v_kwargs.get("device_map")
+                    if isinstance(dmap, dict) and "cpu" in set(dmap.values()):
+                        self_q.quantization_config.llm_int8_enable_fp32_cpu_offload = True
+                    return orig_bnb_validate(self_q, *v_args, **v_kwargs)
+
+                Bnb4BitHfQuantizer.validate_environment = _cpu_offload_aware_validate  # type: ignore[assignment]
+            except Exception:
+                bnb_quantizer_cls = None
+
         try:
-            model, raw_proc_or_tok = loader_cls.from_pretrained(**unsloth_kwargs)
-        except TypeError:
-            unsloth_kwargs.pop("config", None)
-            unsloth_kwargs.pop("load_in_16bit", None)
-            model, raw_proc_or_tok = loader_cls.from_pretrained(**unsloth_kwargs)
+            try:
+                model, raw_proc_or_tok = loader_cls.from_pretrained(**unsloth_kwargs)
+            except TypeError:
+                unsloth_kwargs.pop("load_in_16bit", None)
+                model, raw_proc_or_tok = loader_cls.from_pretrained(**unsloth_kwargs)
+        finally:
+            if bnb_quantizer_cls is not None and orig_bnb_validate is not None:
+                bnb_quantizer_cls.validate_environment = orig_bnb_validate
+            if modeling_utils_mod is not None and orig_alloc_warmup is not None:
+                modeling_utils_mod.caching_allocator_warmup = orig_alloc_warmup
 
         if hasattr(raw_proc_or_tok, "tokenizer") and not hasattr(raw_proc_or_tok, "encode"):
             inner_tok = raw_proc_or_tok.tokenizer
@@ -1046,6 +1113,34 @@ def load_gemma4_8gb_model_and_tokenizer(
     ensure_tied_lm_head(model)
     _configure_trainable_model_flags(model, is_trainable=is_trainable)
 
+    # Normalize Gemma 4 instruct EOS token (`<turn|>` = 106) and `[1, 106, 50]` stop IDs
+    # (`unsloth/gemma-4-E4B-it-unsloth-bnb-4bit` ships with `eos_token="<eos>"` / `eos_token_id=1`).
+    try:
+        if hasattr(tokenizer, "convert_tokens_to_ids") and tokenizer.convert_tokens_to_ids("<turn|>") == 106:
+            if getattr(tokenizer, "eos_token", None) != "<turn|>":
+                tokenizer.eos_token = "<turn|>"
+            proc_attached = getattr(tokenizer, "_gemma4_processor", None)
+            if proc_attached is not None and hasattr(proc_attached, "tokenizer"):
+                if getattr(proc_attached.tokenizer, "eos_token", None) != "<turn|>":
+                    proc_attached.tokenizer.eos_token = "<turn|>"
+            for cfg_holder in (
+                model,
+                getattr(model, "base_model", None),
+                getattr(getattr(model, "base_model", None), "model", None),
+            ):
+                if cfg_holder is None:
+                    continue
+                m_cfg = getattr(cfg_holder, "config", None)
+                if m_cfg is not None and getattr(m_cfg, "model_type", "") == "gemma4":
+                    m_cfg.eos_token_id = [1, 106, 50]
+                    if getattr(m_cfg, "text_config", None) is not None:
+                        m_cfg.text_config.eos_token_id = [1, 106, 50]
+                gen_cfg = getattr(cfg_holder, "generation_config", None)
+                if gen_cfg is not None:
+                    gen_cfg.eos_token_id = [1, 106, 50]
+    except Exception as eos_exc:
+        logger.debug("Gemma 4 EOS normalization skipped: %s", eos_exc)
+
     # Freeze embeddings, multimodal towers, and MoE router gates
     freeze_embeddings_and_towers(model, freeze_moe_router=freeze_moe_router)
 
@@ -1097,6 +1192,8 @@ def load_gemma4_8gb_model_and_tokenizer(
     if not used_unsloth_loader and not getattr(model, "_is_unsloth_model", False):
         install_chunked_causal_lm_loss(model)
     _configure_trainable_model_flags(model, is_trainable=is_trainable)
+    if enable_cpu_offload and is_trainable and torch.cuda.is_available():
+        _normalize_offloaded_hf_device_map_for_training(model, device_idx=device_idx)
 
     log_vram_telemetry(model, stage="post_model_load")
     return model, tokenizer, offload_state

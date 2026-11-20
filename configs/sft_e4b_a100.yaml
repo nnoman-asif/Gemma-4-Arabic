@@ -12,7 +12,7 @@ model:
   arabic_vocab_tokens: 8460
   max_seq_length: 4096
   dtype: "bfloat16"
-  load_in_4bit: true
+  load_in_4bit: false
   quant_type: "nf4"
   use_double_quant: true
 
@@ -34,8 +34,8 @@ vram_optimization:
 
 lora:
   use_rslora: false
-  r: 32
-  lora_alpha: 32
+  r: 16
+  lora_alpha: 16
   lora_dropout: 0.0
   bias: "none"
   use_gradient_checkpointing: "unsloth"
@@ -60,7 +60,7 @@ training:
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 8
   optim: "adamw_bnb_8bit"
-  learning_rate: 1.5e-5
+  learning_rate: 1.0e-5
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.10
   weight_decay: 0.01

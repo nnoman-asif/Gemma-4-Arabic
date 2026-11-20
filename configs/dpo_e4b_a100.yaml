@@ -8,7 +8,7 @@ model:
   sft_adapter_dir: "outputs/sft_e4b_a100"
   max_seq_length: 3072
   dtype: "bfloat16"
-  load_in_4bit: true
+  load_in_4bit: false
 
 vram_optimization:
   target_vram_budget_gb: 80.0
@@ -29,8 +29,8 @@ vram_optimization:
 
 lora:
   use_rslora: false
-  r: 32
-  lora_alpha: 32
+  r: 16
+  lora_alpha: 16
   lora_dropout: 0.0
   bias: "none"
   use_gradient_checkpointing: "unsloth"

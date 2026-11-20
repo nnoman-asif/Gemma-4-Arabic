@@ -696,8 +696,9 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         sft_e4b = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "sft_e4b_a100.yaml").read_text(encoding="utf-8")
         )
-        self.assertEqual(sft_e4b["lora"]["r"], 32)
-        self.assertEqual(sft_e4b["lora"]["lora_alpha"], 32)
+        self.assertFalse(sft_e4b["model"]["load_in_4bit"])
+        self.assertEqual(sft_e4b["lora"]["r"], 16)
+        self.assertEqual(sft_e4b["lora"]["lora_alpha"], 16)
         self.assertEqual(sft_e4b["datasets"]["total_target_samples"], 30000)
         self.assertFalse(sft_e4b["lora"]["use_rslora"])
 
@@ -1957,11 +1958,32 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertLess(47.7 + moe_kv_50, 80.0)
 
         # 7. Verify MMLU-Pro dynamic max_gen_toks budget & lm_eval unclosed-thought guard
+        import types
         from scripts.run_benchmarks import (
             _get_lm_eval_gen_kwargs,
             _install_lm_eval_unclosed_thought_guard,
         )
-        import lm_eval.models.utils as lm_utils
+
+        try:
+            import lm_eval.models.utils as lm_utils
+        except ModuleNotFoundError:
+            lm_pkg = sys.modules.setdefault("lm_eval", types.ModuleType("lm_eval"))
+            lm_models = sys.modules.setdefault("lm_eval.models", types.ModuleType("lm_eval.models"))
+            lm_utils = types.ModuleType("lm_eval.models.utils")
+
+            def _stub_postprocess(generation: str, stop: Any, think_end_token: Any) -> str:
+                txt = generation
+                if think_end_token and think_end_token in txt:
+                    txt = txt.split(think_end_token, 1)[1]
+                for s_tok in (stop or ()):
+                    if s_tok in txt:
+                        txt = txt.split(s_tok, 1)[0]
+                return txt
+
+            lm_utils.postprocess_generated_text = _stub_postprocess  # type: ignore[attr-defined]
+            lm_pkg.models = lm_models  # type: ignore[attr-defined]
+            lm_models.utils = lm_utils  # type: ignore[attr-defined]
+            sys.modules["lm_eval.models.utils"] = lm_utils
 
         kw_32k = _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=True, max_model_len=32768)
         kw_24k = _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=True, max_model_len=24576)
@@ -2402,12 +2424,14 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertAlmostEqual(float(dpo_26b_cfg["training"]["learning_rate"]), 5.0e-7, places=12)
         self.assertAlmostEqual(float(dpo_26b_cfg["training"]["warmup_ratio"]), 0.15, places=6)
 
-        self.assertEqual(sft_e4b_cfg["lora"]["r"], 32)
-        self.assertEqual(sft_e4b_cfg["lora"]["lora_alpha"], 32)
-        self.assertAlmostEqual(float(sft_e4b_cfg["training"]["learning_rate"]), 1.5e-5, places=12)
+        self.assertFalse(sft_e4b_cfg["model"]["load_in_4bit"])
+        self.assertEqual(sft_e4b_cfg["lora"]["r"], 16)
+        self.assertEqual(sft_e4b_cfg["lora"]["lora_alpha"], 16)
+        self.assertAlmostEqual(float(sft_e4b_cfg["training"]["learning_rate"]), 1.0e-5, places=12)
         self.assertAlmostEqual(float(sft_e4b_cfg["training"]["warmup_ratio"]), 0.10, places=6)
-        self.assertEqual(dpo_e4b_cfg["lora"]["r"], 32)
-        self.assertEqual(dpo_e4b_cfg["lora"]["lora_alpha"], 32)
+        self.assertFalse(dpo_e4b_cfg["model"]["load_in_4bit"])
+        self.assertEqual(dpo_e4b_cfg["lora"]["r"], 16)
+        self.assertEqual(dpo_e4b_cfg["lora"]["lora_alpha"], 16)
         self.assertEqual(dpo_e4b_cfg["vram_optimization"]["precompute_ref_batch_size"], 1)
         self.assertEqual(dpo_e4b_cfg["training"]["per_device_train_batch_size"], 1)
         self.assertEqual(dpo_e4b_cfg["training"]["per_device_eval_batch_size"], 1)
@@ -2956,6 +2980,166 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         cb_bad = DPORefSanityCallback(max_initial_loss=0.98, max_initial_grad_norm=100_000.0, check_initial_loss=True)
         with self.assertRaises(RuntimeError):
             cb_bad.on_log(t_args, t_state, TrainerControl(), logs={"loss": 0.6931, "grad_norm": 125_000.0})
+
+    def test_32_dpo_hygiene_eos_normalization_and_canonical_merge_overwrite(self) -> None:
+        """Verify multi-turn DPO rejection, filler/digit-preserving thinking split, E4B <turn|> EOS guard, and generation_config overwrite."""
+        from unittest.mock import patch
+        from scripts.run_benchmarks import _configure_lm_eval_thinking_for_task
+        from src.dpo_formatter import (
+            _extract_prompt_and_response,
+            _split_into_thinking_and_answer,
+            normalize_distilabel_math_thinking_dpo_row,
+        )
+        from src.merge_and_export import (
+            _patch_exported_gemma4_config_tie_embeddings,
+            _restore_canonical_processor_and_templates,
+            verify_merged_checkpoint,
+        )
+
+        # 1. Multi-turn conversations MUST be rejected so Turn-1 prompts never pair with Turn-N answers
+        mt_branch = [
+            {"role": "user", "content": "Turn 1 unrelated question"},
+            {"role": "assistant", "content": "Turn 1 answer."},
+            {"role": "user", "content": "Turn 2 follow-up question"},
+            {"role": "assistant", "content": "Turn 2 follow-up answer."},
+        ]
+        self.assertEqual(_extract_prompt_and_response(mt_branch), (None, None, None))
+        st_branch = [
+            {"role": "system", "content": "System msg"},
+            {"role": "user", "content": "Single turn question?"},
+            {"role": "assistant", "content": "Single turn answer."},
+        ]
+        self.assertEqual(
+            _extract_prompt_and_response(st_branch),
+            ("System msg", "Single turn question?", "Single turn answer."),
+        )
+
+        # 2. Conversational sign-off filler and digit-dropping paragraph splits MUST be rejected
+        bad_filler = (
+            "Step 1: Divide 3x^2 by 2x to get (3/2)x, and divide -4y^3 by 2x to get -2y^3/x.\n\n"
+            "Step 2: Thus the simplified expression is (3/2)x - 2y^3/x.\n\n"
+            "I hope this explanation helps! Let me know if you have any further questions."
+        )
+        self.assertIsNone(_split_into_thinking_and_answer(bad_filler))
+
+        bad_digit_drop = (
+            "الخطوة الأولى: نضرب 12 في 8 فنحصل على 96 سنتيمتراً مربعاً.\n\n"
+            "لذلك تكون هذه الطريقة هي الأفضل لحل المسائل الهندسية بسهولة ووضوح."
+        )
+        self.assertIsNone(_split_into_thinking_and_answer(bad_digit_drop))
+
+        # Native <think>...</think> Dolci-Think STEM/MCQ pair MUST be accepted cleanly
+        dolci_rec = normalize_distilabel_math_thinking_dpo_row(
+            {
+                "dataset_source": "tulu-3-sft-personas-math",
+                "prompt": "If 4x - 7 = 21, what is the value of x? Show your reasoning clearly.",
+                "chosen": [
+                    {"role": "user", "content": "If 4x - 7 = 21, what is the value of x? Show your reasoning clearly."},
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "<think>\nWe add 7 to both sides of 4x - 7 = 21 to obtain 4x = 28, "
+                            "then divide both sides by 4 to find x = 7 and verify 4(7) - 7 = 21.\n</think>\n"
+                            "Adding 7 to both sides gives 4x = 28, so dividing by 4 yields **x = 7**."
+                        ),
+                    },
+                ],
+                "rejected": [
+                    {"role": "user", "content": "If 4x - 7 = 21, what is the value of x? Show your reasoning clearly."},
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "<think>\nSubtract 7 from 21 to get 14, then divide 14 by 4 to find the value of x "
+                            "for the linear equation.\n</think>\n"
+                            "Subtracting 7 gives 4x = 14, so **x = 3.5**."
+                        ),
+                    },
+                ],
+            }
+        )
+        self.assertIsNotNone(dolci_rec)
+        assert dolci_rec is not None
+        self.assertTrue(dolci_rec["enable_thinking"])
+        self.assertIn("x = 7", dolci_rec["chosen_only_messages"][0]["content"])
+
+        # 3. Verify `_configure_lm_eval_thinking_for_task` sets `<turn|>` (106) for BOTH `e4b` and `26b_a4b`
+        class _DummyTok:
+            eos_token = "<eos>"
+            eos_token_id = 1
+
+        class _DummyLM:
+            def __init__(self) -> None:
+                self.tokenizer = _DummyTok()
+                self.enable_thinking = False
+                self.think_end_token = None
+                self.chat_template_args = {}
+
+        lm_e4b = _DummyLM()
+        _configure_lm_eval_thinking_for_task(lm_e4b, False, True, "mmlu_pro", model_key_prefix="e4b")
+        self.assertEqual(lm_e4b.tokenizer.eos_token, "<turn|>")
+        self.assertEqual(lm_e4b.tokenizer.eos_token_id, 106)
+        self.assertTrue(lm_e4b.enable_thinking)
+        self.assertEqual(lm_e4b.think_end_token, "<channel|>")
+
+        # 4. Verify merge patches broken `eos_token_id: 1` in `config.json`, `generation_config.json`, and `tokenizer_config.json`
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_16 = pathlib.Path(tmpdir)
+            (out_16 / "config.json").write_text(
+                json.dumps({"model_type": "gemma4", "use_cache": False, "eos_token_id": 1, "text_config": {"eos_token_id": 1}}),
+                encoding="utf-8",
+            )
+            (out_16 / "generation_config.json").write_text(
+                json.dumps({"bos_token_id": 2, "eos_token_id": 1}),
+                encoding="utf-8",
+            )
+            (out_16 / "tokenizer_config.json").write_text(
+                json.dumps({"bos_token": "<bos>", "eos_token": "<eos>"}),
+                encoding="utf-8",
+            )
+            (out_16 / "chat_template.jinja").write_text("<|turn>user\n{{ content }}<turn|>\n", encoding="utf-8")
+            # Write minimal valid safetensors header (`weight`: F32 [1])
+            hdr = b'{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}'
+            (out_16 / "model.safetensors").write_bytes(len(hdr).to_bytes(8, "little") + hdr + b"\x00\x00")
+
+            _patch_exported_gemma4_config_tie_embeddings(out_16)
+            with patch("huggingface_hub.hf_hub_download", side_effect=OSError("offline")):
+                _restore_canonical_processor_and_templates(out_16, "unsloth/gemma-4-E4B-it")
+
+            patched_cfg = json.loads((out_16 / "config.json").read_text(encoding="utf-8"))
+            patched_gen = json.loads((out_16 / "generation_config.json").read_text(encoding="utf-8"))
+            patched_tok = json.loads((out_16 / "tokenizer_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(patched_cfg["eos_token_id"], [1, 106, 50])
+            self.assertEqual(patched_cfg["text_config"]["eos_token_id"], [1, 106, 50])
+            self.assertEqual(patched_gen["eos_token_id"], [1, 106, 50])
+            self.assertEqual(patched_tok["eos_token"], "<turn|>")
+            v_res = verify_merged_checkpoint(out_16, is_moe=False, enforce_full_size=False)
+            self.assertTrue(v_res["verified"])
+
+        # 5. Verify `_normalize_offloaded_hf_device_map_for_training` clears `"cpu"`/`"disk"` entries for `accelerate >= 1.6`
+        from src.model_loader import _normalize_offloaded_hf_device_map_for_training
+
+        class _DummyInner(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.hf_device_map = {"model.layers": 0, "model.language_model.embed_tokens_per_layer": "cpu"}
+
+        class _DummyBaseWrapper(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.model = _DummyInner()
+                self.hf_device_map = dict(self.model.hf_device_map)
+
+        class _DummyPeft(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.base_model = _DummyBaseWrapper()
+                self.hf_device_map = {"model.layers": 0, "model.embed_tokens_per_layer": "disk"}
+
+        dummy_peft = _DummyPeft()
+        _normalize_offloaded_hf_device_map_for_training(dummy_peft, device_idx=0)
+        self.assertEqual(dummy_peft.hf_device_map, {"": 0})
+        self.assertEqual(dummy_peft.base_model.hf_device_map, {"": 0})
+        self.assertEqual(dummy_peft.base_model.model.hf_device_map, {"": 0})
 
 
 if __name__ == "__main__":

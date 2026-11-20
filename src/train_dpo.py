@@ -243,6 +243,7 @@ def salt_dpo_dataset_fingerprint(
     precompute_ref_batch_size: Optional[int],
     is_moe: bool,
     cache_dir: Optional[pathlib.Path] = None,
+    load_in_4bit: bool = True,
 ) -> Any:
     """Salt HuggingFace `datasets` fingerprint so `DPOTrainer` reference logprob `.map()` never
     reuses stale Arrow cache files across different Stage 1 SFT adapters, batch sizes, or MoE kernel flags,
@@ -263,8 +264,9 @@ def salt_dpo_dataset_fingerprint(
 
     payload = json.dumps(
         {
-            "schema": "v6_bitexact_dpo_ref_alignment",
+            "schema": "v7_bitexact_dpo_ref_alignment",
             "base_model_id": str(base_model_id),
+            "load_in_4bit": bool(load_in_4bit),
             "adapter_sig": adapter_sig,
             "precompute_ref_batch_size": precompute_ref_batch_size,
             "is_moe": bool(is_moe),
@@ -379,21 +381,24 @@ def _temporarily_disable_gradient_checkpointing(model: Any, trainer: Any = None)
     args = getattr(trainer, "args", None)
     gc_kwargs = getattr(args, "gradient_checkpointing_kwargs", None) if args is not None else None
     try:
-        from trl.models.utils import disable_gradient_checkpointing  # type: ignore
-
-        with disable_gradient_checkpointing(model, gc_kwargs):
-            yield
-        return
+        from trl.models.utils import disable_gradient_checkpointing as _trl_disable_gc  # type: ignore
     except Exception:
-        pass
-    flagged = [m for m in model.modules() if getattr(m, "gradient_checkpointing", False) is True]
-    for m in flagged:
-        m.gradient_checkpointing = False
-    try:
-        yield
-    finally:
+        _trl_disable_gc = None
+
+    with contextlib.ExitStack() as stack:
+        if _trl_disable_gc is not None:
+            try:
+                stack.enter_context(_trl_disable_gc(model, gc_kwargs))
+            except Exception:
+                pass
+        flagged = [m for m in model.modules() if getattr(m, "gradient_checkpointing", False) is True]
         for m in flagged:
-            m.gradient_checkpointing = True
+            m.gradient_checkpointing = False
+        try:
+            yield
+        finally:
+            for m in flagged:
+                m.gradient_checkpointing = True
 
 
 def verify_step0_dpo_ref_alignment(
@@ -1143,6 +1148,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.smoke_test
         else (out_dir_path.resolve().parent / ".dpo_ref_cache")
     )
+    load_in_4bit_flag = bool(model_cfg.get("load_in_4bit", True))
     train_dataset = salt_dpo_dataset_fingerprint(
         train_dataset,
         base_model_id=base_model_id_str,
@@ -1150,6 +1156,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         precompute_ref_batch_size=precomp_bs,
         is_moe=is_moe,
         cache_dir=ref_cache_root,
+        load_in_4bit=load_in_4bit_flag,
     )
     if eval_dataset is not None:
         eval_dataset = salt_dpo_dataset_fingerprint(
@@ -1159,6 +1166,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             precompute_ref_batch_size=precomp_bs,
             is_moe=is_moe,
             cache_dir=(ref_cache_root / "eval") if ref_cache_root is not None else None,
+            load_in_4bit=load_in_4bit_flag,
         )
 
     saved_gemma4_proc = getattr(tokenizer, "_gemma4_processor", None)

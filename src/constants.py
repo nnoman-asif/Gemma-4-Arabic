@@ -386,14 +386,14 @@ DPO_DATASETS: Dict[str, DatasetSpec] = {
     ),
     "arabic_reasoning_thinking_dpo": DatasetSpec(
         key="arabic_reasoning_thinking_dpo",
-        repo_id="arcee-globe/arabic-orpo-dpo-mix-40k-filtered",
+        repo_id="arcee-globe/filtered-arabic-distilabel-math-preference-orpo",
         configs=(None,),
         default_split="train",
         stage="dpo",
         role="preference_arabic_thinking",
         target_samples=1_600,
         enable_thinking=True,
-        fallback_repo_id="2A2I/argilla-dpo-mix-7k-arabic",
+        fallback_repo_id="arcee-globe/arabic-orpo-dpo-mix-40k-filtered",
     ),
     "ultrafeedback_english_dpo": DatasetSpec(
         key="ultrafeedback_english_dpo",
@@ -407,14 +407,14 @@ DPO_DATASETS: Dict[str, DatasetSpec] = {
     ),
     "distilabel_math_thinking_dpo": DatasetSpec(
         key="distilabel_math_thinking_dpo",
-        repo_id="argilla/distilabel-math-preference-dpo",
+        repo_id="allenai/Dolci-Think-DPO-7B",
         configs=(None,),
         default_split="train",
         stage="dpo",
         role="preference_english_thinking",
         target_samples=1_000,
         enable_thinking=True,
-        fallback_repo_id="argilla/ultrafeedback-binarized-preferences-cleaned",
+        fallback_repo_id="argilla/distilabel-math-preference-dpo",
     ),
 }
 

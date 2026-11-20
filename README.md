@@ -11,7 +11,7 @@ End-to-end continual instruction tuning (`QLoRA` across dense + 128 3D MoE exper
 | **Edge / Workstation Model** | [`noman-asif/Gemma-4-E4B-Arabic-It`](https://huggingface.co/noman-asif/Gemma-4-E4B-Arabic-It) | **4.5B Total / 4.0B Active** (Dense) | Standalone 16-bit (`bfloat16`) `safetensors` checkpoint (`r=16, alpha=16`) for laptops & single-GPU workstations |
 | **Enterprise MoE Flagship** | [`noman-asif/Gemma-4-26B-A4B-Arabic-It`](https://huggingface.co/noman-asif/Gemma-4-26B-A4B-Arabic-It) | **25.2B Total / 3.8B Active** (128 Experts, Top-8 + 1 Shared) | Standalone 16-bit (`bfloat16`) `safetensors` MoE flagship (`r=16, alpha=16` across attention + shared MLP + all 128 3D experts) |
 | **Stage 1 SFT Dataset** | [`noman-asif/Arabic-Reasoning-Instruct-30k`](https://huggingface.co/datasets/noman-asif/Arabic-Reasoning-Instruct-30k) | **30,000 rows** (V3 High-Purity: 75% Arabic / 25% Replay, 55% CoT) | 13-gram de-contaminated Arabic, Saudi dialect, legal (`moj` + `boe`), and native Gemma 4 `<\|channel>thought` reasoning curriculum |
-| **Stage 2 DPO Dataset** | [`noman-asif/Arabic-Preference-DPO-6k`](https://huggingface.co/datasets/noman-asif/Arabic-Preference-DPO-6k) | **6,000 pairs** (V3 Length-Balanced: 70% Arabic / 30% English+Math, 43.3% CoT) | Thinking-aware conversational preference alignment dataset (`0.55..1.75` length balance, 0% SFT prompt overlap) |
+| **Stage 2 DPO Dataset** | [`noman-asif/Arabic-Preference-DPO-6k`](https://huggingface.co/datasets/noman-asif/Arabic-Preference-DPO-6k) | **6,000 pairs** (V3 Length-Balanced: 70% Arabic / 30% English+STEM, 17.4% CoT) | Thinking-aware conversational preference alignment dataset (`0.55..1.75` length balance, 0% SFT prompt overlap) |
 
 ---
 
@@ -71,14 +71,14 @@ Running `bash scripts/run_dual_a100_pipeline.sh` executes a 4-phase, barrier-syn
 | **Competition Math & Science Replay** | `nvidia/OpenMathInstruct-2` (`train_1M`), `nvidia/OpenScienceReasoning-2` | `4,000` (`13.33%`) | Preserves full reasoning trace **and** final `\boxed{answer}` (`AIME-2026` & `GPQA-Diamond` shield) |
 | **General English Multi-Turn Replay** | `HuggingFaceH4/ultrachat_200k` (`train_sft`) | `1,000` (`3.33%`) | Multi-turn English instruction following (`MMLU-Pro` shield) |
 
-### Stage 2: Thinking-Aware Conversational DPO Alignment (`6,000` Length-Balanced Pairs | 43.3% Thinking CoT)
+### Stage 2: Thinking-Aware Conversational DPO Alignment (`6,000` Length-Balanced Pairs | 17.4% Thinking CoT)
 
 | Subset | Hugging Face Source | Target Pairs (`Share`) | Hygiene & Formatting (`src/dpo_formatter.py`) |
 | :--- | :--- | :---: | :--- |
-| **MSA & Cultural Alignment** | `arcee-globe/arabic-orpo-dpo-mix-40k-filtered` (non-thinking) | `2,600` (`43.33%`) | Unifies user prompts, strict terminal sentence punctuation, `0.55..1.75` length balance, 0% SFT prompt overlap |
-| **Arabic Thinking CoT DPO** | `arcee-globe/arabic-orpo-dpo-mix-40k-filtered` (`enable_thinking=True`) | `1,600` (`26.67%`) | Multi-step Arabic reasoning separated into `<\|channel>thought` + concise final answer |
-| **Competition Math Thinking CoT DPO** | `argilla/distilabel-math-preference-dpo` (`enable_thinking=True`) | `1,000` (`16.67%`) | High-margin (`chosen >= 9.0, margin >= 2.0`) STEM CoT alignment preserving thinking mode |
-| **English Preference Replay** | `argilla/ultrafeedback-binarized-preferences-cleaned` | `800` (`13.33%`) | High-margin (`>= 1.5`, `chosen_rating >= 4.5`) English anchor preventing Stage 2 English drift |
+| **MSA & Cultural Alignment** | `arcee-globe/arabic-orpo-dpo-mix-40k-filtered` (single-turn non-thinking) | `~4,158` (`69.30%`) | Single-turn verified, semantic prompt consistency, strict terminal punctuation, `0.55..1.75` length balance, 0% SFT overlap |
+| **Arabic Thinking CoT DPO** | `arcee-globe/filtered-arabic-distilabel-math-preference-orpo` (`enable_thinking=True`) | `~42` (`0.70%`) | Explicit self-contained mathematical/logical conclusions preserving all numeric results |
+| **STEM & MCQ Thinking CoT DPO** | `allenai/Dolci-Think-DPO-7B` (`enable_thinking=True`) | `1,000` (`16.67%`) | Native `<think>...</think>` STEM, MCQ, math, and code reasoning converted to `<\|channel>thought` + complete answer |
+| **English Preference Replay** | `argilla/ultrafeedback-binarized-preferences-cleaned` | `800` (`13.33%`) | High-margin (`>= 1.5`, `chosen_rating >= 4.5`) single-turn English anchor preventing Stage 2 English drift |
 
 ---
 

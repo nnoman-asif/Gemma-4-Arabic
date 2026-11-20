@@ -100,7 +100,7 @@ datasets:
       unify_prompt_from_chosen: true
 
     arabic_reasoning_thinking_dpo:
-      repo_id: "arcee-globe/arabic-orpo-dpo-mix-40k-filtered"
+      repo_id: "arcee-globe/filtered-arabic-distilabel-math-preference-orpo"
       config_name: "thinking_cot"
       split: "train"
       weight: 0.2667
@@ -114,7 +114,7 @@ datasets:
       enable_thinking: false
 
     distilabel_math_thinking_dpo:
-      repo_id: "argilla/distilabel-math-preference-dpo"
+      repo_id: "allenai/Dolci-Think-DPO-7B"
       config_name: "thinking_cot"
       split: "train"
       weight: 0.1667

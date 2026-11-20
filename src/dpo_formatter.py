@@ -50,6 +50,44 @@ _SAUDI_LEAK_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_CJK_LEAK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_PERSIAN_ONLY_CHARS_RE = re.compile(r"[گچپژک]")
+_ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06FF]")
+_WORD_TOKEN_RE = re.compile(r"[\u0600-\u06FFa-zA-Z0-9]{3,}")
+
+_SIGNOFF_FILLER_RE = re.compile(
+    r"(?:i\s+hope\s+this\s+(?:explanation\s+|answer\s+|solution\s+)?helps|"
+    r"hope\s+this\s+helps|let\s+me\s+know\s+if\s+you\s+have|"
+    r"feel\s+free\s+to\s+ask|if\s+you\s+have\s+any\s+(?:further\s+|other\s+|more\s+)?questions|"
+    r"happy\s+to\s+help|please\s+let\s+me\s+know\s+if|"
+    r"آمل\s+أن\s+يكون|أتمنى\s+أن\s+يكون|لا\s+تتردد\s+في\s+طرح|أخبرني\s+إذا\s+كنت|إذا\s+كان\s+لديك\s+أي\s+(?:سؤال|استفسار))",
+    flags=re.IGNORECASE,
+)
+
+_EXPLICIT_CONCLUSION_START_RE = re.compile(
+    r"^(?:\*{0,2})(?:therefore\b|thus\b|hence\b|consequently\b|so,\s|in\s+conclusion,\s+the\b|"
+    r"final\s+answer\b|the\s+(?:final\s+|unique\s+|correct\s+)?(?:answer|solution|value|result)\s+is\b|"
+    r"إذن\b|إذاً\b|لذلك\b|وبالتالي\b|وعليه\b|بناءً\s+على\s+ذلك\b|النتيجة\b|الإجابة\b|الجواب\b|خلاصة\s+القول\b)",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+_DOLCI_STEM_SOURCE_KEYWORDS: Tuple[str, ...] = (
+    "math",
+    "flan",
+    "code",
+    "python",
+    "science",
+    "qwq",
+    "ultrafeedback",
+)
+_DOLCI_EXCLUDED_SOURCE_KEYWORDS: Tuple[str, ...] = (
+    "wildjailbreak",
+    "wildguard",
+    "harm",
+    "safety",
+    "not-english",
+)
+
 _VALID_ENDING_CHARS: Tuple[str, ...] = (
     ".",
     "!",
@@ -79,24 +117,61 @@ def _has_complete_terminal_ending(text: str) -> bool:
     return any(stripped.endswith(ch) for ch in _VALID_ENDING_CHARS)
 
 
+def _prompts_semantically_consistent(
+    p1: Optional[str],
+    p2: Optional[str],
+    min_overlap: float = 0.35,
+) -> bool:
+    """Verify two user prompt strings refer to the same underlying question."""
+    s1 = (p1 or "").strip()
+    s2 = (p2 or "").strip()
+    if not s1 or not s2 or s1 == s2:
+        return True
+    w1 = set(_WORD_TOKEN_RE.findall(s1.lower()))
+    w2 = set(_WORD_TOKEN_RE.findall(s2.lower()))
+    if not w1 or not w2:
+        return True
+    overlap = len(w1 & w2) / float(max(1, min(len(w1), len(w2))))
+    return overlap >= min_overlap
+
+
 def _split_into_thinking_and_answer(
     text: str,
     min_reasoning_chars: int = 80,
     min_answer_chars: int = 20,
 ) -> Optional[Tuple[str, str]]:
-    """Split a multi-step response into `(reasoning_trace, final_answer)` for thinking-mode DPO."""
+    """Extract `(reasoning_trace, final_answer)` for thinking-mode DPO without stripping answer content.
+
+    Accepts:
+    1. Native `<think>...</think>` / `<|channel>thought...<channel|>` responses where `final_answer`
+       is complete, free of raw `<think>` leftovers, and not a bare conversational sign-off filler.
+    2. Step-by-step derivations WITHOUT `<think>` tags ONLY when the final paragraph begins with an
+       explicit mathematical/logical conclusion marker (`Therefore`, `Thus`, `إذن`, `لذلك`, `وبالتالي`,
+       etc.), contains zero conversational sign-off filler (`"I hope this helps!"`), and preserves
+       numeric values whenever the derivation steps contain digits.
+    """
     cleaned = (text or "").strip()
     if not cleaned:
+        return None
+    if _CJK_LEAK_RE.search(cleaned):
         return None
 
     explicit_r, explicit_a = parse_reasoning_and_content(cleaned)
     if explicit_r and explicit_a:
+        if "<think>" in explicit_r or "</think>" in explicit_r or "<think>" in explicit_a or "</think>" in explicit_a:
+            return None
+        if len(explicit_a) < 160 and _SIGNOFF_FILLER_RE.search(explicit_a):
+            return None
         if (
             len(explicit_r) >= min_reasoning_chars
             and len(explicit_a) >= min_answer_chars
             and _has_complete_terminal_ending(explicit_a)
         ):
             return explicit_r, explicit_a
+        return None
+
+    # Reject if raw unclosed `<think>` / `</think>` tags exist
+    if "<think>" in cleaned or "</think>" in cleaned or "<|channel>" in cleaned:
         return None
 
     paras = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
@@ -107,16 +182,18 @@ def _split_into_thinking_and_answer(
         else:
             return None
 
-    if len(paras[-1]) < min_answer_chars and len(paras) >= 3:
-        reasoning = "\n\n".join(paras[:-2]).strip()
-        answer = "\n\n".join(paras[-2:]).strip()
-    else:
-        reasoning = "\n\n".join(paras[:-1]).strip()
-        answer = paras[-1].strip()
+    reasoning = "\n\n".join(paras[:-1]).strip()
+    answer = paras[-1].strip()
 
     if len(reasoning) < min_reasoning_chars or len(answer) < min_answer_chars:
         return None
     if not _has_complete_terminal_ending(answer):
+        return None
+    if _SIGNOFF_FILLER_RE.search(answer):
+        return None
+    if not _EXPLICIT_CONCLUSION_START_RE.search(answer):
+        return None
+    if re.search(r"\d", reasoning) and not re.search(r"\d", answer):
         return None
     return reasoning, answer
 
@@ -136,14 +213,17 @@ def validate_dpo_load_config(repo_id: str, config_name: Optional[str]) -> str:
 def _extract_prompt_and_response(
     branch: Any,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Extract `(system_prompt, user_prompt, assistant_response)` from a string or message list."""
+    """Extract `(system_prompt, user_prompt, assistant_response)` strictly from a single-turn exchange.
+
+    Multi-turn message lists (`len(non_system_turns) != 2`) are rejected (`(None, None, None)`) so a
+    Turn-1 user prompt is NEVER paired with an unrelated Turn-2/Turn-3 assistant reply.
+    """
     if isinstance(branch, str):
         return None, None, branch.strip()
 
     if isinstance(branch, list):
         sys_txt: Optional[str] = None
-        user_txt: Optional[str] = None
-        asst_txt: Optional[str] = None
+        non_sys: List[Tuple[str, str]] = []
         for msg in branch:
             if not isinstance(msg, dict):
                 continue
@@ -151,12 +231,18 @@ def _extract_prompt_and_response(
             content = str(
                 msg.get("content") if msg.get("content") is not None else (msg.get("value") or "")
             ).strip()
-            if role == "system" and sys_txt is None:
-                sys_txt = content
-            elif role in ("user", "human") and user_txt is None:
-                user_txt = content
-            elif role in ("assistant", "gpt", "model"):
-                asst_txt = content
+            if role in ("system", "developer"):
+                if sys_txt is None:
+                    sys_txt = content
+            elif role in ("user", "human", "assistant", "gpt", "model"):
+                non_sys.append((role, content))
+
+        if len(non_sys) != 2:
+            return None, None, None
+        u_role, user_txt = non_sys[0]
+        a_role, asst_txt = non_sys[1]
+        if u_role not in ("user", "human") or a_role not in ("assistant", "gpt", "model"):
+            return None, None, None
         return sys_txt, user_txt, asst_txt
 
     return None, None, None
@@ -337,13 +423,23 @@ def normalize_arcee_arabic_dpo_row(
 
     if has_english_meta_leak(unified_prompt) or has_english_meta_leak(chosen_resp):
         return None
+    if _CJK_LEAK_RE.search(unified_prompt + chosen_resp + rejected_resp):
+        return None
+    if _PERSIAN_ONLY_CHARS_RE.search(unified_prompt + chosen_resp):
+        return None
+    if "<think>" in chosen_resp or "</think>" in chosen_resp or "<think>" in rejected_resp:
+        return None
 
     if strict_hygiene:
         if len(unified_prompt) < 12 or len(chosen_resp) < 40 or len(rejected_resp) < 25:
             return None
-        if arabic_char_ratio(unified_prompt + " " + chosen_resp) < 0.60:
+        if not _prompts_semantically_consistent(chosen_user_prompt, rejected_user_prompt, min_overlap=0.35):
+            return None
+        if arabic_char_ratio(unified_prompt) < 0.50 or arabic_char_ratio(chosen_resp) < 0.55:
             return None
         if not _has_complete_terminal_ending(chosen_resp) or not _has_complete_terminal_ending(rejected_resp):
+            return None
+        if _SIGNOFF_FILLER_RE.search(chosen_resp):
             return None
         # Strict length balance prevents sigmoid DPO verbosity drift / <turn|> EOS suppression
         len_ratio = len(chosen_resp) / float(max(1, len(rejected_resp)))
@@ -385,9 +481,15 @@ def normalize_arabic_reasoning_thinking_dpo_row(
     ).strip()
     if len(unified_prompt) < 15 or not chosen_resp or not rejected_resp:
         return None
+    if not _prompts_semantically_consistent(chosen_user_prompt, rejected_user_prompt, min_overlap=0.35):
+        return None
     if has_english_meta_leak(unified_prompt) or has_english_meta_leak(chosen_resp):
         return None
-    if arabic_char_ratio(unified_prompt + " " + chosen_resp) < 0.60:
+    if _CJK_LEAK_RE.search(unified_prompt + chosen_resp + rejected_resp):
+        return None
+    if _PERSIAN_ONLY_CHARS_RE.search(unified_prompt + chosen_resp):
+        return None
+    if arabic_char_ratio(unified_prompt) < 0.50 or arabic_char_ratio(chosen_resp) < 0.55:
         return None
     if not _has_complete_terminal_ending(chosen_resp) or not _has_complete_terminal_ending(rejected_resp):
         return None
@@ -447,16 +549,20 @@ def normalize_ultrafeedback_dpo_row(
             return None
 
     c_sys, c_prompt, chosen_resp = _extract_prompt_and_response(row.get("chosen"))
-    _, _, rejected_resp = _extract_prompt_and_response(row.get("rejected"))
+    _, r_prompt, rejected_resp = _extract_prompt_and_response(row.get("rejected"))
     prompt_txt = str(row.get("prompt") or c_prompt or "").strip()
 
     if len(prompt_txt) < 15 or not chosen_resp or not rejected_resp:
         return None
     if len(chosen_resp) < 30 or len(rejected_resp) < 15:
         return None
+    if _CJK_LEAK_RE.search(prompt_txt + chosen_resp + rejected_resp):
+        return None
 
     len_ratio = len(chosen_resp) / float(max(1, len(rejected_resp)))
     if strict_hygiene:
+        if not _prompts_semantically_consistent(c_prompt, r_prompt, min_overlap=0.50):
+            return None
         if not _has_complete_terminal_ending(chosen_resp) or not _has_complete_terminal_ending(rejected_resp):
             return None
         if len_ratio < DPO_MIN_LEN_RATIO or len_ratio > DPO_MAX_LEN_RATIO:
@@ -482,14 +588,21 @@ def normalize_ultrafeedback_dpo_row(
 
 
 # ---------------------------------------------------------------------------
-# DPO 5: argilla/distilabel-math-preference-dpo (`enable_thinking=True` STEM CoT)
+# DPO 5: STEM/MCQ/Math Thinking CoT DPO (`allenai/Dolci-Think-DPO-7B` + `distilabel-math`)
 # ---------------------------------------------------------------------------
 def normalize_distilabel_math_thinking_dpo_row(
     row: Dict[str, Any],
     tokenizer: Optional[Any] = None,
     decontaminator: Optional[BenchmarkDecontaminator] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Normalize step-by-step math preference pairs into `<|channel>thought` thinking-mode DPO pairs."""
+    """Normalize genuine `<think>...</think>` STEM/MCQ/Math preference pairs into `<|channel>thought` DPO pairs."""
+    ds_source = str(row.get("dataset_source") or "").strip().lower()
+    if ds_source:
+        if any(bad in ds_source for bad in _DOLCI_EXCLUDED_SOURCE_KEYWORDS):
+            return None
+        if not any(kw in ds_source for kw in _DOLCI_STEM_SOURCE_KEYWORDS):
+            return None
+
     c_rating = row.get("chosen_rating") if row.get("chosen_rating") is not None else row.get("chosen-rating")
     r_rating = row.get("rejected_rating") if row.get("rejected_rating") is not None else row.get("rejected-rating")
     if isinstance(c_rating, (int, float)) and isinstance(r_rating, (int, float)):
@@ -506,13 +619,19 @@ def normalize_distilabel_math_thinking_dpo_row(
     raw_chosen = row.get("chosen_response") if row.get("chosen_response") is not None else row.get("chosen")
     raw_rejected = row.get("rejected_response") if row.get("rejected_response") is not None else row.get("rejected")
     c_sys, c_prompt, chosen_resp = _extract_prompt_and_response(raw_chosen)
-    _, _, rejected_resp = _extract_prompt_and_response(raw_rejected)
+    _, r_prompt, rejected_resp = _extract_prompt_and_response(raw_rejected)
     if not prompt_txt and c_prompt:
         prompt_txt = c_prompt.strip()
 
     if len(prompt_txt) < 15 or not chosen_resp or not rejected_resp:
         return None
-    if not _has_complete_terminal_ending(chosen_resp) or not _has_complete_terminal_ending(rejected_resp):
+    if not _prompts_semantically_consistent(c_prompt, r_prompt, min_overlap=0.50):
+        return None
+    if _CJK_LEAK_RE.search(prompt_txt + chosen_resp + rejected_resp):
+        return None
+    if _ARABIC_SCRIPT_RE.search(prompt_txt):
+        return None
+    if len(chosen_resp) > 6800 or len(rejected_resp) > 6800:
         return None
 
     len_ratio = len(chosen_resp) / float(max(1, len(rejected_resp)))
@@ -549,6 +668,34 @@ def normalize_distilabel_math_thinking_dpo_row(
     return rec
 
 
+def _iter_fast_parquet_shard_if_supported(repo_id: str) -> Optional[Any]:
+    """Read single-shard Parquet DPO sources directly via `hf_hub_download` + `pyarrow.parquet`."""
+    shard_map = {
+        "allenai/Dolci-Think-DPO-7B": "data/train-00000-of-00007.parquet",
+        "arcee-globe/arabic-orpo-dpo-mix-40k-filtered": "data/train-00000-of-00001.parquet",
+        "arcee-globe/filtered-arabic-distilabel-math-preference-orpo": "data/train-00000-of-00001.parquet",
+        "argilla/ultrafeedback-binarized-preferences-cleaned": "data/train-00000-of-00001.parquet",
+    }
+    rel_file = shard_map.get(repo_id)
+    if not rel_file:
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+        import pyarrow.parquet as pq
+
+        local_pq = hf_hub_download(repo_id=repo_id, filename=rel_file, repo_type="dataset")
+        pf = pq.ParquetFile(local_pq)
+
+        def _row_gen():
+            for batch in pf.iter_batches(batch_size=512):
+                for rec in batch.to_pylist():
+                    yield rec
+
+        return _row_gen()
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Streaming Loader & Weighted DPO Mixer
 # ---------------------------------------------------------------------------
@@ -583,22 +730,31 @@ def load_and_normalize_dpo_source(
     for active_repo in candidate_repos:
         if len(collected) >= limit:
             break
-        try:
-            if active_repo == ARABIC_DIALECT_DPO_REPO:
-                validated_cfg = validate_dpo_load_config(active_repo, raw_cfg)
-                ds = load_dataset(
-                    active_repo,
-                    validated_cfg,
-                    split=spec.default_split,
-                    streaming=streaming,
-                )
-            elif raw_cfg and active_repo == spec.repo_id:
-                ds = load_dataset(active_repo, raw_cfg, split=spec.default_split, streaming=streaming)
-            else:
-                ds = load_dataset(active_repo, split=spec.default_split, streaming=streaming)
-        except Exception as exc:
-            logger.warning("Failed opening DPO source '%s' (%s): %s", source_key, active_repo, exc)
-            continue
+        ds: Any = _iter_fast_parquet_shard_if_supported(active_repo) if streaming else None
+        if ds is None:
+            try:
+                if active_repo == ARABIC_DIALECT_DPO_REPO:
+                    validated_cfg = validate_dpo_load_config(active_repo, raw_cfg)
+                    ds = load_dataset(
+                        active_repo,
+                        validated_cfg,
+                        split=spec.default_split,
+                        streaming=streaming,
+                    )
+                elif active_repo == "allenai/Dolci-Think-DPO-7B":
+                    ds = load_dataset(
+                        active_repo,
+                        data_files="data/train-00000-of-00007.parquet",
+                        split=spec.default_split,
+                        streaming=streaming,
+                    )
+                elif raw_cfg and active_repo == spec.repo_id:
+                    ds = load_dataset(active_repo, raw_cfg, split=spec.default_split, streaming=streaming)
+                else:
+                    ds = load_dataset(active_repo, split=spec.default_split, streaming=streaming)
+            except Exception as exc:
+                logger.warning("Failed opening DPO source '%s' (%s): %s", source_key, active_repo, exc)
+                continue
 
         max_raw_scan = max(limit * 45, 2500)
         scanned = 0

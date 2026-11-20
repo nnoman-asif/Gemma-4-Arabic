@@ -129,6 +129,27 @@ for stale in ('live_raw_e4b_tuned.json', 'live_raw_e4b.json', 'live_raw_26b_a4b_
   touch outputs/.v3_pipeline_migrated
 fi
 
+if [[ ! -f "outputs/.v4_e4b_bf16_dpo_repaired" ]]; then
+  echo "======================================================================"
+  echo "[V4 E4B Repair] Cleaning stale E4B checkpoints/merges & old DPO cache while preserving completed 26B-A4B"
+  echo "======================================================================"
+  rm -rf \
+    data/dpo_mixed \
+    outputs/sft_e4b_a100 \
+    outputs/dpo_e4b_a100 \
+    outputs/merged_gemma4_e4b_arabic \
+    outputs/.dpo_ref_cache/dense_* \
+    unsloth_compiled_cache \
+    unsloth_compiled_cache_gpu0 \
+    outputs/eval_reports/live_raw_e4b_tuned.json \
+    outputs/eval_reports/live_raw_e4b.json \
+    outputs/eval_reports/benchmark_results_e4b.json \
+    outputs/eval_reports/benchmark_comparison_e4b.md \
+    outputs/eval_reports/family_benchmark_comparison.json \
+    outputs/eval_reports/family_benchmark_comparison.md
+  touch outputs/.v4_e4b_bf16_dpo_repaired
+fi
+
 echo "======================================================================"
 echo "[Phase 0/4] Upfront Hardware, CUDA Driver, Disk & Dependency Verification"
 echo "======================================================================"
@@ -152,7 +173,7 @@ except Exception:
     has_vllm = False
 assert has_vllm or drv >= 13000, f'[FATAL] Host NVIDIA driver only supports CUDA {maj}.{minr} (< 13.0), whereas PyPI vllm>=0.30.0 (required for Gemma 4) pulls torch+cu13 requiring Host CUDA >= 13.0 (NVIDIA Driver >= 580). Stop this instance now and rent a node with CUDA >= 13.0 / Driver >= 580!'"
 
-"${PYTHON_BIN}" -c "import os, pathlib, shutil; free_gb = shutil.disk_usage('.').free / (1024 ** 3); gib = float(1024 ** 3); hf_dir = pathlib.Path(os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))); data_dir = pathlib.Path('data'); cached_bytes = sum(f.stat().st_size for d in (hf_dir, data_dir) if d.is_dir() for f in d.rglob('*') if f.is_file() and not f.is_symlink()); cached_gb = min(70.0, cached_bytes / gib); e4b_dir = pathlib.Path('outputs/merged_gemma4_e4b_arabic'); moe_dir = pathlib.Path('outputs/merged_gemma4_26b_a4b_arabic'); e4b_ok = (e4b_dir / 'merge_manifest.json').is_file() and sum(f.stat().st_size for f in (e4b_dir / 'merged_16bit').glob('*.safetensors')) / gib >= 7.8 if (e4b_dir / 'merged_16bit').is_dir() else False; moe_ok = (moe_dir / 'merge_manifest.json').is_file() and sum(f.stat().st_size for f in (moe_dir / 'merged_16bit').glob('*.safetensors')) / gib >= 44.0 if (moe_dir / 'merged_16bit').is_dir() else False; req_gb = 20.0 if (e4b_ok and moe_ok) else (max(65.0, 90.0 - cached_gb * 0.35) if e4b_ok else max(110.0, 180.0 - cached_gb)); print(f'[Disk] Free workspace disk space: {free_gb:.1f} GB | Already cached HF+data: {cached_gb:.1f} GB (required for remaining stages: >= {req_gb:.1f} GB)'); assert free_gb >= req_gb, f'Insufficient free disk space ({free_gb:.1f} GB < {req_gb:.1f} GB required). Increase container disk to >= 250 GB.'"
+"${PYTHON_BIN}" -c "import os, pathlib, shutil; free_gb = shutil.disk_usage('.').free / (1024 ** 3); gib = float(1024 ** 3); hf_dir = pathlib.Path(os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))); data_dir = pathlib.Path('data'); cached_bytes = sum(f.stat().st_size for d in (hf_dir, data_dir) if d.is_dir() for f in d.rglob('*') if f.is_file() and not f.is_symlink()); cached_gb = min(70.0, cached_bytes / gib); e4b_dir = pathlib.Path('outputs/merged_gemma4_e4b_arabic'); moe_dir = pathlib.Path('outputs/merged_gemma4_26b_a4b_arabic'); e4b_ok = (e4b_dir / 'merge_manifest.json').is_file() and sum(f.stat().st_size for f in (e4b_dir / 'merged_16bit').glob('*.safetensors')) / gib >= 7.8 if (e4b_dir / 'merged_16bit').is_dir() else False; moe_ok = (moe_dir / 'merge_manifest.json').is_file() and sum(f.stat().st_size for f in (moe_dir / 'merged_16bit').glob('*.safetensors')) / gib >= 44.0 if (moe_dir / 'merged_16bit').is_dir() else False; req_gb = 20.0 if (e4b_ok and moe_ok) else (30.0 if moe_ok else (max(65.0, 90.0 - cached_gb * 0.35) if e4b_ok else max(110.0, 180.0 - cached_gb))); print(f'[Disk] Free workspace disk space: {free_gb:.1f} GB | Already cached HF+data: {cached_gb:.1f} GB (required for remaining stages: >= {req_gb:.1f} GB)'); assert free_gb >= req_gb, f'Insufficient free disk space ({free_gb:.1f} GB < {req_gb:.1f} GB required). Increase container disk to >= 250 GB.'"
 
 if ! "${PYTHON_BIN}" -c "import vllm; from packaging.version import Version; assert Version(vllm.__version__) >= Version('0.30.0')" >/dev/null 2>&1; then
   echo "[Setup] Installing vLLM (>=0.30.0)..."
@@ -182,7 +203,7 @@ fi
 
 "${PYTHON_BIN}" -c "import bitsandbytes as bnb, hf_xet, inspect_ai, inspect_evals, lighteval, lm_eval, matplotlib, more_itertools, peft, ray, torch, transformers, trl, unsloth, vllm; from transformers import Gemma4ForConditionalGeneration; from packaging.version import Version; assert Version(vllm.__version__) >= Version('0.30.0'), f'vllm {vllm.__version__} < 0.30.0'; assert Version(unsloth.__version__) >= Version('2026.4.1'), f'unsloth {unsloth.__version__} < 2026.4.1'; assert Version(peft.__version__) >= Version('0.21.3'), f'peft {peft.__version__} < 0.21.3'; assert torch.cuda.is_available() and torch.cuda.device_count() >= 2, 'Post-install CUDA check failed! Host driver is incompatible with installed PyTorch CUDA runtime.'; [((torch.ones((64, 64), device=f'cuda:{i}', dtype=torch.bfloat16) @ torch.ones((64, 64), device=f'cuda:{i}', dtype=torch.bfloat16)).sum().item()) for i in (0, 1)]; q_lin = bnb.nn.Linear4bit(64, 64, bias=False, compute_dtype=torch.bfloat16, quant_type='nf4').to('cuda:0'); _ = q_lin(torch.ones((2, 64), device='cuda:0', dtype=torch.bfloat16)).sum().item(); del q_lin; torch.cuda.empty_cache(); print(f'[Verified] GPUs=2xBF16+NF4 OK | torch={torch.__version__} | bnb={bnb.__version__} | unsloth={unsloth.__version__} | transformers={transformers.__version__} | peft={peft.__version__} | trl={trl.__version__} | vllm={vllm.__version__} | lm_eval={lm_eval.__version__}')"
 
-if "${PYTHON_BIN}" -c "import pathlib, sys; gib = float(1024 ** 3); e4b = pathlib.Path('outputs/merged_gemma4_e4b_arabic'); moe = pathlib.Path('outputs/merged_gemma4_26b_a4b_arabic'); ok = all((d / 'merged_16bit' / 'config.json').is_file() and (d / 'merged_16bit' / 'chat_template.jinja').is_file() and (d / 'merge_manifest.json').is_file() for d in (e4b, moe)) and sum(f.stat().st_size for f in (e4b / 'merged_16bit').glob('*.safetensors')) / gib >= 7.8 and sum(f.stat().st_size for f in (moe / 'merged_16bit').glob('*.safetensors')) / gib >= 44.0; sys.exit(0 if ok else 1)" >/dev/null 2>&1; then
+if "${PYTHON_BIN}" -c "import json, pathlib, sys; gib = float(1024 ** 3); e4b = pathlib.Path('outputs/merged_gemma4_e4b_arabic'); moe = pathlib.Path('outputs/merged_gemma4_26b_a4b_arabic'); ok = all((d / 'merged_16bit' / 'config.json').is_file() and (d / 'merged_16bit' / 'chat_template.jinja').is_file() and (d / 'merged_16bit' / 'generation_config.json').is_file() and 106 in (json.loads((d / 'merged_16bit' / 'generation_config.json').read_text(encoding='utf-8')).get('eos_token_id') or []) and (d / 'merge_manifest.json').is_file() for d in (e4b, moe)) and sum(f.stat().st_size for f in (e4b / 'merged_16bit').glob('*.safetensors')) / gib >= 7.8 and sum(f.stat().st_size for f in (moe / 'merged_16bit').glob('*.safetensors')) / gib >= 44.0; sys.exit(0 if ok else 1)" >/dev/null 2>&1; then
   echo "======================================================================"
   echo "[Skip] Both merged_16bit checkpoints & manifests already verified on disk:"
   echo "  - outputs/merged_gemma4_e4b_arabic/merged_16bit"
@@ -227,8 +248,8 @@ else
 
   echo "======================================================================"
   echo "[Phase 2A/4] Simultaneous Dual-GPU Training (SFT -> DPO, save_steps=100)"
-  echo "  - GPU 0: Gemma-4-E4B-Arabic-It      (r=32, alpha=32)          -> logs/train_gpu0_e4b.log"
-  echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  (r=16, alpha=16, 128 exp) -> logs/train_gpu1_26b_a4b.log"
+  echo "  - GPU 0: Gemma-4-E4B-Arabic-It      (16-bit BF16 LoRA, r=16, alpha=16) -> logs/train_gpu0_e4b.log"
+  echo "  - GPU 1: Gemma-4-26B-A4B-Arabic-It  (r=16, alpha=16, 128 exp)          -> logs/train_gpu1_26b_a4b.log"
   echo "======================================================================"
 
   rm -rf unsloth_compiled_cache unsloth_compiled_cache_gpu0 unsloth_compiled_cache_gpu1
@@ -243,7 +264,7 @@ else
     if [[ -f "outputs/sft_e4b_a100/adapter_config.json" && -s "outputs/sft_e4b_a100/adapter_model.safetensors" && -f "outputs/sft_e4b_a100/training_metrics.json" ]]; then
       echo "[GPU 0] [Skip] Verified completed Stage 1 SFT adapter at outputs/sft_e4b_a100."
     else
-      echo "[GPU 0] Starting/resuming Stage 1 QLoRA SFT for Gemma-4-E4B-Arabic-It (r=32, alpha=32)..."
+      echo "[GPU 0] Starting/resuming Stage 1 16-bit BF16 LoRA SFT for Gemma-4-E4B-Arabic-It (r=16, alpha=16)..."
       rm -rf unsloth_compiled_cache_gpu0 /tmp/inductor_train_gpu0 /tmp/triton_train_gpu0
       "${PYTHON_BIN}" src/train_sft.py \
         --config configs/sft_e4b_a100.yaml \

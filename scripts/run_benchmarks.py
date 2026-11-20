@@ -525,6 +525,7 @@ def _patch_local_checkpoint_config_json(model_dir: pathlib.Path) -> bool:
         return False
     has_sep_lm_head = _has_separate_lm_head_in_checkpoint(model_dir)
     try:
+        orig_cfg_stat = cfg_path.stat()
         cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
         changed = False
         if not has_sep_lm_head:
@@ -542,6 +543,20 @@ def _patch_local_checkpoint_config_json(model_dir: pathlib.Path) -> bool:
             if cfg_data["text_config"].get("use_cache") is not True:
                 cfg_data["text_config"]["use_cache"] = True
                 changed = True
+        is_gemma4_ckpt = cfg_data.get("model_type") == "gemma4" or (
+            isinstance(cfg_data.get("text_config"), dict)
+            and cfg_data["text_config"].get("model_type") in ("gemma4_text", "gemma4")
+        )
+        if is_gemma4_ckpt:
+            cur_eos = cfg_data.get("eos_token_id")
+            if not (isinstance(cur_eos, list) and 106 in cur_eos):
+                cfg_data["eos_token_id"] = [1, 106, 50]
+                changed = True
+            if isinstance(cfg_data.get("text_config"), dict):
+                cur_t_eos = cfg_data["text_config"].get("eos_token_id")
+                if not (isinstance(cur_t_eos, list) and 106 in cur_t_eos):
+                    cfg_data["text_config"]["eos_token_id"] = [1, 106, 50]
+                    changed = True
         if changed:
             tmp_cfg = cfg_path.with_name(f"config.json.tmp.{os.getpid()}")
             tmp_cfg.write_text(
@@ -549,10 +564,32 @@ def _patch_local_checkpoint_config_json(model_dir: pathlib.Path) -> bool:
                 encoding="utf-8",
             )
             os.replace(tmp_cfg, cfg_path)
+            try:
+                os.utime(cfg_path, (orig_cfg_stat.st_atime, orig_cfg_stat.st_mtime))
+            except OSError:
+                pass
             logger.info(
-                "Patched %s on disk (tie_word_embeddings / use_cache=true).",
+                "Patched %s on disk (tie_word_embeddings / use_cache=true / eos_token_id).",
                 cfg_path,
             )
+        if is_gemma4_ckpt:
+            gen_cfg_path = model_dir / "generation_config.json"
+            if gen_cfg_path.exists():
+                gen_data = json.loads(gen_cfg_path.read_text(encoding="utf-8"))
+                gen_eos = gen_data.get("eos_token_id")
+                if not (isinstance(gen_eos, list) and 106 in gen_eos):
+                    gen_data["eos_token_id"] = [1, 106, 50]
+                    tmp_gen = gen_cfg_path.with_name(f"generation_config.json.tmp.{os.getpid()}")
+                    tmp_gen.write_text(json.dumps(gen_data, indent=2, ensure_ascii=False), encoding="utf-8")
+                    os.replace(tmp_gen, gen_cfg_path)
+            tok_cfg_path = model_dir / "tokenizer_config.json"
+            if tok_cfg_path.exists():
+                tok_data = json.loads(tok_cfg_path.read_text(encoding="utf-8"))
+                if tok_data.get("eos_token") != "<turn|>":
+                    tok_data["eos_token"] = "<turn|>"
+                    tmp_tok = tok_cfg_path.with_name(f"tokenizer_config.json.tmp.{os.getpid()}")
+                    tmp_tok.write_text(json.dumps(tok_data, indent=2, ensure_ascii=False), encoding="utf-8")
+                    os.replace(tmp_tok, tok_cfg_path)
         chat_tpl_path = model_dir / "chat_template.jinja"
         if chat_tpl_path.exists() and "26b" in str(model_dir).lower():
             raw_tpl = chat_tpl_path.read_text(encoding="utf-8")
@@ -3300,18 +3337,17 @@ def _configure_lm_eval_thinking_for_task(
     use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
     if use_thinking:
         _install_lm_eval_unclosed_thought_guard()
-    if model_key_prefix == "26b_a4b":
-        tok = getattr(lm_obj, "tokenizer", None)
-        if tok is not None:
-            try:
-                if task_chat_tpl:
-                    tok.eos_token = "<turn|>"
-                    tok.eos_token_id = 106
-                else:
-                    tok.eos_token = "<eos>"
-                    tok.eos_token_id = 1
-            except Exception:
-                pass
+    tok = getattr(lm_obj, "tokenizer", None)
+    if tok is not None:
+        try:
+            if task_chat_tpl:
+                tok.eos_token = "<turn|>"
+                tok.eos_token_id = 106
+            else:
+                tok.eos_token = "<eos>"
+                tok.eos_token_id = 1
+        except Exception:
+            pass
     if effective_use_vllm:
         if hasattr(lm_obj, "enable_thinking"):
             lm_obj.enable_thinking = use_thinking
@@ -5229,7 +5265,7 @@ def evaluate_preflight_gate_metrics(
 
     return {
         "gate_passed": len(reasons) == 0,
-        "needs_conservative_lambda_retry": (ret_delta < -abs(max_mmlu_pro_drop) and ret_delta >= -15.0),
+        "needs_conservative_lambda_retry": (ret_delta < -abs(max_mmlu_pro_drop) and ret_delta >= -25.0),
         "base_arabic_mmlu": round(base_ar_mmlu, 2),
         "avg_base_arabic": round(avg_base_ar, 2),
         "avg_tuned_arabic": round(avg_tuned_ar, 2),
