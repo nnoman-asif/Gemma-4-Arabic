@@ -527,7 +527,8 @@ def generate_all_family_plots(
     x = np.arange(len(labels))
     width = 0.20
 
-    fig1, ax1 = plt.subplots(figsize=(14.5, 7.0), facecolor="#ffffff")
+    fig1_w = 17.5 if len(labels) > 6 else 14.5
+    fig1, ax1 = plt.subplots(figsize=(fig1_w, 7.2), facecolor="#ffffff")
     ax1.set_facecolor("#f8fafc")
     rects1 = ax1.bar(x - 1.5 * width, e4b_base, width, label="E4B Base", color="#94a3b8", edgecolor="#475569")
     rects2 = ax1.bar(x - 0.5 * width, e4b_tuned, width, label="E4B Arabic-Tuned (4.0B Active)", color="#0284c7", edgecolor="#0369a1")
@@ -540,14 +541,21 @@ def generate_all_family_plots(
 
     ax1.set_ylabel("Benchmark Score (%)", fontsize=12, fontweight="bold", color="#0f172a")
     ax1.set_title(
-        f"Gemma-4-Arabic Family: OALL v2 Arabic Benchmark Comparison ({len(labels)} Suites)",
+        f"Gemma-4-Arabic Family: OALL v2 & Thinking Arabic Benchmark Comparison ({len(labels)} Suites)",
         fontsize=14,
         fontweight="bold",
         color="#0f172a",
         pad=16,
     )
     ax1.set_xticks(x)
-    ax1.set_xticklabels(labels, fontsize=11, fontweight="bold", color="#1e293b")
+    ax1.set_xticklabels(
+        labels,
+        fontsize=10.0 if len(labels) > 6 else 11.0,
+        fontweight="bold",
+        color="#1e293b",
+        rotation=15 if len(labels) > 6 else 0,
+        ha="right" if len(labels) > 6 else "center",
+    )
     ax1.set_ylim(y_min_ar, y_max_ar)
     ax1.grid(axis="y", linestyle="--", alpha=0.5, color="#cbd5e1")
     ax1.legend(loc="upper left", frameon=True, facecolor="#ffffff", edgecolor="#cbd5e1", fontsize=10)

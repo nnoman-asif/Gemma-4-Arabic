@@ -68,3 +68,4 @@ Thumbs.db
 # Local-only Hub publishing and sync utilities
 scripts/publish_to_hub.py
 scripts/package_local_sync.py
+scripts/prepare_ties_remerge.py

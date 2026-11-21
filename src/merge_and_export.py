@@ -161,39 +161,126 @@ def apply_ties_interpolation_to_state_dict(
     return merged_state
 
 
+def score_arabic_candidate(
+    base_scores: Dict[str, float],
+    tuned_scores: Dict[str, float],
+    tolerance_pts: float = 0.0,
+) -> Dict[str, Any]:
+    """Rank a TIES merge candidate by `(all_non_negative, non_negative_count, min_delta, mean_gain)`."""
+    deltas = {
+        k: round(float(tuned_scores[k]) - float(base_scores[k]), 2)
+        for k in base_scores
+        if k in tuned_scores
+    }
+    if not deltas:
+        return {
+            "all_non_negative": False,
+            "non_negative_count": 0,
+            "min_delta": -999.0,
+            "mean_gain": -999.0,
+            "deltas": {},
+            "rank_key": (0, 0, -999.0, -999.0),
+        }
+    non_neg_count = sum(1 for d in deltas.values() if d >= -abs(tolerance_pts))
+    all_ok = non_neg_count == len(deltas)
+    min_delta = min(deltas.values())
+    mean_gain = round(sum(deltas.values()) / float(len(deltas)), 4)
+    return {
+        "all_non_negative": all_ok,
+        "non_negative_count": non_neg_count,
+        "min_delta": round(min_delta, 2),
+        "mean_gain": round(mean_gain, 2),
+        "deltas": deltas,
+        "rank_key": (1 if all_ok else 0, non_neg_count, round(min_delta, 2), round(mean_gain, 4)),
+    }
+
+
+def _lookup_sft_tensor(
+    param_name: str,
+    sft_adapter_state: Dict[str, torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Match a live `PeftModel` LoRA parameter name (with `.default.`) against saved `adapter_model.safetensors` keys."""
+    if param_name in sft_adapter_state:
+        return sft_adapter_state[param_name]
+    no_default = param_name.replace(".default.", ".")
+    if no_default in sft_adapter_state:
+        return sft_adapter_state[no_default]
+    for prefix in ("base_model.model.", "model."):
+        for cand in (param_name, no_default):
+            stripped = cand[len(prefix) :] if cand.startswith(prefix) else f"{prefix}{cand}"
+            if stripped in sft_adapter_state:
+                return sft_adapter_state[stripped]
+    return None
+
+
 @torch.no_grad()
 def scale_and_trim_peft_lora_weights(
     model: nn.Module,
     lambda_scale: float = DEFAULT_TIES_LAMBDA,
     density: float = DEFAULT_TIES_DENSITY,
     sft_adapter_state: Optional[Dict[str, torch.Tensor]] = None,
+    sft_weight: float = 0.0,
 ) -> int:
-    """Optionally scale (`lambda_scale`) or TIES-trim (`density`) active LoRA `lora_B` tensors.
+    """Scale (`lambda_scale`), TIES-trim (`density`), and optionally TIES-blend Stage 1 SFT + Stage 2 DPO LoRA weights.
 
-    When `lambda_scale == 1.0`, `density == 1.0`, and `sft_adapter_state is None` (default),
+    When `lambda_scale == 1.0`, `density == 1.0`, and (`sft_adapter_state is None` or `sft_weight <= 0.0`),
     performs a lossless no-op (`return 0`) so 100% of trained Stage 2 DPO 2D & 3D MoE LoRA
     weights merge cleanly without unstructured rank sparsification.
     """
-    if abs(float(lambda_scale) - 1.0) < 1e-7 and float(density) >= 1.0 and sft_adapter_state is None:
+    w_sft = max(0.0, min(1.0, float(sft_weight))) if sft_adapter_state is not None else 0.0
+    if abs(float(lambda_scale) - 1.0) < 1e-7 and float(density) >= 1.0 and w_sft <= 1e-7:
         logger.info("Lossless LoRA merge selected (lambda=1.00, density=1.00); preserving exact adapter weights.")
         return 0
 
     modified_count = 0
+    blended_sft_b_count = 0
     for name, param in model.named_parameters():
-        if "lora_B" in name and ".ref." not in name and not name.endswith(".ref"):
-            updated = param.data
-            if float(density) < 1.0:
+        if ".ref." in name or name.endswith(".ref"):
+            continue
+        if w_sft > 1e-7 and sft_adapter_state is not None and "lora_A" in name:
+            sft_a = _lookup_sft_tensor(name, sft_adapter_state)
+            if sft_a is not None and tuple(sft_a.shape) == tuple(param.data.shape):
+                blended_a = (
+                    w_sft * sft_a.to(device=param.data.device, dtype=torch.float32)
+                    + (1.0 - w_sft) * param.data.to(dtype=torch.float32)
+                )
+                param.data.copy_(blended_a.to(dtype=param.data.dtype))
+        elif "lora_B" in name:
+            updated = param.data.to(dtype=torch.float32)
+            if w_sft > 1e-7 and sft_adapter_state is not None:
+                sft_b = _lookup_sft_tensor(name, sft_adapter_state)
+                if sft_b is not None and tuple(sft_b.shape) == tuple(param.data.shape):
+                    updated = ties_merge_deltas(
+                        deltas=[
+                            sft_b.to(device=param.data.device, dtype=torch.float32),
+                            updated,
+                        ],
+                        weights=[w_sft, 1.0 - w_sft],
+                        density=float(density),
+                    )
+                    blended_sft_b_count += 1
+                elif float(density) < 1.0:
+                    updated = ties_trim_tensor(updated, density=float(density))
+            elif float(density) < 1.0:
                 updated = ties_trim_tensor(updated, density=float(density))
+
             if abs(float(lambda_scale) - 1.0) >= 1e-7:
                 updated = updated * float(lambda_scale)
-            param.data.copy_(updated)
+            param.data.copy_(updated.to(dtype=param.data.dtype))
             modified_count += 1
 
+    if w_sft > 1e-7 and sft_adapter_state is not None and modified_count > 0 and blended_sft_b_count == 0:
+        raise RuntimeError(
+            "Requested SFT+DPO TIES blend (`sft_weight > 0`), but 0 `lora_B` tensors matched `sft_adapter_state`!"
+        )
+
     logger.info(
-        "Scaled/trimmed %d lora_B tensors (lambda=%.2f, density=%.2f).",
+        "Scaled/trimmed %d lora_B tensors (lambda=%.2f, density=%.2f, sft_weight=%.2f, sft_matched=%d).",
         modified_count,
         float(lambda_scale),
         float(density),
+        w_sft,
+        blended_sft_b_count,
     )
     return modified_count
 
@@ -578,7 +665,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--sft-adapter-dir",
         type=str,
         default=None,
-        help="Optional Stage 1 SFT adapter directory (used only for intermediate checkpoint cleanup unless explicit TIES is requested).",
+        help="Optional Stage 1 SFT adapter directory (for SFT+DPO TIES blending when --sft-weight > 0 and checkpoint cleanup).",
+    )
+    parser.add_argument(
+        "--sft-weight",
+        type=float,
+        default=0.0,
+        help="Weight in [0.0, 1.0] assigned to Stage 1 SFT during SFT+DPO TIES blending (default: 0.0 = pure Stage 2 adapter).",
     )
     parser.add_argument(
         "--output-dir",
@@ -762,13 +855,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         if torch.cuda.is_available()
         else 0.0
     )
+    sft_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    effective_adapter_path = adapter_path
+    eff_sft_weight = max(0.0, min(1.0, float(args.sft_weight)))
+    if args.sft_adapter_dir and eff_sft_weight > 1e-7:
+        sft_dir_path = pathlib.Path(args.sft_adapter_dir)
+        sft_st_file = sft_dir_path / "adapter_model.safetensors"
+        if not sft_st_file.is_file():
+            raise FileNotFoundError(
+                f"--sft-weight={eff_sft_weight:.2f} requested, but Stage 1 SFT safetensors not found at '{sft_st_file}'!"
+            )
+        if eff_sft_weight >= 1.0 - 1e-7:
+            effective_adapter_path = sft_dir_path
+            eff_sft_weight = 0.0
+            logger.info("sft_weight=1.00 -> loading Stage 1 SFT adapter directly from %s.", effective_adapter_path)
+        else:
+            from safetensors.torch import load_file as load_safetensors_file
+
+            sft_state_dict = load_safetensors_file(str(sft_st_file), device="cpu")
+            logger.info(
+                "Loaded %d Stage 1 SFT tensors from %s for TIES blending (sft_weight=%.2f, dpo_weight=%.2f).",
+                len(sft_state_dict),
+                sft_st_file,
+                eff_sft_weight,
+                1.0 - eff_sft_weight,
+            )
+
     use_4bit_for_merge = bool(is_moe or args.offload_to_cpu or gpu_total_gb < 24.0)
     model, tokenizer, offload_state = load_gemma4_8gb_model_and_tokenizer(
         model_name=args.base_model,
         max_seq_length=DEFAULT_MAX_SEQ_LENGTH,
         load_in_4bit=use_4bit_for_merge,
         attach_lora=False,
-        adapter_checkpoint=str(adapter_path),
+        adapter_checkpoint=str(effective_adapter_path),
         is_trainable=False,
         offload_ple_to_cpu=bool(args.offload_to_cpu),
         offload_multimodal_towers_to_cpu=bool(args.offload_to_cpu),
@@ -778,8 +897,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         model=model,
         lambda_scale=args.lambda_scale,
         density=args.density,
-        sft_adapter_state=None,
+        sft_adapter_state=sft_state_dict,
+        sft_weight=eff_sft_weight,
     )
+    sft_state_dict = None
     restored_modules: List[str] = []
     if offload_state.ple_module_names or offload_state.multimodal_module_names:
         restored_modules = restore_multimodal_towers(
@@ -803,7 +924,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     manifest = {
         "base_model": args.base_model,
-        "adapter_dir": str(adapter_path),
+        "adapter_dir": str(effective_adapter_path),
+        "sft_adapter_dir": str(args.sft_adapter_dir) if args.sft_adapter_dir else None,
+        "sft_weight": round(float(args.sft_weight), 4),
         "lambda_scale": args.lambda_scale,
         "density": args.density,
         "modified_lora_b_tensors": modified,

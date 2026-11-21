@@ -109,6 +109,51 @@ arabic_benchmarks:
     num_fewshot: 0
     description: "Arabic safety, truthfulness, and trustworthiness evaluation"
 
+  MMLU-ProX-Ar:
+    runner: "lm_eval"
+    lm_eval_task: "mmlu_prox_lite_ar"
+    lighteval_task: "lm_eval|mmlu_prox_lite_ar|5"
+    metric: "exact_match,custom-extract"
+    num_fewshot: 5
+    enable_thinking: true
+    description: "Official MMLU-ProX-Lite Arabic 10-choice multi-step Thinking CoT across 14 disciplines (li-lab/MMLU-ProX-Lite)"
+
+  MMMLU-Ar-STEM:
+    runner: "inspect_evals"
+    inspect_task: "inspect_evals/mmlu_0_shot"
+    lm_eval_task: "inspect_evals/mmlu_0_shot:AR_XY_STEM"
+    lighteval_task: "inspect_evals|mmlu_0_shot:AR_XY_STEM|0"
+    mmmlu_language: "AR_XY"
+    mmmlu_subjects:
+      - "abstract_algebra"
+      - "college_computer_science"
+      - "college_mathematics"
+      - "college_physics"
+      - "econometrics"
+      - "formal_logic"
+    metric: "accuracy"
+    num_fewshot: 0
+    epochs: 1
+    enable_thinking: true
+    description: "Official OpenAI MMMLU Arabic (AR_XY) 0-shot Thinking CoT across Algebra, CS, Math, Physics, Econometrics, and Formal Logic"
+
+  MMMLU-Ar-Law-Prof:
+    runner: "inspect_evals"
+    inspect_task: "inspect_evals/mmlu_0_shot"
+    lm_eval_task: "inspect_evals/mmlu_0_shot:AR_XY_LAW_PROF"
+    lighteval_task: "inspect_evals|mmlu_0_shot:AR_XY_LAW_PROF|0"
+    mmmlu_language: "AR_XY"
+    mmmlu_subjects:
+      - "international_law"
+      - "jurisprudence"
+      - "professional_accounting"
+      - "professional_medicine"
+    metric: "accuracy"
+    num_fewshot: 0
+    epochs: 1
+    enable_thinking: true
+    description: "Official OpenAI MMMLU Arabic (AR_XY) 0-shot Thinking CoT across Jurisprudence, International Law, Medicine, and Accounting"
+
 retention_anchors:
   MMLU-Pro:
     runner: "lm_eval"

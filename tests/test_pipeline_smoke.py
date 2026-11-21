@@ -218,8 +218,11 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(dpo_e4b_cfg["dpo"]["max_length"], 3072)
         self.assertEqual(dpo_26b_cfg["dpo"]["max_length"], 3072)
 
-        self.assertEqual(len(eval_cfg["arabic_benchmarks"]), 6)
+        self.assertEqual(len(eval_cfg["arabic_benchmarks"]), 9)
         self.assertNotIn("MGSM-Ar", eval_cfg["arabic_benchmarks"])
+        for ar_think_name in ("MMLU-ProX-Ar", "MMMLU-Ar-STEM", "MMMLU-Ar-Law-Prof"):
+            self.assertIn(ar_think_name, eval_cfg["arabic_benchmarks"])
+            self.assertTrue(eval_cfg["arabic_benchmarks"][ar_think_name]["enable_thinking"])
         self.assertEqual(len(eval_cfg["retention_anchors"]), 4)
 
     def test_02_gemma4_chat_template_thinking_tokens(self) -> None:
@@ -805,19 +808,20 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(
             _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=True),
             {
-                "max_gen_toks": 24576,
+                "max_gen_toks": 10240,
                 "temperature": 1.0,
                 "top_p": 0.95,
                 "top_k": 64,
                 "do_sample": True,
-                "until": ["<turn|>", "<end_of_turn>", "<eos>", "</s>", "<|im_end|>"],
+                "until": ["<turn|>"],
+                "stop_token_ids": [1, 106, 50],
                 "skip_special_tokens": False,
             },
         )
         self.assertEqual(
             _get_lm_eval_gen_kwargs("mmlu_pro", model_key_prefix="26b_a4b", use_vllm=False),
             {
-                "max_gen_toks": 24576,
+                "max_gen_toks": 10240,
                 "temperature": 1.0,
                 "top_p": 0.95,
                 "top_k": 64,
@@ -3296,6 +3300,128 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
             )
             series = _load_training_curve_series(str_metrics, ("loss",))
             self.assertEqual(series, ([10.0, 20.0], [2.105, 1.204]))
+
+    def test_34_arabic_thinking_benchmarks_fast_vllm_and_sft_dpo_ties_blend(self) -> None:
+        """Verify 3 official Arabic Thinking benchmarks, single-GPU fast vLLM kwargs, and SFT+DPO TIES blending."""
+        from scripts.run_benchmarks import (
+            _build_vllm_fast_engine_kwargs,
+            _get_lm_eval_gen_kwargs,
+            _normalize_arabic_mmlu_prox_postprocess,
+            _resolve_selected_suites,
+            _uses_multiturn_fewshot,
+            load_eval_config,
+            normalize_inspect_completion_for_scoring,
+        )
+        from src.merge_and_export import scale_and_trim_peft_lora_weights, score_arabic_candidate
+
+        # 1. Verify single-GPU (`TP=1`) fast vLLM kwargs & integer `stop_token_ids=[1, 106, 50]`
+        fast_kw = _build_vllm_fast_engine_kwargs(
+            gpu_memory_utilization=0.95,
+            max_num_seqs=256,
+            max_num_batched_tokens=16384,
+        )
+        self.assertAlmostEqual(fast_kw["gpu_memory_utilization"], 0.95, places=3)
+        if "async_scheduling" in fast_kw:
+            self.assertTrue(fast_kw["async_scheduling"])
+
+        vllm_gen = _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=True, max_model_len=16384)
+        assert vllm_gen is not None
+        self.assertEqual(vllm_gen["max_gen_toks"], 10240)
+        self.assertEqual(vllm_gen["until"], ["<turn|>"])
+        self.assertEqual(vllm_gen["stop_token_ids"], [1, 106, 50])
+        self.assertFalse(vllm_gen["skip_special_tokens"])
+
+        prox_gen = _get_lm_eval_gen_kwargs("mmlu_prox_lite_ar", use_vllm=True, max_model_len=16384)
+        assert prox_gen is not None
+        self.assertEqual(prox_gen["stop_token_ids"], [1, 106, 50])
+        self.assertNotIn("سؤال:", prox_gen["until"])
+
+        hf_gen = _get_lm_eval_gen_kwargs("mmlu_pro", use_vllm=False, max_model_len=16384)
+        assert hf_gen is not None
+        self.assertNotIn("stop_token_ids", hf_gen)
+
+        # 2. Verify `fewshot_as_multiturn` is True for `mmlu_pro` and False for `mmlu_prox_lite_ar`
+        self.assertTrue(_uses_multiturn_fewshot("mmlu_pro", True))
+        self.assertFalse(_uses_multiturn_fewshot("mmlu_prox_lite_ar", True))
+        self.assertFalse(_uses_multiturn_fewshot("mmlu_prox_ar", True))
+
+        # 3. Verify symmetric Arabic answer normalization for `mmlu_prox_lite_ar` and `inspect_evals/mmlu_0_shot`
+        self.assertEqual(
+            _normalize_arabic_mmlu_prox_postprocess("بناءً على ذلك، الإجابة هي: **(C)**"),
+            "بناءً على ذلك، الإجابة هي (C)",
+        )
+        self.assertEqual(
+            normalize_inspect_completion_for_scoring(
+                "<|channel>thought\nنحلل الخيارات.\n<channel|>الإجابة الصحيحة هي: **(ج)**",
+                is_arabic_mcq=True,
+            ),
+            "الإجابة الصحيحة هي: **(ج)**\nANSWER: C",
+        )
+        self.assertEqual(
+            normalize_inspect_completion_for_scoring(
+                "<|channel>thought\nCheck B.\n<channel|>Therefore,\nANSWER: B",
+                is_arabic_mcq=True,
+            ),
+            "Therefore,\nANSWER: B",
+        )
+
+        # 4. Verify `--tasks` shorthands resolve all 3 new Arabic Thinking benchmarks
+        cfg = load_eval_config(PROJECT_ROOT / "configs" / "eval_config.yaml")
+        sel_ar, sel_ret = _resolve_selected_suites(cfg, "mmluproxar,mmmlustem,mmmlulaw,mmlupro") or ([], [])
+        self.assertEqual(sel_ar, ["MMLU-ProX-Ar", "MMMLU-Ar-STEM", "MMMLU-Ar-Law-Prof"])
+        self.assertEqual(sel_ret, ["MMLU-Pro"])
+
+        # 5. Verify SFT+DPO TIES blending across `.default.` PEFT parameter names (2D + 3D MoE)
+        class _MockPeftModule(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lora_A = nn.ModuleDict({"default": nn.Linear(4, 2, bias=False)})
+                self.lora_B = nn.ModuleDict(
+                    {
+                        "default": nn.Linear(2, 4, bias=False),
+                        "ref": nn.Linear(2, 4, bias=False),
+                    }
+                )
+                with torch.no_grad():
+                    self.lora_A["default"].weight.fill_(1.0)
+                    self.lora_B["default"].weight.copy_(
+                        torch.tensor([[4.0, 0.02], [-4.0, -0.01], [2.0, 0.01], [-2.0, -0.02]])
+                    )
+                    self.lora_B["ref"].weight.fill_(9.0)
+
+        mock_m = _MockPeftModule()
+        sft_state = {
+            "lora_A.weight": torch.full((2, 4), 3.0),
+            "lora_B.weight": torch.tensor([[2.0, -0.01], [-2.0, 0.01], [4.0, -0.02], [-4.0, 0.02]]),
+        }
+        mod_cnt = scale_and_trim_peft_lora_weights(
+            model=mock_m,
+            lambda_scale=0.50,
+            density=0.50,
+            sft_adapter_state=sft_state,
+            sft_weight=0.50,
+        )
+        self.assertEqual(mod_cnt, 1)
+        self.assertTrue(torch.allclose(mock_m.lora_A["default"].weight, torch.full((2, 4), 2.0)))
+        self.assertTrue(torch.allclose(mock_m.lora_B["ref"].weight, torch.full((4, 2), 9.0)))
+        # Bottom-50% tiny entries (`0.01`/`0.02`) must be trimmed to exact 0.0, top-50% blended (`3.0 * 0.5 = 1.5`)!
+        self.assertTrue(torch.allclose(mock_m.lora_B["default"].weight[:, 1], torch.zeros(4)))
+        self.assertTrue(
+            torch.allclose(
+                mock_m.lora_B["default"].weight[:, 0],
+                torch.tensor([1.5, -1.5, 1.5, -1.5]),
+            )
+        )
+
+        # 6. Verify `score_arabic_candidate` strictly prefers 6/6 non-negative Arabic suites
+        base_6 = {"ArabicMMLU": 76.51, "MadinahQA": 65.98, "AlGhafa": 76.92, "ACVA": 81.82, "EXAMS-AR": 59.96, "AraTrust": 91.65}
+        dip_6 = {"ArabicMMLU": 77.05, "MadinahQA": 81.95, "AlGhafa": 77.12, "ACVA": 82.04, "EXAMS-AR": 59.78, "AraTrust": 89.90}
+        clean_6 = {"ArabicMMLU": 77.10, "MadinahQA": 77.50, "AlGhafa": 77.15, "ACVA": 82.00, "EXAMS-AR": 60.15, "AraTrust": 91.84}
+        r_dip = score_arabic_candidate(base_6, dip_6)
+        r_clean = score_arabic_candidate(base_6, clean_6)
+        self.assertFalse(r_dip["all_non_negative"])
+        self.assertTrue(r_clean["all_non_negative"])
+        self.assertGreater(r_clean["rank_key"], r_dip["rank_key"])
 
 
 if __name__ == "__main__":

@@ -177,6 +177,9 @@ GROUP_SUBTASK_COUNTS: Dict[str, int] = {
     "arabic_leaderboard_alghafa_light": 9,
     "arabic_leaderboard_acva_light": len(ACVA_CORE_SUBTASKS),
     "mmlu_pro": 14,
+    "mmlu_prox_lite_ar": 14,
+    "mmlu_prox_ar": 14,
+    "mmlu_prox_lite_en": 14,
 }
 
 # Full-dataset LightEval task definitions for the 6 OALL v2 Arabic benchmarks
@@ -400,15 +403,57 @@ def _enable_vllm_language_model_only_default() -> bool:
         return False
 
 
-def _vllm_supports_language_model_only() -> bool:
-    """Return True if installed `vllm.engine.arg_utils.EngineArgs` exposes `language_model_only`."""
+def _get_supported_vllm_engine_fields() -> set:
+    """Return the set of valid `vllm.engine.arg_utils.EngineArgs` dataclass field names when vLLM is installed."""
     try:
         import dataclasses
         from vllm.engine.arg_utils import EngineArgs
 
-        return "language_model_only" in {f.name for f in dataclasses.fields(EngineArgs)}
+        return {f.name for f in dataclasses.fields(EngineArgs)}
     except Exception:
-        return False
+        return set()
+
+
+def _vllm_supports_language_model_only() -> bool:
+    """Return True if installed `vllm.engine.arg_utils.EngineArgs` exposes `language_model_only`."""
+    return "language_model_only" in _get_supported_vllm_engine_fields()
+
+
+def _build_vllm_fast_engine_kwargs(
+    gpu_memory_utilization: float = 0.95,
+    max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 16384,
+    enable_async_scheduling: bool = True,
+    enable_chunked_prefill: bool = True,
+    for_inspect_cli: bool = False,
+) -> Dict[str, Any]:
+    """Build single-GPU (`TP=1`) high-throughput vLLM engine kwargs validated against installed `EngineArgs`."""
+    fields = _get_supported_vllm_engine_fields()
+    kw: Dict[str, Any] = {
+        "gpu_memory_utilization": float(gpu_memory_utilization),
+    }
+    if not fields:
+        # Safe defaults when inspected in dry-run / unit-test environments without vLLM installed
+        if not for_inspect_cli:
+            kw["max_num_seqs"] = int(max_num_seqs)
+            kw["max_num_batched_tokens"] = int(max_num_batched_tokens)
+            if enable_async_scheduling:
+                kw["async_scheduling"] = True
+            if enable_chunked_prefill:
+                kw["enable_chunked_prefill"] = True
+        return kw
+
+    if "language_model_only" in fields:
+        kw["language_model_only"] = True
+    if "max_num_seqs" in fields:
+        kw["max_num_seqs"] = int(max_num_seqs)
+    if "max_num_batched_tokens" in fields and not for_inspect_cli:
+        kw["max_num_batched_tokens"] = int(max_num_batched_tokens)
+    if enable_chunked_prefill and "enable_chunked_prefill" in fields and not for_inspect_cli:
+        kw["enable_chunked_prefill"] = True
+    if enable_async_scheduling and "async_scheduling" in fields:
+        kw["async_scheduling"] = True
+    return kw
 
 
 def _find_free_localhost_port() -> int:
@@ -772,19 +817,44 @@ def clean_gemma4_completion(text: str, drop_unclosed_thought: bool = True) -> st
     return s.strip()
 
 
-def normalize_inspect_completion_for_scoring(text: str, is_aime: bool = False) -> str:
-    """Clean Gemma 4 completions for `inspect_evals` (`GPQA-Diamond` & `AIME-2026`).
+_ARABIC_CHOICE_LETTER_MAP: Dict[str, str] = {
+    "أ": "A",
+    "ا": "A",
+    "ب": "B",
+    "ج": "C",
+    "د": "D",
+}
 
-    In addition to stripping any residual thought channels or turn markers, converts standalone
-    LaTeX `\\[` / `\\]` display-math fence lines into `$$` when `is_aime=True` because upstream
-    `inspect_evals` `aime_scorer` skips trailing `$$` lines when locating the final `\\boxed{N}`
-    line, whereas a trailing `\\]` line otherwise masks `\\boxed{N}` on the line immediately above.
+
+def normalize_inspect_completion_for_scoring(
+    text: str,
+    is_aime: bool = False,
+    is_arabic_mcq: bool = False,
+) -> str:
+    """Clean Gemma 4 completions for `inspect_evals` (`GPQA-Diamond`, `AIME-2026`, and `MMMLU` Arabic CoT).
+
+    In addition to stripping any residual thought channels or turn markers:
+    1. Converts standalone LaTeX `\\[` / `\\]` display-math fence lines into `$$` when `is_aime=True` because
+       upstream `inspect_evals` `aime_scorer` skips trailing `$$` lines when locating the final `\\boxed{N}`.
+    2. When `is_arabic_mcq=True` (`openai/MMMLU` `AR_XY` CoT) and English `ANSWER:` is absent while an explicit
+       Arabic answer phrase (`الإجابة هي (C)` / `الإجابة: ج` / `الجواب: B`) is present, appends canonical
+       `ANSWER: <A-D>` symmetrically for both Base and Tuned so valid Arabic answers match `inspect_ai`'s regex.
     """
     cleaned = clean_gemma4_completion(text, drop_unclosed_thought=True)
     if not cleaned:
         return ""
     if is_aime:
         cleaned = re.sub(r"(?m)^[ \t]*\\[\[\]][ \t\.,;]*$", "$$", cleaned)
+    if is_arabic_mcq and not re.search(r"(?i)\bANSWER\s*:", cleaned):
+        ar_matches = re.findall(
+            r"(?:الإجابة|الاجابة|الجواب)(?:\s+(?:الصحيحة|النهائية|النهائي))?(?:\s+هي|\s+هو)?\s*:?\s*\*{0,2}\s*[\(\[]?([A-Da-dأابجد])[\)\]]?\s*\*{0,2}",
+            cleaned,
+        )
+        if ar_matches:
+            raw_ch = ar_matches[-1].strip()
+            mapped = _ARABIC_CHOICE_LETTER_MAP.get(raw_ch, raw_ch.upper())
+            if mapped in ("A", "B", "C", "D"):
+                cleaned = f"{cleaned.rstrip()}\nANSWER: {mapped}"
     return cleaned.strip()
 
 
@@ -2664,9 +2734,15 @@ def run_inspect_evals_subprocess(
             load_target_path = resolved_dir.as_posix()
 
     is_26b = "26b" in str(load_target_path).lower() or "26b" in str(tag).lower()
-    inspect_max_model_len = 32768
-    inspect_max_tokens = 28672
-    inspect_max_conns = 32 if is_26b else 64
+    needs_long_olympiad_ctx = any(
+        ("gpqa" in str(sp.get("lm_eval_task", "")).lower())
+        or ("aime" in str(sp.get("lm_eval_task", "")).lower())
+        or sname.strip().lower().startswith(("gpqa", "aime"))
+        for sname, sp in suite_specs.items()
+    )
+    inspect_max_model_len = 32768 if needs_long_olympiad_ctx else 16384
+    inspect_max_tokens = 28672 if needs_long_olympiad_ctx else 10240
+    inspect_max_conns = (48 if not needs_long_olympiad_ctx else 32) if is_26b else (96 if not needs_long_olympiad_ctx else 64)
 
     logger.info(
         "[%s] Running Inspect Evals on %s (backend=%s, max_model_len=%d, max_tokens=%d, limit=%s)...",
@@ -2693,6 +2769,7 @@ for _n in ("httpx", "httpcore", "urllib3", "datasets", "huggingface_hub"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 sys.path.insert(0, {repr(str(PROJECT_ROOT))})
 from scripts.run_benchmarks import (
+    _build_vllm_fast_engine_kwargs,
     _destroy_vllm_and_free_vram,
     _prepare_gemma4_config_for_load,
     _vllm_supports_language_model_only,
@@ -2714,13 +2791,21 @@ except Exception:
         pass
 
 @solver
-def _gemma4_clean_solver(inner_solver: Solver, is_aime: bool = False) -> Solver:
+def _gemma4_clean_solver(
+    inner_solver: Solver,
+    is_aime: bool = False,
+    is_arabic_mcq: bool = False,
+) -> Solver:
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         async def wrapped_generate(s: TaskState, *args, **kwargs) -> TaskState:
             s = await generate(s, *args, **kwargs)
             if s.output and s.output.completion:
                 raw_c = s.output.completion
-                cleaned = normalize_inspect_completion_for_scoring(raw_c, is_aime=is_aime)
+                cleaned = normalize_inspect_completion_for_scoring(
+                    raw_c,
+                    is_aime=is_aime,
+                    is_arabic_mcq=is_arabic_mcq,
+                )
                 if cleaned != raw_c:
                     s.output.completion = cleaned
                     if getattr(s, "messages", None):
@@ -2760,13 +2845,15 @@ try:
         try:
             vllm_args = {{
                 "dtype": "bfloat16",
-                "gpu_memory_utilization": 0.90,
                 "max_model_len": {int(inspect_max_model_len)},
                 "trust_remote_code": True,
                 "timeout": 1200,
+                **_build_vllm_fast_engine_kwargs(
+                    gpu_memory_utilization=0.95,
+                    max_num_seqs=max(128, {int(inspect_max_conns)} * 2),
+                    for_inspect_cli=True,
+                ),
             }}
-            if _vllm_supports_language_model_only():
-                vllm_args["language_model_only"] = True
             if has_gemma4_parser:
                 vllm_args["reasoning_parser"] = "gemma4"
             gen_cfg = GenerateConfig(
@@ -2789,8 +2876,8 @@ try:
             _destroy_vllm_and_free_vram()
             vllm_args = {{
                 "dtype": "bfloat16",
-                "gpu_memory_utilization": 0.90,
-                "max_model_len": 24576,
+                "gpu_memory_utilization": 0.92,
+                "max_model_len": min(24576, {int(inspect_max_model_len)}),
                 "trust_remote_code": True,
                 "timeout": 1200,
             }}
@@ -2799,7 +2886,7 @@ try:
             if has_gemma4_parser:
                 vllm_args["reasoning_parser"] = "gemma4"
             gen_cfg = GenerateConfig(
-                max_tokens=20480,
+                max_tokens=min(20480, {int(inspect_max_tokens)}),
                 temperature=1.0,
                 top_p=0.95,
                 max_connections=max(16, {int(inspect_max_conns)} // 2),
@@ -2827,7 +2914,7 @@ try:
     eval_sig_params = inspect.signature(inspect_eval).parameters
 
     for sname, spec in suite_specs.items():
-        task_id = str(spec.get("lm_eval_task", "")).strip().lower()
+        task_id = str(spec.get("inspect_task") or spec.get("lm_eval_task") or "").strip().lower()
         epochs = int(spec.get("epochs", 1))
         if "gpqa" in task_id or sname.strip().lower().startswith("gpqa"):
             from inspect_evals.gpqa import gpqa_diamond
@@ -2835,6 +2922,7 @@ try:
             task_obj.solver = _gemma4_clean_solver(
                 chain(task_obj.solver) if isinstance(task_obj.solver, list) else task_obj.solver,
                 is_aime=False,
+                is_arabic_mcq=False,
             )
         elif "aime" in task_id or sname.strip().lower().startswith("aime"):
             from inspect_evals.aime2026 import aime2026
@@ -2842,6 +2930,28 @@ try:
             task_obj.solver = _gemma4_clean_solver(
                 chain(task_obj.solver) if isinstance(task_obj.solver, list) else task_obj.solver,
                 is_aime=True,
+                is_arabic_mcq=False,
+            )
+        elif "mmlu_0_shot" in task_id or sname.strip().lower().startswith("mmmlu"):
+            from inspect_evals.mmlu import mmlu_0_shot
+            mmmlu_lang = str(spec.get("mmmlu_language") or "AR_XY")
+            raw_subjs = spec.get("mmmlu_subjects") or []
+            subj_list = list(raw_subjs) if isinstance(raw_subjs, (list, tuple)) else [str(raw_subjs)]
+            task_obj = mmlu_0_shot(
+                language=mmmlu_lang,
+                subjects=subj_list,
+                cot=True,
+                shuffle=False,
+            )
+            task_obj.config = GenerateConfig(
+                max_tokens=10240,
+                temperature=1.0,
+                top_p=0.95,
+            )
+            task_obj.solver = _gemma4_clean_solver(
+                chain(task_obj.solver) if isinstance(task_obj.solver, list) else task_obj.solver,
+                is_aime=False,
+                is_arabic_mcq=mmmlu_lang.upper().startswith("AR"),
             )
         else:
             raise ValueError(f"Unsupported inspect_evals task for suite '{{sname}}': {{task_id}}")
@@ -3105,7 +3215,7 @@ try:
         vllm_cfg = VLLMModelConfig(
             model_name={repr(load_target_path)},
             dtype="bfloat16",
-            gpu_memory_utilization=0.90,
+            gpu_memory_utilization=0.95,
             max_model_length=lcb_max_model_len,
             max_num_seqs={int(lcb_max_num_seqs)},
             max_num_batched_tokens={int(lcb_batched_toks)},
@@ -3229,20 +3339,63 @@ finally:
     return parsed_out
 
 
+def _is_lm_eval_thinking_task(task_name: str) -> bool:
+    """Return True for `lm_eval` generative Chain-of-Thought tasks (`mmlu_pro` and `mmlu_prox*`)."""
+    clean = str(task_name or "").strip().lower()
+    return clean == "mmlu_pro" or clean.startswith("mmlu_prox")
+
+
+def _uses_multiturn_fewshot(task_name: str, task_chat_tpl: bool) -> bool:
+    """Return True iff `task_name` supplies non-empty `fewshot_config.doc_to_target` for multi-turn chat fewshot.
+
+    Upstream `lm_eval/tasks/mmlu_prox/*` sets `fewshot_config.doc_to_target: ""` and embeds both question and
+    CoT answer inside `fewshot_to_text`, so `fewshot_as_multiturn` MUST be `False` on `mmlu_prox*` to avoid
+    injecting 5 empty `{"role": "assistant", "content": ""}` turns!
+    """
+    if not task_chat_tpl:
+        return False
+    return not str(task_name or "").strip().lower().startswith("mmlu_prox")
+
+
+def _normalize_arabic_mmlu_prox_postprocess(text: str) -> str:
+    """Normalize Markdown bolding/colons around `الإجابة هي (X)` symmetrically for `mmlu_prox_*_ar` regex extraction."""
+    if not text or ("الإجابة" not in text and "الاجابة" not in text):
+        return text
+    out = re.sub(
+        r"(?:الإجابة|الاجابة)\s+هي\s*:?\s*\*{0,2}\s*[\(\[]?([A-Ja-jأابجدهوزحطي])[\)\]]?\s*\*{0,2}",
+        lambda m: f"الإجابة هي ({_ARABIC_CHOICE_LETTER_MAP.get(m.group(1), m.group(1).upper())})",
+        text,
+    )
+    return out
+
+
 def _get_lm_eval_gen_kwargs(
     task_name: str,
     model_key_prefix: str = "e4b",
     use_vllm: bool = True,
-    max_model_len: int = 32768,
+    max_model_len: int = 16384,
 ) -> Optional[Dict[str, Any]]:
-    """Return official Gemma 4 Thinking Mode `generation_kwargs` for `lm_eval` generative tasks (`mmlu_pro`)."""
+    """Return fast, zero-compromise Gemma 4 Thinking Mode `generation_kwargs` for `mmlu_pro` & `mmlu_prox*`."""
     _ = model_key_prefix
-    clean = task_name.strip().lower()
-    if clean == "mmlu_pro":
-        # Reserve 8,192 tokens for 5-shot CoT multiturn prompts so lm_eval's maybe_truncate
-        # never left-truncates prompts while granting up to 24,576 reasoning+answer tokens.
-        eff_gen_budget = max(4096, min(24576, int(max_model_len) - 8192))
-        kw: Dict[str, Any] = {
+    if _is_lm_eval_thinking_task(task_name):
+        # Default `max_model_len=16384` reserves 6,144 prompt tokens -> `max_gen_toks=10240`
+        # (capping >10k runaway outliers while scaling proportionally if a larger window is explicitly passed).
+        prompt_reserve = 8192 if int(max_model_len) >= 24576 else 6144
+        eff_gen_budget = max(4096, min(24576, int(max_model_len) - prompt_reserve))
+        if use_vllm:
+            # Single `<turn|>` string + integer `stop_token_ids=[1, 106, 50]` halts in O(1) C++ without
+            # multi-string per-token detokenization or mid-thought `"سؤال:"`/`"Q:"` truncation!
+            return {
+                "max_gen_toks": eff_gen_budget,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 64,
+                "do_sample": True,
+                "until": ["<turn|>"],
+                "stop_token_ids": [1, 106, 50],
+                "skip_special_tokens": False,
+            }
+        return {
             "max_gen_toks": eff_gen_budget,
             "temperature": 1.0,
             "top_p": 0.95,
@@ -3256,9 +3409,6 @@ def _get_lm_eval_gen_kwargs(
                 "<|im_end|>",
             ],
         }
-        if use_vllm:
-            kw["skip_special_tokens"] = False
-        return kw
     return None
 
 
@@ -3285,7 +3435,11 @@ def _install_lm_eval_unclosed_thought_guard() -> None:
             and ("<|channel>thought" in generation or generation.lstrip().startswith("<|channel>"))
         ):
             return ""
-        return orig_fn(generation, stop, think_end_token)
+        res = orig_fn(generation, stop, think_end_token)
+        for eot in ("<turn|>", "<eos>", "<end_of_turn>", "<|im_end|>", "</s>"):
+            if eot in res:
+                res = res.split(eot, 1)[0]
+        return _normalize_arabic_mmlu_prox_postprocess(res.strip())
 
     setattr(_guarded_postprocess_generated_text, "_gemma4_unclosed_thought_guarded", True)
     lm_utils.postprocess_generated_text = _guarded_postprocess_generated_text
@@ -3306,7 +3460,7 @@ def _should_apply_chat_template_for_task(
     apply_chat_template: bool,
     model_key_prefix: str = "e4b",
 ) -> bool:
-    """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`) and `False` for completion/log-likelihood tasks."""
+    """Return `True` (when `apply_chat_template` is enabled) for chat-instruct tasks (`mmlu_pro`, `mmlu_prox*`) and `False` for completion/log-likelihood tasks."""
     _ = model_key_prefix
     clean = task_name.strip().lower()
     if clean in (
@@ -3333,8 +3487,9 @@ def _configure_lm_eval_thinking_for_task(
     task_name: str = "",
     model_key_prefix: str = "e4b",
 ) -> None:
-    """Configure `enable_thinking=True` and `think_end_token='<channel|>'` for `mmlu_pro` across `VLLM` and `HFLM`."""
-    use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
+    """Configure `enable_thinking=True` and `think_end_token='<channel|>'` for `mmlu_pro` & `mmlu_prox*` across `VLLM` and `HFLM`."""
+    _ = model_key_prefix
+    use_thinking = bool(task_chat_tpl) and _is_lm_eval_thinking_task(task_name)
     if use_thinking:
         _install_lm_eval_unclosed_thought_guard()
     tok = getattr(lm_obj, "tokenizer", None)
@@ -3389,9 +3544,9 @@ def run_lm_eval_task(
             _prepare_gemma4_config_for_load(model_path)
         except Exception:
             pass
-    lm_max_len = 32768
+    lm_max_len = 16384
     task_chat_tpl = _should_apply_chat_template_for_task(task_name, apply_chat_template)
-    use_thinking = bool(task_chat_tpl) and (task_name.strip().lower() == "mmlu_pro")
+    use_thinking = bool(task_chat_tpl) and _is_lm_eval_thinking_task(task_name)
     if use_thinking:
         _install_lm_eval_unclosed_thought_guard()
     model_backend = "vllm" if use_vllm else "hf"
@@ -3401,14 +3556,16 @@ def run_lm_eval_task(
             "pretrained": model_path,
             "dtype": "bfloat16",
             "trust_remote_code": True,
-            "gpu_memory_utilization": 0.90,
             "enable_prefix_caching": True,
             "max_model_len": lm_max_len,
             "enable_thinking": use_thinking,
             "think_end_token": "<channel|>" if use_thinking else None,
+            **_build_vllm_fast_engine_kwargs(
+                gpu_memory_utilization=0.95,
+                max_num_seqs=256,
+                max_num_batched_tokens=16384,
+            ),
         }
-        if _vllm_supports_language_model_only():
-            model_args["language_model_only"] = True
     else:
         model_args = {
             "pretrained": model_path,
@@ -3438,7 +3595,7 @@ def run_lm_eval_task(
         torch_random_seed=42,
         confirm_run_unsafe_code=True,
         apply_chat_template=task_chat_tpl,
-        fewshot_as_multiturn=bool(task_chat_tpl),
+        fewshot_as_multiturn=_uses_multiturn_fewshot(task_name, task_chat_tpl),
         log_samples=True,
         bootstrap_iters=0,
         task_manager=TaskManager(),
@@ -3463,7 +3620,7 @@ def _run_lm_eval_suites_subprocess(
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Run the `lm_eval` tasks for `model_path` in an isolated child subprocess so the OS reclaims 100% of vLLM's GPU memory pool upon completion or retry."""
     child_env = _build_isolated_gpu_env(device=device, tag=tag)
-    candidate_lengths = (32768, 24576) if use_vllm else (32768,)
+    candidate_lengths = (16384, 12288) if use_vllm else (16384,)
     last_rc: Optional[int] = None
 
     for attempt_idx, cand_max_len in enumerate(candidate_lengths, start=1):
@@ -3537,9 +3694,9 @@ def _evaluate_checkpoint_with_lm_eval(
     _preserved_arabic: Optional[Dict[str, Dict[str, Any]]] = None,
     _preserved_retention: Optional[Dict[str, Dict[str, Any]]] = None,
     checkpoint_callback: Optional[Any] = None,
-    _lm_eval_max_len: int = 32768,
+    _lm_eval_max_len: int = 16384,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Evaluate a checkpoint across all 4 isolated runner stages (`lighteval` Arabic, `lm_eval` MMLU-Pro, `inspect_evals` GPQA+AIME, `lighteval_lcb` LiveCodeBench-v6)."""
+    """Evaluate a checkpoint across all 4 isolated runner stages (`lighteval` Arabic, `lm_eval` MMLU-Pro + MMLU-ProX-Ar, `inspect_evals` MMMLU-Ar + GPQA + AIME, `lighteval_lcb` LiveCodeBench-v6)."""
     eval_cfg = cfg.get("evaluation", {})
     ar_defs = cfg.get("arabic_benchmarks", {})
     ret_defs = cfg.get("retention_anchors", {})
@@ -3548,7 +3705,7 @@ def _evaluate_checkpoint_with_lm_eval(
     default_bs = 8 if model_key_prefix == "26b_a4b" else int(eval_cfg.get("batch_size", 32))
     batch_size = int(model_specific_cfg.get("batch_size", default_bs))
     max_seq_len = int(eval_cfg.get("max_seq_length", 8192))
-    lm_eval_max_len = int(_lm_eval_max_len or 32768)
+    lm_eval_max_len = int(_lm_eval_max_len or 16384)
 
     out: Dict[str, Dict[str, Dict[str, Any]]] = {
         "arabic": dict(_preserved_arabic or {}),
@@ -3571,6 +3728,12 @@ def _evaluate_checkpoint_with_lm_eval(
         for k, v in ar_defs.items()
         if k not in out["arabic"]
         and str(v.get("runner", "lm_eval")).strip().lower() == "lm_eval"
+    }
+    pending_inspect_ar = {
+        k: v
+        for k, v in ar_defs.items()
+        if k not in out["arabic"]
+        and str(v.get("runner", "lm_eval")).strip().lower() == "inspect_evals"
     }
     pending_lm_eval_ret = {
         k: v
@@ -3692,15 +3855,17 @@ def _evaluate_checkpoint_with_lm_eval(
                         "pretrained": base_model_path,
                         "dtype": "bfloat16",
                         "trust_remote_code": True,
-                        "gpu_memory_utilization": 0.90,
                         "enable_prefix_caching": True,
                         "max_model_len": active_max_model_len,
                         "batch_size": "auto",
                         "enable_thinking": True,
                         "think_end_token": "<channel|>",
+                        **_build_vllm_fast_engine_kwargs(
+                            gpu_memory_utilization=0.95,
+                            max_num_seqs=256,
+                            max_num_batched_tokens=16384,
+                        ),
                     }
-                    if _vllm_supports_language_model_only():
-                        vllm_init_kw["language_model_only"] = True
                     if is_peft_vllm:
                         vllm_init_kw["lora_local_path"] = str(model_path)
                     lm_obj = VLLM(**vllm_init_kw)
@@ -3842,7 +4007,7 @@ def _evaluate_checkpoint_with_lm_eval(
                         torch_random_seed=42,
                         confirm_run_unsafe_code=True,
                         apply_chat_template=task_chat_tpl,
-                        fewshot_as_multiturn=bool(task_chat_tpl),
+                        fewshot_as_multiturn=_uses_multiturn_fewshot(task_name, task_chat_tpl),
                         log_samples=True,
                         bootstrap_iters=0,
                         task_manager=task_manager,
@@ -3876,15 +4041,20 @@ def _evaluate_checkpoint_with_lm_eval(
             model_obj = None
             _flush_stage()
 
-    # Stage 3: GPQA-Diamond & AIME-2026 via Inspect Evals (isolated subprocess)
-    if pending_inspect_ret and not _skip_non_lm_eval:
+    # Stage 3: MMMLU-Ar Thinking + GPQA-Diamond & AIME-2026 via Inspect Evals (single isolated subprocess)
+    combined_inspect_specs: Dict[str, Dict[str, Any]] = {
+        **pending_inspect_ar,
+        **pending_inspect_ret,
+    }
+    if combined_inspect_specs and not _skip_non_lm_eval:
         def _on_inspect_suite(sname: str, smetrics: Dict[str, Any]) -> None:
-            out["retention"][sname] = smetrics
+            target_bucket = "arabic" if sname in pending_inspect_ar else "retention"
+            out[target_bucket][sname] = smetrics
             _flush_stage()
 
         inspect_metrics = run_inspect_evals_subprocess(
             model_path=model_path,
-            suite_specs=pending_inspect_ret,
+            suite_specs=combined_inspect_specs,
             device=device,
             limit=limit,
             use_vllm=use_vllm,
@@ -3892,7 +4062,8 @@ def _evaluate_checkpoint_with_lm_eval(
             on_suite_complete=_on_inspect_suite,
         )
         for sname, smetrics in inspect_metrics.items():
-            out["retention"][sname] = smetrics
+            target_bucket = "arabic" if sname in pending_inspect_ar else "retention"
+            out[target_bucket][sname] = smetrics
         _flush_stage()
 
     # Stage 4: LiveCodeBench-v6 via LightEval (isolated subprocess)
@@ -4019,6 +4190,14 @@ def _resolve_selected_suites(
         "examsar": ("arabic", "EXAMS-AR"),
         "arabicexams": ("arabic", "EXAMS-AR"),
         "aratrust": ("arabic", "AraTrust"),
+        "mmluprox": ("arabic", "MMLU-ProX-Ar"),
+        "mmluproxar": ("arabic", "MMLU-ProX-Ar"),
+        "mmluproxlitear": ("arabic", "MMLU-ProX-Ar"),
+        "mmmlustem": ("arabic", "MMMLU-Ar-STEM"),
+        "mmmluarstem": ("arabic", "MMMLU-Ar-STEM"),
+        "mmmlulaw": ("arabic", "MMMLU-Ar-Law-Prof"),
+        "mmmlulawprof": ("arabic", "MMMLU-Ar-Law-Prof"),
+        "mmmluarlawprof": ("arabic", "MMMLU-Ar-Law-Prof"),
     }
     for k, v in shorthands.items():
         alias_map.setdefault(k, v)
@@ -4519,6 +4698,8 @@ def prewarm_eval_datasets(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any
                 ("MBZUAI/MadinahQA", "Arabic Language (Grammar)", "MadinahQA"),
                 ("asas-ai/AraTrust", "default", "AraTrust"),
                 ("OALL/Arabic_EXAMS", None, "EXAMS-AR"),
+                ("li-lab/MMLU-ProX-Lite", "ar", "MMLU-ProX-Ar"),
+                ("openai/MMMLU", "AR_XY", "MMMLU-Ar"),
                 ("TIGER-Lab/MMLU-Pro", None, "MMLU-Pro"),
                 ("MathArena/aime_2026", None, "AIME-2026"),
             ]
@@ -4567,6 +4748,14 @@ def prewarm_eval_datasets(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         warmed.append("AIME-2026")
     except Exception as exc:
         warnings_list.append(f"AIME-2026: {exc}")
+
+    try:
+        from inspect_evals.mmlu import mmlu_0_shot
+
+        _ = mmlu_0_shot(language="AR_XY", subjects=["abstract_algebra"], cot=True, shuffle=False)
+        warmed.append("MMMLU-Ar")
+    except Exception as exc:
+        warnings_list.append(f"MMMLU-Ar: {exc}")
 
     # 3. LiveCodeBench-v6 (`lighteval` dataset cache)
     try:
@@ -5456,19 +5645,37 @@ def run_preflight_gate(
             base_ar, base_ret = _probe_single_checkpoint_preflight(base_id, dev, cfg, args.use_vllm, f"{mk}:base_pf")
             tuned_ar, tuned_ret = _probe_single_checkpoint_preflight(tuned_path, dev, cfg, args.use_vllm, f"{mk}:tuned_pf")
 
+        manifest_file = (
+            pathlib.Path(tuned_path).parent / "merge_manifest.json"
+            if pathlib.Path(tuned_path).name == "merged_16bit"
+            else pathlib.Path(tuned_path) / "merge_manifest.json"
+        )
+        manifest_meta: Dict[str, Any] = {}
+        if manifest_file.is_file():
+            try:
+                manifest_meta = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except Exception:
+                manifest_meta = {}
+        is_ties_calibrated = bool(
+            manifest_meta.get("ties_calibrated")
+            or float(manifest_meta.get("sft_weight", 0.0) or 0.0) > 0.0
+        )
+
         strict_l100 = evaluate_preflight_gate_metrics(base_ar, tuned_ar, base_ret, tuned_ret)
         best_tuned_ar, best_tuned_ret = tuned_ar, tuned_ret
-        best_lambda = 1.0
+        best_lambda = float(manifest_meta.get("lambda_scale", 1.0) or 1.0)
         candidates_probed: Dict[str, Any] = {
-            "1.00": {
+            f"{best_lambda:.2f}": {
                 "arabic_gain_pts": strict_l100["arabic_gain_pts"],
                 "mmlu_pro_delta_pts": strict_l100["mmlu_pro_delta_pts"],
             }
         }
 
         # Automatic conservative lambda=0.70 comparison on mild retention OR mild subsample Arabic dip
+        # (Skipped when checkpoint was already explicitly TIES-calibrated via `merge_manifest.json`)
         should_probe_l070 = (
-            not strict_l100["gate_passed"]
+            not is_ties_calibrated
+            and not strict_l100["gate_passed"]
             and strict_l100["base_arabic_mmlu"] >= 40.0
             and strict_l100["arabic_gain_pts"] >= -3.0
             and strict_l100["mmlu_pro_delta_pts"] >= -25.0
