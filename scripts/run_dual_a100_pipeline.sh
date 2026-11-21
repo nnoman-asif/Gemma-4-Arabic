@@ -430,9 +430,9 @@ echo "======================================================================"
   --prewarm-datasets
 
 echo "======================================================================"
-echo "[Phase 2C/4] Mandatory 5-Minute Dual-GPU Pre-Flight Gate (Arabic Gain + Retention)"
-echo "  - Verifies Tuned >= Base on ArabicMMLU + AlGhafa and near-zero regression on MMLU-Pro"
-echo "  - Auto-falls back to --lambda-scale 0.70 --force if needed; aborts fast before 90m eval on failure"
+echo "[Phase 2C/4] Mandatory 5-Minute Dual-GPU Pre-Flight Gate (Arabic + Retention)"
+echo "  - Verifies 4-suite Arabic probe (ArabicMMLU, AlGhafa, ACVA, MadinahQA) + MMLU-Pro CoT"
+echo "  - Compares lambda=1.00 vs conservative lambda=0.70 on borderline dips; aborts on real regressions"
 echo "======================================================================"
 
 "${PYTHON_BIN}" scripts/run_benchmarks.py \

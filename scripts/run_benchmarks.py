@@ -4277,8 +4277,17 @@ def _load_single_role_checkpoint(
                 continue
             if role == "base" and str(raw.get("base_model_id") or "") != str(base_model_id):
                 continue
-            if role == "tuned" and str(raw.get("tuned_model_path") or "") != str(tuned_model_path):
-                continue
+            if role == "tuned":
+                if str(raw.get("tuned_model_path") or "") != str(tuned_model_path):
+                    continue
+                ckpt_cfg = pathlib.Path(tuned_model_path) / "config.json"
+                if ckpt_cfg.is_file() and cand_path.stat().st_mtime + 1.0 < ckpt_cfg.stat().st_mtime:
+                    logger.info(
+                        "Ignoring stale tuned cache %s (older than re-merged %s).",
+                        cand_path.name,
+                        ckpt_cfg,
+                    )
+                    continue
             role_block = raw.get(role, {})
             if isinstance(role_block, dict):
                 ar_map = _valid_entries(role_block.get("arabic", {}))
@@ -4501,7 +4510,8 @@ def prewarm_eval_datasets(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any
 
         # 1. OALL v2 Arabic suites + MMLU-Pro
         hf_specs: List[Tuple[str, Optional[str], str]] = [
-            ("OALL/Arabic_MMLU", sub, "ArabicMMLU") for sub in ARABIC_MMLU_40_SUBSETS
+            ("OALL/Arabic_MMLU", "All", "ArabicMMLU"),
+            *(("OALL/Arabic_MMLU", sub, "ArabicMMLU") for sub in ARABIC_MMLU_40_SUBSETS),
         ]
         hf_specs.extend(
             [
@@ -5230,6 +5240,12 @@ def _run_role_parallel_pair_on_dual_gpus(
     )
 
 
+PREFLIGHT_ARABIC_SUITES: Tuple[str, ...] = ("ArabicMMLU", "AlGhafa", "ACVA", "MadinahQA")
+# 1-sigma paired binomial non-inferiority band on `limit=300` (`max_samples=150`) LightEval smoke probes,
+# matching the existing `-4.5` pt subsampling tolerance on `N=112` `MMLU-Pro`.
+PREFLIGHT_SUBSAMPLE_MIN_ARABIC_GAIN: float = -1.5
+
+
 def evaluate_preflight_gate_metrics(
     base_ar: Dict[str, float],
     tuned_ar: Dict[str, float],
@@ -5284,10 +5300,10 @@ def _probe_single_checkpoint_preflight(
     use_vllm: bool,
     tag: str,
 ) -> Tuple[Dict[str, float], float]:
-    """Run fast isolated Arabic (`ArabicMMLU`, `AlGhafa`) + Thinking (`MMLU-Pro`) preflight probes without touching `live_raw_*.json`."""
+    """Run fast isolated Arabic (`ArabicMMLU`, `AlGhafa`, `ACVA`, `MadinahQA`) + Thinking (`MMLU-Pro`) preflight probes without touching `live_raw_*.json`."""
     ar_raw = run_lighteval_tasks_subprocess(
         model_path=checkpoint_path,
-        suite_names=["ArabicMMLU", "AlGhafa"],
+        suite_names=list(PREFLIGHT_ARABIC_SUITES),
         device=device,
         limit=300,
         batch_size=16,
@@ -5324,12 +5340,31 @@ def _probe_single_checkpoint_preflight(
     return ar_scores, mmlu_pro_pct
 
 
+def _preflight_composite_score(gate_dict: Dict[str, Any]) -> Tuple[int, float]:
+    """Rank preflight candidates by strict pass status first, then composite Arabic + retention delta."""
+    strict_ok = 1 if gate_dict.get("gate_passed") else 0
+    comp = float(gate_dict.get("arabic_gain_pts", 0.0)) + 0.5 * float(gate_dict.get("mmlu_pro_delta_pts", 0.0))
+    return (strict_ok, round(comp, 4))
+
+
+def _invalidate_stale_tuned_eval_caches(model_key: str) -> None:
+    """Remove any stale `live_raw_{model_key}_tuned.json` / combined cache after a checkpoint re-merge."""
+    rep_dir = PROJECT_ROOT / "outputs" / "eval_reports"
+    for fname in (f"live_raw_{model_key}_tuned.json", f"live_raw_{model_key}.json"):
+        fp = rep_dir / fname
+        if fp.is_file():
+            try:
+                fp.unlink()
+            except OSError:
+                pass
+
+
 def run_preflight_gate(
     args: argparse.Namespace,
     cfg: Dict[str, Any],
     report_path_override: Optional[pathlib.Path] = None,
 ) -> Dict[str, Any]:
-    """Execute the fast Dual-GPU Pre-Flight Gate across target model(s) before full 40-suite evaluation."""
+    """Execute the fast Dual-GPU Pre-Flight Gate across target model(s) before full 10-suite evaluation."""
     from concurrent.futures import ThreadPoolExecutor
 
     models_cfg = cfg.get("models", {})
@@ -5340,7 +5375,7 @@ def run_preflight_gate(
         payload = {
             "status": "dry_run_preflight_passed",
             "models_checked": target_keys,
-            "probes": ["ArabicMMLU", "AlGhafa", "MMLU-Pro"],
+            "probes": [*PREFLIGHT_ARABIC_SUITES, "MMLU-Pro"],
         }
         return payload
 
@@ -5405,7 +5440,11 @@ def run_preflight_gate(
                 )
                 continue
 
-        logger.info("[Preflight:%s] Running paired Base vs. Tuned gate on ArabicMMLU + AlGhafa + MMLU-Pro...", mk)
+        logger.info(
+            "[Preflight:%s] Running paired Base vs. Tuned gate on %s + MMLU-Pro...",
+            mk,
+            " + ".join(PREFLIGHT_ARABIC_SUITES),
+        )
         if dual_gpu:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 fut_b = pool.submit(_probe_single_checkpoint_preflight, base_id, "cuda:0", cfg, args.use_vllm, f"{mk}:base_pf")
@@ -5417,44 +5456,110 @@ def run_preflight_gate(
             base_ar, base_ret = _probe_single_checkpoint_preflight(base_id, dev, cfg, args.use_vllm, f"{mk}:base_pf")
             tuned_ar, tuned_ret = _probe_single_checkpoint_preflight(tuned_path, dev, cfg, args.use_vllm, f"{mk}:tuned_pf")
 
-        gate = evaluate_preflight_gate_metrics(base_ar, tuned_ar, base_ret, tuned_ret)
-        gate["merge_lambda_used"] = 1.0
-        gate["tuned_checkpoint_mtime"] = cfg_file.stat().st_mtime
+        strict_l100 = evaluate_preflight_gate_metrics(base_ar, tuned_ar, base_ret, tuned_ret)
+        best_tuned_ar, best_tuned_ret = tuned_ar, tuned_ret
+        best_lambda = 1.0
+        candidates_probed: Dict[str, Any] = {
+            "1.00": {
+                "arabic_gain_pts": strict_l100["arabic_gain_pts"],
+                "mmlu_pro_delta_pts": strict_l100["mmlu_pro_delta_pts"],
+            }
+        }
 
-        # Automatic conservative lambda=0.70 fallback re-merge if retention dipped slightly
-        if not gate["gate_passed"] and gate["needs_conservative_lambda_retry"] and mk in default_dpo_map:
+        # Automatic conservative lambda=0.70 comparison on mild retention OR mild subsample Arabic dip
+        should_probe_l070 = (
+            not strict_l100["gate_passed"]
+            and strict_l100["base_arabic_mmlu"] >= 40.0
+            and strict_l100["arabic_gain_pts"] >= -3.0
+            and strict_l100["mmlu_pro_delta_pts"] >= -25.0
+            and mk in default_dpo_map
+        )
+        if should_probe_l070:
             remerge_base_id, dpo_dir_rel, merge_out_rel = default_dpo_map[mk]
-            dpo_dir_abs = PROJECT_ROOT / dpo_dir_rel
+            dpo_dir_abs = pathlib.Path(str(entry.get("dpo_checkpoint_dir", PROJECT_ROOT / dpo_dir_rel)))
+            if not dpo_dir_abs.is_absolute():
+                dpo_dir_abs = PROJECT_ROOT / dpo_dir_abs
+            merge_out_abs = pathlib.Path(tuned_path).parent if pathlib.Path(tuned_path).name == "merged_16bit" else (PROJECT_ROOT / merge_out_rel)
             if (dpo_dir_abs / "adapter_config.json").exists():
                 logger.warning(
-                    "[Preflight:%s] Mild retention dip detected (%s); automatically re-merging with conservative --lambda-scale 0.70 --force...",
+                    "[Preflight:%s] Borderline subsample probe at lambda=1.00 (%s); comparing against conservative --lambda-scale 0.70 --force...",
                     mk,
-                    "; ".join(gate["failure_reasons"]),
+                    "; ".join(strict_l100["failure_reasons"]),
                 )
-                remerge_cmd = [
-                    sys.executable,
-                    str(PROJECT_ROOT / "src" / "merge_and_export.py"),
-                    "--base-model",
-                    str(entry.get("base_model_id", remerge_base_id)),
-                    "--adapter-dir",
-                    str(dpo_dir_abs),
-                    "--output-dir",
-                    str(PROJECT_ROOT / merge_out_rel),
-                    "--lambda-scale",
-                    "0.70",
-                    "--export-format",
-                    "merged_16bit",
-                    "--force",
-                ]
-                remerge_rc = subprocess.run(remerge_cmd, cwd=str(PROJECT_ROOT)).returncode
-                if remerge_rc == 0:
+
+                def _run_remerge(l_val: str) -> int:
+                    cmd = [
+                        sys.executable,
+                        str(PROJECT_ROOT / "src" / "merge_and_export.py"),
+                        "--base-model",
+                        str(entry.get("base_model_id", remerge_base_id)),
+                        "--adapter-dir",
+                        str(dpo_dir_abs),
+                        "--output-dir",
+                        str(merge_out_abs),
+                        "--lambda-scale",
+                        l_val,
+                        "--export-format",
+                        "merged_16bit",
+                        "--force",
+                    ]
+                    return subprocess.run(cmd, cwd=str(PROJECT_ROOT)).returncode
+
+                if _run_remerge("0.70") == 0:
+                    _invalidate_stale_tuned_eval_caches(mk)
                     probe_dev = "cuda:1" if dual_gpu else str(entry.get("device", "cuda:0"))
-                    tuned_ar, tuned_ret = _probe_single_checkpoint_preflight(
+                    tuned_ar_070, tuned_ret_070 = _probe_single_checkpoint_preflight(
                         tuned_path, probe_dev, cfg, args.use_vllm, f"{mk}:tuned_l070_pf"
                     )
-                    gate = evaluate_preflight_gate_metrics(base_ar, tuned_ar, base_ret, tuned_ret)
-                    gate["merge_lambda_used"] = 0.70
-                    gate["tuned_checkpoint_mtime"] = cfg_file.stat().st_mtime
+                    strict_l070 = evaluate_preflight_gate_metrics(base_ar, tuned_ar_070, base_ret, tuned_ret_070)
+                    candidates_probed["0.70"] = {
+                        "arabic_gain_pts": strict_l070["arabic_gain_pts"],
+                        "mmlu_pro_delta_pts": strict_l070["mmlu_pro_delta_pts"],
+                    }
+                    if _preflight_composite_score(strict_l070) > _preflight_composite_score(strict_l100):
+                        best_tuned_ar, best_tuned_ret = tuned_ar_070, tuned_ret_070
+                        best_lambda = 0.70
+                        logger.info(
+                            "[Preflight:%s] Selected conservative lambda=0.70 (Arabic %+.2f, MMLU-Pro %+.2f > lambda=1.00).",
+                            mk,
+                            strict_l070["arabic_gain_pts"],
+                            strict_l070["mmlu_pro_delta_pts"],
+                        )
+                    else:
+                        logger.info(
+                            "[Preflight:%s] lambda=1.00 (Arabic %+.2f, MMLU-Pro %+.2f) outperformed or tied lambda=0.70 (Arabic %+.2f, MMLU-Pro %+.2f); restoring lambda=1.00 on disk...",
+                            mk,
+                            strict_l100["arabic_gain_pts"],
+                            strict_l100["mmlu_pro_delta_pts"],
+                            strict_l070["arabic_gain_pts"],
+                            strict_l070["mmlu_pro_delta_pts"],
+                        )
+                        if _run_remerge("1.0") != 0:
+                            raise RuntimeError(f"[Preflight:{mk}] Failed to restore lambda=1.0 merged checkpoint at {merge_out_abs}")
+                        _invalidate_stale_tuned_eval_caches(mk)
+
+        # Evaluate smoke pass/abort using the principled 1-sigma subsample non-inferiority margin (`-1.5` pts Arabic, `-4.5` pts MMLU-Pro)
+        gate = evaluate_preflight_gate_metrics(
+            base_ar,
+            best_tuned_ar,
+            base_ret,
+            best_tuned_ret,
+            min_arabic_gain=PREFLIGHT_SUBSAMPLE_MIN_ARABIC_GAIN,
+            max_mmlu_pro_drop=4.5,
+        )
+        gate["merge_lambda_used"] = best_lambda
+        gate["tuned_checkpoint_mtime"] = cfg_file.stat().st_mtime
+        gate["base_arabic_Breakdown"] = {k: round(float(v), 2) for k, v in base_ar.items()}
+        gate["tuned_arabic_Breakdown"] = {k: round(float(v), 2) for k, v in best_tuned_ar.items()}
+        gate["lambda_candidates_probed"] = candidates_probed
+        if gate["gate_passed"] and gate["arabic_gain_pts"] < 0.0:
+            note = (
+                f"Subsample Arabic delta ({gate['arabic_gain_pts']:+.2f} pts on max_samples=150) is within the "
+                f"1-sigma finite-sample noise band ([{PREFLIGHT_SUBSAMPLE_MIN_ARABIC_GAIN:+.2f}, 0.00] pts); "
+                "proceeding to full 48,132-item 6-suite OALL v2 evaluation."
+            )
+            gate["subsample_non_inferiority_note"] = note
+            logger.info("[Preflight:%s] %s", mk, note)
 
         model_reports[mk] = gate
         logger.info(

@@ -376,17 +376,37 @@ def _load_training_curve_series(
             steps: List[float] = []
             vals: List[float] = []
             for entry in history:
-                if not isinstance(entry, dict) or "step" not in entry:
+                if not isinstance(entry, dict):
                     continue
                 for k in metric_keys:
-                    if k in entry and isinstance(entry[k], (int, float)):
-                        steps.append(float(entry["step"]))
-                        vals.append(float(entry[k]))
-                        break
+                    if k not in entry:
+                        continue
+                    try:
+                        val_f = float(entry[k])
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(val_f):
+                        continue
+                    step_raw = entry.get("step", len(steps) + 1)
+                    try:
+                        step_f = float(step_raw)
+                    except (TypeError, ValueError):
+                        step_f = float(len(steps) + 1)
+                    steps.append(step_f)
+                    vals.append(val_f)
+                    break
             if len(steps) == 1:
                 return [0.0, steps[0]], [vals[0], vals[0]]
             if len(steps) >= 2:
                 return steps, vals
+            metrics_block = payload.get("metrics", {})
+            if isinstance(metrics_block, dict) and "train_loss" in metrics_block:
+                try:
+                    t_loss = float(metrics_block["train_loss"])
+                    if math.isfinite(t_loss):
+                        return [0.0, 1.0], [t_loss, t_loss]
+                except (TypeError, ValueError):
+                    pass
         except Exception as exc:
             logger.warning("Could not load training history from %s: %s", cand, exc)
     return None

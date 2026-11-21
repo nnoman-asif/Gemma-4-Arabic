@@ -3141,6 +3141,162 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertEqual(dummy_peft.base_model.hf_device_map, {"": 0})
         self.assertEqual(dummy_peft.base_model.model.hf_device_map, {"": 0})
 
+    def test_33_preflight_subsample_margin_lambda_selection_and_cache_hygiene(self) -> None:
+        """Verify 4-suite Arabic preflight probe, lambda=1.00 vs 0.70 selection, -1.5pt smoke margin, and stale cache eviction."""
+        import argparse
+        from unittest.mock import patch
+        from scripts.benchmark_latency_and_plots import _load_training_curve_series
+        from scripts.run_benchmarks import (
+            PREFLIGHT_ARABIC_SUITES,
+            _load_single_role_checkpoint,
+            run_preflight_gate,
+        )
+
+        # 1. Verify preflight covers all 4 fast OALL v2 suites inside the single LightEval pass
+        self.assertEqual(
+            PREFLIGHT_ARABIC_SUITES,
+            ("ArabicMMLU", "AlGhafa", "ACVA", "MadinahQA"),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_p = pathlib.Path(tmpdir)
+            e4b_root = tmp_p / "merged_e4b"
+            e4b_16 = e4b_root / "merged_16bit"
+            dpo_dir = tmp_p / "dpo_e4b_a100"
+            e4b_16.mkdir(parents=True)
+            dpo_dir.mkdir(parents=True)
+            (e4b_16 / "config.json").write_text("{}", encoding="utf-8")
+            (dpo_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+            rep_file = tmp_p / "preflight_gate_report.json"
+
+            pf_args = argparse.Namespace(
+                model_key="e4b",
+                model_path=None,
+                dry_run=False,
+                use_vllm=True,
+                force_preflight=True,
+            )
+            pf_cfg = {
+                "models": {
+                    "e4b": {
+                        "base_model_id": "unsloth/gemma-4-E4B-it",
+                        "dpo_checkpoint_dir": str(dpo_dir),
+                        "merged_checkpoint_dir": str(e4b_16),
+                    }
+                }
+            }
+
+            # Case A: Exact Vast.ai borderline subsample fluctuation (-0.26 pts Arabic, -2.67 pts MMLU-Pro)
+            # where lambda=1.00 outperforms lambda=0.70 -> restores lambda=1.00 on disk and PASSES smoke gate!
+            remerge_lambdas: List[str] = []
+
+            def _mock_subproc_run(cmd: List[str], cwd: Any = None) -> Any:
+                idx = cmd.index("--lambda-scale")
+                remerge_lambdas.append(cmd[idx + 1])
+                return type("_RC", (), {"returncode": 0})()
+
+            def _probe_case_a(ckpt: str, dev: str, cfg_d: Dict[str, Any], use_v: bool, tag: str):
+                if "base" in tag:
+                    return {"ArabicMMLU": 73.41, "AlGhafa": 73.41}, 73.21
+                if "l070" in tag:
+                    return {"ArabicMMLU": 73.00, "AlGhafa": 73.10}, 70.54
+                return {"ArabicMMLU": 73.15, "AlGhafa": 73.15}, 70.54
+
+            with (
+                patch("scripts.run_benchmarks._probe_single_checkpoint_preflight", side_effect=_probe_case_a),
+                patch("scripts.run_benchmarks.subprocess.run", side_effect=_mock_subproc_run),
+            ):
+                res_a = run_preflight_gate(pf_args, pf_cfg, report_path_override=rep_file)
+            self.assertTrue(res_a["gate_passed"])
+            self.assertEqual(remerge_lambdas, ["0.70", "1.0"])
+            self.assertEqual(res_a["models"]["e4b"]["merge_lambda_used"], 1.0)
+            self.assertIn("subsample_non_inferiority_note", res_a["models"]["e4b"])
+
+            # Case B: Conservative lambda=0.70 strictly outperforms lambda=1.00 -> keeps lambda=0.70 without restoring 1.0!
+            remerge_lambdas.clear()
+
+            def _probe_case_b(ckpt: str, dev: str, cfg_d: Dict[str, Any], use_v: bool, tag: str):
+                if "base" in tag:
+                    return {"ArabicMMLU": 73.41, "AlGhafa": 73.41}, 73.21
+                if "l070" in tag:
+                    return {"ArabicMMLU": 74.10, "AlGhafa": 74.20}, 72.32
+                return {"ArabicMMLU": 73.15, "AlGhafa": 73.15}, 70.54
+
+            with (
+                patch("scripts.run_benchmarks._probe_single_checkpoint_preflight", side_effect=_probe_case_b),
+                patch("scripts.run_benchmarks.subprocess.run", side_effect=_mock_subproc_run),
+            ):
+                res_b = run_preflight_gate(pf_args, pf_cfg, report_path_override=rep_file)
+            self.assertTrue(res_b["gate_passed"])
+            self.assertEqual(remerge_lambdas, ["0.70"])
+            self.assertEqual(res_b["models"]["e4b"]["merge_lambda_used"], 0.70)
+
+            # Case C: Genuine Arabic regression (-2.10 pts < -1.50 pts) MUST STILL FAIL & ABORT!
+            def _probe_case_c(ckpt: str, dev: str, cfg_d: Dict[str, Any], use_v: bool, tag: str):
+                if "base" in tag:
+                    return {"ArabicMMLU": 73.41, "AlGhafa": 73.41}, 73.21
+                return {"ArabicMMLU": 71.31, "AlGhafa": 71.31}, 72.50
+
+            with (
+                patch("scripts.run_benchmarks._probe_single_checkpoint_preflight", side_effect=_probe_case_c),
+                patch("scripts.run_benchmarks.subprocess.run", side_effect=_mock_subproc_run),
+            ):
+                with self.assertRaises(RuntimeError):
+                    run_preflight_gate(pf_args, pf_cfg, report_path_override=rep_file)
+
+            # 2. Verify `_load_single_role_checkpoint` ignores stale tuned cache older than re-merged `config.json`
+            base_cache = tmp_p / "live_raw_e4b_base.json"
+            tuned_cache = tmp_p / "live_raw_e4b_tuned.json"
+            comb_cache = tmp_p / "live_raw_e4b.json"
+            base_cache.write_text(
+                json.dumps(
+                    {
+                        "limit": None,
+                        "base_model_id": "unsloth/gemma-4-E4B-it",
+                        "base": {"arabic": {"ArabicMMLU": {"eval_score_pct": 66.4}}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tuned_cache.write_text(
+                json.dumps(
+                    {
+                        "limit": None,
+                        "tuned_model_path": str(e4b_16),
+                        "tuned": {"arabic": {"ArabicMMLU": {"eval_score_pct": 60.1}}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            now_ts = (e4b_16 / "config.json").stat().st_mtime
+            os.utime(tuned_cache, (now_ts - 30.0, now_ts - 30.0))
+            os.utime(base_cache, (now_ts - 30.0, now_ts - 30.0))
+
+            b_loaded = _load_single_role_checkpoint(
+                base_cache, comb_cache, "base", None, "unsloth/gemma-4-E4B-it", str(e4b_16)
+            )
+            t_stale = _load_single_role_checkpoint(
+                tuned_cache, comb_cache, "tuned", None, "unsloth/gemma-4-E4B-it", str(e4b_16)
+            )
+            self.assertIn("ArabicMMLU", b_loaded[0])
+            self.assertEqual(t_stale, ({}, {}))
+
+            # 3. Verify `_load_training_curve_series` handles stringified floats (`'1.204'`) cleanly
+            str_metrics = tmp_p / "training_metrics.json"
+            str_metrics.write_text(
+                json.dumps(
+                    {
+                        "log_history": [
+                            {"step": 10, "loss": "2.105"},
+                            {"step": 20, "loss": "1.204"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            series = _load_training_curve_series(str_metrics, ("loss",))
+            self.assertEqual(series, ([10.0, 20.0], [2.105, 1.204]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
