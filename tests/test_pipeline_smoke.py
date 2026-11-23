@@ -3423,6 +3423,50 @@ class TestGemma4ArabicPipeline(unittest.TestCase):
         self.assertTrue(r_clean["all_non_negative"])
         self.assertGreater(r_clean["rank_key"], r_dip["rank_key"])
 
+        # 7. Verify 14-subject outbid-safe MMLU-Pro checkpointing & exact sample-weighted aggregation
+        from scripts.run_benchmarks import (
+            MMLU_PRO_14_SUBTASKS,
+            _extract_mmlu_pro_subtask_record,
+            _load_lm_eval_progress,
+            _save_lm_eval_progress,
+            aggregate_mmlu_pro_subtasks,
+        )
+
+        self.assertEqual(len(MMLU_PRO_14_SUBTASKS), 14)
+        subj_counts = [717, 789, 1132, 410, 844, 969, 818, 381, 1101, 1351, 924, 499, 1299, 798]
+        self.assertEqual(sum(subj_counts), 12032)
+
+        with tempfile.TemporaryDirectory() as tmp_pdir:
+            prog_file = pathlib.Path(tmp_pdir) / ".lm_eval_progress_26b_a4b_base.json"
+            state_part = {"arabic": {}, "retention": {}, "mmlu_pro_subtasks": {}}
+            total_correct = 0
+            for idx_s, (stask, scnt) in enumerate(zip(MMLU_PRO_14_SUBTASKS, subj_counts)):
+                corr = int(scnt * (0.62 + 0.01 * (idx_s % 5)))
+                total_correct += corr
+                fake_payload = {
+                    "results": {stask: {"exact_match,custom-extract": corr / float(scnt)}},
+                    "n-samples": {stask: {"effective": scnt}},
+                }
+                rec = _extract_mmlu_pro_subtask_record(fake_payload, stask)
+                state_part["mmlu_pro_subtasks"][stask] = rec
+                if idx_s == 4:
+                    # Simulate Vast.ai outbid right after subject 5/14 + MMLU-ProX-Ar
+                    state_part["arabic"]["MMLU-ProX-Ar"] = {"eval_score_pct": 71.25, "n_samples": 658}
+                    _save_lm_eval_progress(prog_file, model_path="unsloth/gemma-4-26B-A4B-it", limit=None, state=state_part)
+                    reloaded = _load_lm_eval_progress(prog_file, model_path="unsloth/gemma-4-26B-A4B-it", limit=None)
+                    self.assertEqual(len(reloaded["mmlu_pro_subtasks"]), 5)
+                    self.assertEqual(reloaded["arabic"]["MMLU-ProX-Ar"]["eval_score_pct"], 71.25)
+                    # Different model_path or limit must not collide
+                    self.assertEqual(
+                        _load_lm_eval_progress(prog_file, model_path="other/model", limit=None)["mmlu_pro_subtasks"],
+                        {},
+                    )
+
+            agg = aggregate_mmlu_pro_subtasks(state_part["mmlu_pro_subtasks"])
+            expected_pct = round((total_correct / 12032.0) * 100.0, 2)
+            self.assertEqual(agg["n_samples"], 12032)
+            self.assertEqual(agg["eval_score_pct"], expected_pct)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

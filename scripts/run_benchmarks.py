@@ -182,6 +182,24 @@ GROUP_SUBTASK_COUNTS: Dict[str, int] = {
     "mmlu_prox_lite_en": 14,
 }
 
+# Official 14 subject subtasks in upstream `lm_eval/tasks/mmlu_pro/_mmlu_pro.yaml` (`weight_by_size: true`)
+MMLU_PRO_14_SUBTASKS: Tuple[str, ...] = (
+    "mmlu_pro_biology",
+    "mmlu_pro_business",
+    "mmlu_pro_chemistry",
+    "mmlu_pro_computer_science",
+    "mmlu_pro_economics",
+    "mmlu_pro_engineering",
+    "mmlu_pro_health",
+    "mmlu_pro_history",
+    "mmlu_pro_law",
+    "mmlu_pro_math",
+    "mmlu_pro_other",
+    "mmlu_pro_philosophy",
+    "mmlu_pro_physics",
+    "mmlu_pro_psychology",
+)
+
 # Full-dataset LightEval task definitions for the 6 OALL v2 Arabic benchmarks
 LIGHTEVAL_SUITE_TASK_MAP: Dict[str, Tuple[str, ...]] = {
     "ArabicMMLU": tuple(f"arabic_mmlu:{sub}|0" for sub in ARABIC_MMLU_40_SUBSETS),
@@ -3609,6 +3627,159 @@ def run_lm_eval_task(
     )["eval_score_pct"]
 
 
+def _get_lm_eval_progress_path(
+    tag: str,
+    progress_dir: Optional[pathlib.Path] = None,
+) -> pathlib.Path:
+    """Return persistent `/workspace` JSON checkpoint path for resumable `lm_eval` suites & `MMLU-Pro` subjects."""
+    safe_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(tag or "default")).strip("_") or "default"
+    base_dir = progress_dir or (PROJECT_ROOT / "outputs" / "eval_reports")
+    return base_dir / f".lm_eval_progress_{safe_tag}.json"
+
+
+def _load_lm_eval_progress(
+    progress_path: pathlib.Path,
+    model_path: str,
+    limit: Optional[int],
+) -> Dict[str, Any]:
+    """Load validated per-suite and per-subject `MMLU-Pro` progress, invalidating if `model_path`, `limit`, or `config.json` mtime changed."""
+    empty: Dict[str, Any] = {"arabic": {}, "retention": {}, "mmlu_pro_subtasks": {}}
+    if not progress_path.is_file():
+        return empty
+    try:
+        raw = json.loads(progress_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return empty
+        if str(raw.get("model_path") or "") != str(model_path):
+            return empty
+        if raw.get("limit") != limit:
+            return empty
+        ckpt_cfg = pathlib.Path(model_path) / "config.json"
+        if ckpt_cfg.is_file() and progress_path.stat().st_mtime + 1.0 < ckpt_cfg.stat().st_mtime:
+            logger.info(
+                "Ignoring stale lm_eval progress %s (older than re-merged %s).",
+                progress_path.name,
+                ckpt_cfg,
+            )
+            return empty
+        return {
+            "arabic": dict(raw.get("arabic") or {}) if isinstance(raw.get("arabic"), dict) else {},
+            "retention": dict(raw.get("retention") or {}) if isinstance(raw.get("retention"), dict) else {},
+            "mmlu_pro_subtasks": (
+                dict(raw.get("mmlu_pro_subtasks") or {})
+                if isinstance(raw.get("mmlu_pro_subtasks"), dict)
+                else {}
+            ),
+        }
+    except Exception as exc:
+        logger.warning("Could not parse lm_eval progress %s: %s", progress_path, exc)
+        return empty
+
+
+def _save_lm_eval_progress(
+    progress_path: pathlib.Path,
+    model_path: str,
+    limit: Optional[int],
+    state: Dict[str, Any],
+) -> None:
+    """Atomically flush `lm_eval` suite & per-subject `MMLU-Pro` progress to disk (`fsync` + `os.replace`)."""
+    payload = {
+        "model_path": str(model_path),
+        "limit": limit,
+        "arabic": dict(state.get("arabic") or {}),
+        "retention": dict(state.get("retention") or {}),
+        "mmlu_pro_subtasks": dict(state.get("mmlu_pro_subtasks") or {}),
+    }
+    _atomic_write_json(progress_path, payload)
+
+
+def _extract_mmlu_pro_subtask_record(
+    sub_payload: Dict[str, Any],
+    sub_task: str,
+    metric_hint: str = "exact_match,custom-extract",
+) -> Dict[str, Any]:
+    """Extract unrounded `raw_score_pct` (`0.0`..`100.0`) and exact `n_samples` for one `MMLU-Pro` subject."""
+    results_block = sub_payload.get("results", {})
+    sub_metrics = results_block.get(sub_task) if isinstance(results_block, dict) else None
+    if not isinstance(sub_metrics, dict):
+        sub_dicts = [v for v in (results_block or {}).values() if isinstance(v, dict)]
+        if not sub_dicts:
+            raise ValueError(f"Missing subject metrics for '{sub_task}' in lm_eval payload.")
+        sub_metrics = sub_dicts[0]
+
+    raw_val: Optional[float] = None
+    for k in (
+        metric_hint,
+        "exact_match,custom-extract",
+        "exact_match,none",
+        "exact_match",
+        "acc,none",
+        "acc",
+    ):
+        if k in sub_metrics and isinstance(sub_metrics[k], (int, float)):
+            raw_val = float(sub_metrics[k])
+            break
+    if raw_val is None:
+        for k, v in sub_metrics.items():
+            if "stderr" not in str(k) and isinstance(v, (int, float)):
+                raw_val = float(v)
+                break
+    if raw_val is None:
+        raise ValueError(f"Could not find numeric exact_match for '{sub_task}' in {sub_metrics}")
+
+    raw_pct = raw_val * 100.0 if raw_val <= 1.0 else raw_val
+
+    n_sub = 0
+    n_samples_block = sub_payload.get("n-samples", {})
+    if isinstance(n_samples_block, dict):
+        entry_n = n_samples_block.get(sub_task)
+        if isinstance(entry_n, dict) and "effective" in entry_n:
+            n_sub = int(entry_n["effective"])
+        elif isinstance(entry_n, int):
+            n_sub = int(entry_n)
+    if n_sub <= 0:
+        det = extract_lm_eval_detailed_metrics(
+            results_payload=sub_payload,
+            task_name=sub_task,
+            metric_hint=metric_hint,
+        )
+        n_sub = int(det.get("n_samples") or 0)
+    if n_sub <= 0:
+        raise ValueError(f"Non-positive sample count ({n_sub}) extracted for '{sub_task}'.")
+
+    return {
+        "raw_score_pct": raw_pct,
+        "eval_score_pct": round(raw_pct, 2),
+        "n_samples": int(n_sub),
+    }
+
+
+def aggregate_mmlu_pro_subtasks(subtask_records: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute exact upstream `lm_eval` `weight_by_size: true` `MMLU-Pro` score across all 14 subjects."""
+    missing = [s for s in MMLU_PRO_14_SUBTASKS if s not in subtask_records]
+    if missing:
+        raise ValueError(f"Cannot aggregate MMLU-Pro: missing subject(s) {missing}")
+    total_n = sum(int(subtask_records[s]["n_samples"]) for s in MMLU_PRO_14_SUBTASKS)
+    if total_n <= 0:
+        raise ValueError("Total MMLU-Pro sample count must be positive.")
+    weighted_pct = (
+        sum(
+            float(subtask_records[s]["raw_score_pct"]) * int(subtask_records[s]["n_samples"])
+            for s in MMLU_PRO_14_SUBTASKS
+        )
+        / float(total_n)
+    )
+    final_pct = round(weighted_pct, 2)
+    return {
+        "eval_score_pct": final_pct,
+        "raw_signal_pct": final_pct,
+        "top1_acc_pct": final_pct,
+        "nll": None,
+        "ppl": None,
+        "n_samples": int(total_n),
+    }
+
+
 def _run_lm_eval_suites_subprocess(
     model_path: str,
     device: str,
@@ -3617,11 +3788,14 @@ def _run_lm_eval_suites_subprocess(
     limit: Optional[int] = None,
     use_vllm: bool = True,
     apply_chat_template: bool = True,
+    progress_path: Optional[pathlib.Path] = None,
+    on_partial_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Run the `lm_eval` tasks for `model_path` in an isolated child subprocess so the OS reclaims 100% of vLLM's GPU memory pool upon completion or retry."""
     child_env = _build_isolated_gpu_env(device=device, tag=tag)
     candidate_lengths = (16384, 12288) if use_vllm else (16384,)
     last_rc: Optional[int] = None
+    eff_progress_path = progress_path or _get_lm_eval_progress_path(tag)
 
     for attempt_idx, cand_max_len in enumerate(candidate_lengths, start=1):
         with tempfile.TemporaryDirectory(prefix="lm_eval_run_") as tmp_dir:
@@ -3652,18 +3826,25 @@ res = _evaluate_checkpoint_with_lm_eval(
     _in_lm_eval_subprocess=True,
     _skip_non_lm_eval=True,
     _lm_eval_max_len={int(cand_max_len)},
+    _progress_path_override=pathlib.Path({repr(str(eff_progress_path))}),
 )
 pathlib.Path({repr(str(out_json_file))}).write_text(
     json.dumps(res, indent=2),
     encoding="utf-8",
 )
 """
-            proc = subprocess.run(
-                [sys.executable, "-c", runner_code],
-                env=child_env,
-                cwd=str(PROJECT_ROOT),
-            )
-            last_rc = proc.returncode
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-c", runner_code],
+                    env=child_env,
+                    cwd=str(PROJECT_ROOT),
+                )
+                last_rc = proc.returncode
+            finally:
+                if on_partial_progress is not None and eff_progress_path.is_file():
+                    partial_state = _load_lm_eval_progress(eff_progress_path, model_path=model_path, limit=limit)
+                    if partial_state.get("arabic") or partial_state.get("retention"):
+                        on_partial_progress(partial_state)
             if proc.returncode == 0 and out_json_file.exists():
                 return json.loads(out_json_file.read_text(encoding="utf-8"))
             if attempt_idx < len(candidate_lengths):
@@ -3695,6 +3876,7 @@ def _evaluate_checkpoint_with_lm_eval(
     _preserved_retention: Optional[Dict[str, Dict[str, Any]]] = None,
     checkpoint_callback: Optional[Any] = None,
     _lm_eval_max_len: int = 16384,
+    _progress_path_override: Optional[pathlib.Path] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Evaluate a checkpoint across all 4 isolated runner stages (`lighteval` Arabic, `lm_eval` MMLU-Pro + MMLU-ProX-Ar, `inspect_evals` MMMLU-Ar + GPQA + AIME, `lighteval_lcb` LiveCodeBench-v6)."""
     eval_cfg = cfg.get("evaluation", {})
@@ -3706,6 +3888,7 @@ def _evaluate_checkpoint_with_lm_eval(
     batch_size = int(model_specific_cfg.get("batch_size", default_bs))
     max_seq_len = int(eval_cfg.get("max_seq_length", 8192))
     lm_eval_max_len = int(_lm_eval_max_len or 16384)
+    lm_progress_path = _progress_path_override or _get_lm_eval_progress_path(tag)
 
     out: Dict[str, Dict[str, Dict[str, Any]]] = {
         "arabic": dict(_preserved_arabic or {}),
@@ -3715,6 +3898,32 @@ def _evaluate_checkpoint_with_lm_eval(
     def _flush_stage() -> None:
         if checkpoint_callback is not None:
             checkpoint_callback(out)
+
+    # Recover any suites completed prior to an outbid/interruption (e.g. `MMLU-ProX-Ar` or aggregated `MMLU-Pro`)
+    progress_state = (
+        _load_lm_eval_progress(lm_progress_path, model_path=str(model_path), limit=limit)
+        if isinstance(model_path, str)
+        else {"arabic": {}, "retention": {}, "mmlu_pro_subtasks": {}}
+    )
+    recovered_any = False
+    for sname, smetrics in progress_state.get("arabic", {}).items():
+        if sname in ar_defs and sname not in out["arabic"] and isinstance(smetrics, dict) and "eval_score_pct" in smetrics:
+            out["arabic"][sname] = smetrics
+            recovered_any = True
+    for sname, smetrics in progress_state.get("retention", {}).items():
+        if sname in ret_defs and sname not in out["retention"] and isinstance(smetrics, dict) and "eval_score_pct" in smetrics:
+            out["retention"][sname] = smetrics
+            recovered_any = True
+    if (
+        "MMLU-Pro" in ret_defs
+        and "MMLU-Pro" not in out["retention"]
+        and limit is None
+        and all(s in progress_state.get("mmlu_pro_subtasks", {}) for s in MMLU_PRO_14_SUBTASKS)
+    ):
+        out["retention"]["MMLU-Pro"] = aggregate_mmlu_pro_subtasks(progress_state["mmlu_pro_subtasks"])
+        recovered_any = True
+    if recovered_any and not _in_lm_eval_subprocess:
+        _flush_stage()
 
     pending_lighteval_ar: List[str] = [
         sname
@@ -3780,6 +3989,20 @@ def _evaluate_checkpoint_with_lm_eval(
             sub_cfg = dict(cfg)
             sub_cfg["arabic_benchmarks"] = pending_lm_eval_ar
             sub_cfg["retention_anchors"] = pending_lm_eval_ret
+
+            def _on_lm_eval_partial(p_state: Dict[str, Any]) -> None:
+                changed = False
+                for sname, smetrics in p_state.get("arabic", {}).items():
+                    if sname in pending_lm_eval_ar and isinstance(smetrics, dict) and "eval_score_pct" in smetrics:
+                        out["arabic"][sname] = smetrics
+                        changed = True
+                for sname, smetrics in p_state.get("retention", {}).items():
+                    if sname in pending_lm_eval_ret and isinstance(smetrics, dict) and "eval_score_pct" in smetrics:
+                        out["retention"][sname] = smetrics
+                        changed = True
+                if changed:
+                    _flush_stage()
+
             lm_sub_out = _run_lm_eval_suites_subprocess(
                 model_path=model_path,
                 device=device,
@@ -3788,12 +4011,19 @@ def _evaluate_checkpoint_with_lm_eval(
                 limit=limit,
                 use_vllm=use_vllm,
                 apply_chat_template=apply_chat_template,
+                progress_path=lm_progress_path,
+                on_partial_progress=_on_lm_eval_partial,
             )
             for sname, smetrics in lm_sub_out.get("arabic", {}).items():
                 out["arabic"][sname] = smetrics
             for sname, smetrics in lm_sub_out.get("retention", {}).items():
                 out["retention"][sname] = smetrics
             _flush_stage()
+            if lm_progress_path.is_file():
+                try:
+                    lm_progress_path.unlink()
+                except OSError:
+                    pass
         else:
             import lm_eval
             import torch
@@ -3984,45 +4214,133 @@ def _evaluate_checkpoint_with_lm_eval(
                         use_vllm=effective_use_vllm,
                         max_model_len=active_max_model_len,
                     )
-                    logger.info(
-                        "[%s] Running lm_eval on %s/%s (task=%s, shots=%d, limit=%s, metric=%s, chat_template=%s)...",
-                        tag,
-                        cat,
-                        suite_name,
-                        task_name,
-                        num_fewshot,
-                        str(eff_limit),
-                        metric_hint,
-                        str(task_chat_tpl),
-                    )
-                    payload = lm_eval.simple_evaluate(
-                        model=lm_obj,
-                        tasks=tasks_arg,
-                        num_fewshot=num_fewshot,
-                        batch_size="auto" if effective_use_vllm else batch_size,
-                        limit=eff_limit,
-                        gen_kwargs=gen_kwargs,
-                        random_seed=42,
-                        numpy_random_seed=42,
-                        torch_random_seed=42,
-                        confirm_run_unsafe_code=True,
-                        apply_chat_template=task_chat_tpl,
-                        fewshot_as_multiturn=_uses_multiturn_fewshot(task_name, task_chat_tpl),
-                        log_samples=True,
-                        bootstrap_iters=0,
-                        task_manager=task_manager,
-                    )
-                    if not isinstance(payload, dict):
-                        raise RuntimeError(
-                            f"[{tag}] lm_eval.simple_evaluate returned None for {cat}/{suite_name} ({task_name})."
+                    if task_name.strip().lower() == "mmlu_pro" and eff_limit is None and isinstance(model_path, str):
+                        done_subs = progress_state.setdefault("mmlu_pro_subtasks", {})
+                        cached_cnt = sum(
+                            1
+                            for s in MMLU_PRO_14_SUBTASKS
+                            if isinstance(done_subs.get(s), dict) and int(done_subs[s].get("n_samples", 0)) > 0
                         )
-                    metrics = extract_lm_eval_detailed_metrics(
-                        results_payload=payload,
-                        task_name=primary_key,
-                        metric_hint=metric_hint,
-                        model_key_prefix=model_key_prefix,
-                    )
+                        logger.info(
+                            "[%s] Running %s/%s in 14-subject outbid-safe mode (%d/14 subjects cached, shots=%d, chat_template=%s)...",
+                            tag,
+                            cat,
+                            suite_name,
+                            cached_cnt,
+                            num_fewshot,
+                            str(task_chat_tpl),
+                        )
+                        for sub_idx, sub_task in enumerate(MMLU_PRO_14_SUBTASKS, start=1):
+                            existing_sub = done_subs.get(sub_task)
+                            if isinstance(existing_sub, dict) and int(existing_sub.get("n_samples", 0)) > 0:
+                                logger.info(
+                                    "[%s] [Reused Cached Subject %d/14] %s -> %.2f%% (N=%d)",
+                                    tag,
+                                    sub_idx,
+                                    sub_task,
+                                    float(existing_sub["eval_score_pct"]),
+                                    int(existing_sub["n_samples"]),
+                                )
+                                continue
+
+                            sub_payload = lm_eval.simple_evaluate(
+                                model=lm_obj,
+                                tasks=[sub_task],
+                                num_fewshot=num_fewshot,
+                                batch_size="auto" if effective_use_vllm else batch_size,
+                                limit=None,
+                                gen_kwargs=gen_kwargs,
+                                random_seed=42,
+                                numpy_random_seed=42,
+                                torch_random_seed=42,
+                                confirm_run_unsafe_code=True,
+                                apply_chat_template=task_chat_tpl,
+                                fewshot_as_multiturn=_uses_multiturn_fewshot(task_name, task_chat_tpl),
+                                log_samples=True,
+                                bootstrap_iters=0,
+                                task_manager=task_manager,
+                            )
+                            if not isinstance(sub_payload, dict):
+                                raise RuntimeError(
+                                    f"[{tag}] lm_eval.simple_evaluate returned None for subject {sub_task}."
+                                )
+                            sub_rec = _extract_mmlu_pro_subtask_record(
+                                sub_payload=sub_payload,
+                                sub_task=sub_task,
+                                metric_hint=metric_hint,
+                            )
+                            done_subs[sub_task] = sub_rec
+                            _save_lm_eval_progress(
+                                lm_progress_path,
+                                model_path=str(model_path),
+                                limit=limit,
+                                state=progress_state,
+                            )
+                            cum_n = sum(
+                                int(done_subs[s]["n_samples"])
+                                for s in MMLU_PRO_14_SUBTASKS
+                                if isinstance(done_subs.get(s), dict) and "n_samples" in done_subs[s]
+                            )
+                            logger.info(
+                                "[%s] [Checkpointed Subject %d/14] %s -> %.2f%% (N=%d | %d/12032 total prompts saved on disk)",
+                                tag,
+                                sub_idx,
+                                sub_task,
+                                float(sub_rec["eval_score_pct"]),
+                                int(sub_rec["n_samples"]),
+                                cum_n,
+                            )
+                        metrics = aggregate_mmlu_pro_subtasks(done_subs)
+                    else:
+                        logger.info(
+                            "[%s] Running lm_eval on %s/%s (task=%s, shots=%d, limit=%s, metric=%s, chat_template=%s)...",
+                            tag,
+                            cat,
+                            suite_name,
+                            task_name,
+                            num_fewshot,
+                            str(eff_limit),
+                            metric_hint,
+                            str(task_chat_tpl),
+                        )
+                        payload = lm_eval.simple_evaluate(
+                            model=lm_obj,
+                            tasks=tasks_arg,
+                            num_fewshot=num_fewshot,
+                            batch_size="auto" if effective_use_vllm else batch_size,
+                            limit=eff_limit,
+                            gen_kwargs=gen_kwargs,
+                            random_seed=42,
+                            numpy_random_seed=42,
+                            torch_random_seed=42,
+                            confirm_run_unsafe_code=True,
+                            apply_chat_template=task_chat_tpl,
+                            fewshot_as_multiturn=_uses_multiturn_fewshot(task_name, task_chat_tpl),
+                            log_samples=True,
+                            bootstrap_iters=0,
+                            task_manager=task_manager,
+                        )
+                        if not isinstance(payload, dict):
+                            raise RuntimeError(
+                                f"[{tag}] lm_eval.simple_evaluate returned None for {cat}/{suite_name} ({task_name})."
+                            )
+                        metrics = extract_lm_eval_detailed_metrics(
+                            results_payload=payload,
+                            task_name=primary_key,
+                            metric_hint=metric_hint,
+                            model_key_prefix=model_key_prefix,
+                        )
                     out[cat][suite_name] = metrics
+                    if isinstance(model_path, str):
+                        progress_state.setdefault(cat, {})[suite_name] = metrics
+                        _save_lm_eval_progress(
+                            lm_progress_path,
+                            model_path=str(model_path),
+                            limit=limit,
+                            state=progress_state,
+                        )
+                    if not _in_lm_eval_subprocess:
+                        _flush_stage()
                     nll_display = f"{metrics['nll']:.4f}" if metrics.get("nll") is not None else "N/A"
                     logger.info(
                         "[%s] %s/%s -> %s=%.2f%% | HardTop1=%.2f%% | GoldNLL=%s (N=%d)",
@@ -4040,6 +4358,11 @@ def _evaluate_checkpoint_with_lm_eval(
             lm_obj = None
             model_obj = None
             _flush_stage()
+            if not _in_lm_eval_subprocess and lm_progress_path.is_file():
+                try:
+                    lm_progress_path.unlink()
+                except OSError:
+                    pass
 
     # Stage 3: MMMLU-Ar Thinking + GPQA-Diamond & AIME-2026 via Inspect Evals (single isolated subprocess)
     combined_inspect_specs: Dict[str, Dict[str, Any]] = {
@@ -5537,9 +5860,13 @@ def _preflight_composite_score(gate_dict: Dict[str, Any]) -> Tuple[int, float]:
 
 
 def _invalidate_stale_tuned_eval_caches(model_key: str) -> None:
-    """Remove any stale `live_raw_{model_key}_tuned.json` / combined cache after a checkpoint re-merge."""
+    """Remove any stale `live_raw_{model_key}_tuned.json` / combined / `lm_eval` progress cache after a checkpoint re-merge."""
     rep_dir = PROJECT_ROOT / "outputs" / "eval_reports"
-    for fname in (f"live_raw_{model_key}_tuned.json", f"live_raw_{model_key}.json"):
+    for fname in (
+        f"live_raw_{model_key}_tuned.json",
+        f"live_raw_{model_key}.json",
+        f".lm_eval_progress_{model_key}_tuned.json",
+    ):
         fp = rep_dir / fname
         if fp.is_file():
             try:
